@@ -36,7 +36,7 @@
 </header>
 <main>
   <section>
-    <canvas id="view" width="320" height="200"></canvas>
+    <canvas id="view" width="320" height="320"></canvas>
     <p class="dim">Arrow keys or WASD move. Every keypress is one Command on the room's input channel.</p>
 
     <h2>time machine</h2>
@@ -49,11 +49,11 @@
     </div>
     <div class="forkrow">
       <span class="dim">then move</span>
-      <button data-move="0,-1">up</button><button data-move="0,1">down</button>
+      <button data-move="0,1">up</button><button data-move="0,-1">down</button>
       <button data-move="-1,0">left</button><button data-move="1,0">right</button>
       <span class="dim" id="fork-state">—</span>
     </div>
-    <canvas id="branch-view" width="320" height="200"></canvas>
+    <canvas id="branch-view" width="320" height="320"></canvas>
     <dl class="inline">
       <dt>branch tick</dt><dd id="branch-tick">—</dd>
       <dt>branch digest</dt><dd id="branch-digest">—</dd>
@@ -268,7 +268,8 @@ setInterval(() => {
   w.write(dg).then(() => w.releaseLock()).catch(() => {});
 }, 250);
 
-const moves = { ArrowUp:[0,-1], ArrowDown:[0,1], ArrowLeft:[-1,0], ArrowRight:[1,0], w:[0,-1], s:[0,1], a:[-1,0], d:[1,0] };
+const moves = { ArrowUp:[0,1], ArrowDown:[0,-1], ArrowLeft:[-1,0], ArrowRight:[1,0],
+                w:[0,1], s:[0,-1], a:[-1,0], d:[1,0], W:[0,1], S:[0,-1], A:[-1,0], D:[1,0] };
 addEventListener("keydown", (e) => {
   const m = moves[e.key];
   if (!m || !writer) return;
@@ -380,19 +381,35 @@ function refreshBranch() {
   draw(branch.x, ui["branch-view"]);
 }
 
+/// Draw a world. `cl_extent()` is the arena's half-extent (game.ARENA), `cl_live()` returns the entity
+/// count and fills the render buffer, and y is positive UP — the same contract gkz's own page draws from.
 function draw(inst, canvas) {
-  const live = inst.cl_live();
-  const n = inst.cl_extent();
-  const buf = new DataView(inst.memory.buffer, inst.cl_buf(), n * 4 * 4);
   const ctx = canvas.getContext("2d");
+  const ext = inst.cl_extent();
+  const span = ext * 2 + 1;
+  const cell = canvas.width / span;
+
   ctx.fillStyle = "#05070a";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  const sx = canvas.width / 32, sy = canvas.height / 20;
-  for (let i = 0; i < live; i++) {
-    const px = buf.getInt32(i * 16), py = buf.getInt32(i * 16 + 4);
-    const hp = buf.getInt32(i * 16 + 8), team = buf.getInt32(i * 16 + 12);
-    ctx.fillStyle = team === 0 ? "#7ee787" : hp > 0 ? "#ff7b72" : "#484f58";
-    ctx.fillRect(px * sx, py * sy, sx, sy);
+  ctx.strokeStyle = "#141a21";
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= span; i++) {
+    ctx.beginPath(); ctx.moveTo(i * cell, 0); ctx.lineTo(i * cell, canvas.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * cell); ctx.lineTo(canvas.width, i * cell); ctx.stroke();
+  }
+
+  const n = inst.cl_live();
+  const buf = new Int32Array(inst.memory.buffer, inst.cl_buf(), n * 4);
+  for (let i = 0; i < n; i++) {
+    const px = buf[i * 4], py = buf[i * 4 + 1], hp = buf[i * 4 + 2], team = buf[i * 4 + 3];
+    const cx = (px + ext) * cell, cy = (ext - py) * cell;
+    ctx.fillStyle = team === 0 ? "#7ee787" : "#ff7b72";
+    ctx.fillRect(cx + cell * 0.15, cy + cell * 0.15, cell * 0.7, cell * 0.7);
+    ctx.fillStyle = "#05070a";
+    ctx.font = Math.max(9, cell * 0.34) + "px ui-monospace,monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(hp), cx + cell / 2, cy + cell / 2);
   }
 }
 
