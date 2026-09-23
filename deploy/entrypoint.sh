@@ -34,6 +34,9 @@ if [ -n "$DOMAIN" ]; then
         fi
     fi
 
+    echo "[entrypoint] certificates and keys under /data:"
+    find /data -name '*.crt' -o -name '*.key' 2>/dev/null | head -12
+
     if [ "$acme_ok" = yes ]; then
         # A renewal loop: certificates last 90 days and nothing else here would notice. lego 5 has no renew
         # command - `run` is both, deciding from the certificate's remaining lifetime - and a renewal takes
@@ -123,8 +126,15 @@ if [ -z "${DATABASE_URL:-}" ]; then
 
     # The log lives inside PGDATA, which postgres owns: the volume is mounted root-owned, so a log path at
     # the volume root is one the server cannot create.
-    su postgres -c "$pgbin/pg_ctl -D $pgdata -l $pgdata/server.log -o '-c listen_addresses=127.0.0.1' start" >/dev/null \
-        || { echo "[entrypoint] the local database would not start:"; tail -20 "$pgdata/server.log"; exit 1; }
+    if ! su postgres -c "$pgbin/pg_ctl -D $pgdata -l $pgdata/server.log -o '-c listen_addresses=127.0.0.1' start" >/tmp/pgctl.out 2>&1; then
+        echo "[entrypoint] the local database would not start. pg_ctl said:"
+        cat /tmp/pgctl.out
+        echo "[entrypoint] $pgdata contains:"
+        ls -la "$pgdata" | head -12
+        echo "[entrypoint] server.log tail:"
+        tail -12 "$pgdata/server.log" 2>/dev/null || echo "(no server.log)"
+        exit 1
+    fi
     for _ in $(seq 1 30); do "$pgbin/pg_isready" -q && break; sleep 0.5; done
 
     su postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='zix'\" | grep -q 1" \
