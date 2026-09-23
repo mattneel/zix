@@ -193,4 +193,4 @@ zig build test-all           # ketiganya
 
 Dari root repo langkah yang sama bernama `jzon-test-unit`, `jzon-test-behaviour`, `jzon-test-edge`, dan `jzon-test-all`. Batas per-test datang dari `-Ddriver-test-timeout=<durasi>`, karena build paket bersarang tidak pernah melihat `--test-timeout` milik induknya.
 
-Setiap tier berjalan di kedua versi Zig yang didukung dan di ketujuh target CI.
+Setiap tier berjalan di ketujuh target CI (ketujuhnya dipin ke Zig 0.16; tidak ada leg CI 0.17).

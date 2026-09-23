@@ -597,7 +597,9 @@ For full memory details see [`docs/hld-http-en.md`](docs/hld-http-en.md) and [`d
     - [x] 0.16.x:
         - 0.16.0
     - [x] 0.17.x (Experimental):
-        - 0.17.0-dev.1933+e19a73c2d
+        - 0.17.0-dev.2264+230c63650 (the revision zurtr builds zix with)
+        - CI covers 0.16 only: every workflow under `.github/workflows` installs
+          Zig 0.16.0, and no leg builds a 0.17 toolchain yet.
 
 <br>
 

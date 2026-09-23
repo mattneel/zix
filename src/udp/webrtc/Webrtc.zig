@@ -10,8 +10,9 @@
 //! - zix answers, it does not dial. The ICE agent is lite (RFC 8445 2.3) and the DTLS role is
 //!   always server, which is what decides the stream identifiers a channel may open on
 //!   (RFC 8832 6).
-//! - Media is not carried yet. RTP and RTCP are routed to their own layer and dropped there, and
-//!   answering them is a later pass.
+//! - Media is carried when `carry_media` is set: RTP and RTCP are routed to their own layer
+//!   (media/mux.zig, media/peer_media.zig) and forwarded (media/forward.zig), with the SRTP
+//!   profiles chosen by that flag.
 
 const server = @import("server.zig");
 const core = @import("core.zig");

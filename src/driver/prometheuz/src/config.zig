@@ -13,7 +13,9 @@ pub const ScrapeConfig = struct {
     path: []const u8 = "/metrics",
     /// Scraper poller interval in milliseconds.
     scrape_interval_ms: u32 = 15_000,
-    /// Bounds the TCP connect phase in milliseconds, 0 disables.
+    /// Accepted for API-shape parity and NOT yet enforced: the client discards it
+    /// (`http_client.zig`; see docs/driver/prometheuz/config-*.md). 0 disables, and there is
+    /// nothing to disable today.
     conn_timeout_ms: u32 = 5_000,
     /// Caps the scraped response body in bytes.
     max_response_body: usize = 1024 * 1024 * 4,
@@ -24,6 +26,7 @@ pub const WriteConfig = struct {
     ip: []const u8 = "127.0.0.1",
     port: u16 = 9090,
     path: []const u8 = "/api/v1/write",
+    /// Accepted for API-shape parity and NOT yet enforced (see docs/driver/prometheuz/config-*.md).
     conn_timeout_ms: u32 = 5_000,
     max_response_body: usize = 1024 * 1024,
 };
@@ -33,6 +36,7 @@ pub const WriteConfig = struct {
 pub const QueryConfig = struct {
     ip: []const u8 = "127.0.0.1",
     port: u16 = 9090,
+    /// Accepted for API-shape parity and NOT yet enforced (see docs/driver/prometheuz/config-*.md).
     conn_timeout_ms: u32 = 5_000,
     max_response_body: usize = 1024 * 1024 * 4,
 };

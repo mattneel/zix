@@ -193,4 +193,4 @@ zig build test-all           # all three
 
 From the repo root the same steps are `jzon-test-unit`, `jzon-test-behaviour`, `jzon-test-edge`, and `jzon-test-all`. The per-test bound comes from `-Ddriver-test-timeout=<duration>`, because a nested package build never sees the parent's `--test-timeout`.
 
-Every tier runs on both supported Zig versions and on all seven CI targets.
+Every tier runs on all seven CI targets (all seven are pinned to Zig 0.16; there is no 0.17 CI leg).

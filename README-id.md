@@ -597,7 +597,9 @@ Untuk detail memori lengkap lihat [`docs/hld-http-id.md`](docs/hld-http-id.md) d
     - [x] 0.16.x:
         - 0.16.0
     - [x] 0.17.x (Experimental):
-        - 0.17.0-dev.1933+e19a73c2d
+        - 0.17.0-dev.2264+230c63650 (revisi yang dipakai zurtr untuk membangun zix)
+        - CI hanya mencakup 0.16: setiap workflow di `.github/workflows` memasang
+          Zig 0.16.0, dan belum ada leg yang membangun toolchain 0.17.
 
 <br>
 
