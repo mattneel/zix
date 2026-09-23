@@ -457,3 +457,27 @@ Lihat ADR-069 (`docs/adr-id.md`) untuk keputusan melayani WebTransport sebagai f
 ---
 
 ###### end of hld-webtransport
+
+## Menjangkau demo dari browser Windows (WSL2)
+
+Demo ini mengikat `127.0.0.1`, dan sesinya adalah QUIC di atas UDP. WSL2 dalam mode NAT bawaan meneruskan
+**TCP** dari sisi Windows ke distribusinya, tetapi **tidak** meneruskan UDP. Browser di host Windows karena
+itu bisa memuat halamannya lewat TCP dan tidak akan pernah mencapai listener HTTP/3-nya: Chrome mencoba
+alternative service QUIC-nya, tidak mendapat jawaban, jatuh kembali ke TCP, dan dial-nya berakhir dengan
+`ERR_CONNECTION_RESET` (listener TCP di sana berbicara HTTP/1.1 dan me-reset permintaan yang tak terduga).
+Browser yang berada *di dalam* distribusinya mencapai kedua kaki itu, itulah sebabnya halaman dan flag yang
+sama berhasil di sana.
+
+Dua cara menutup jaraknya:
+
+- **Mirrored networking** (disarankan): setel `networkingMode=mirrored` di bawah `[wsl2]` pada
+  `%UserProfile%\.wslconfig`, jalankan `wsl --shutdown`, lalu buka lagi. Distribusinya lalu berbagi
+  antarmuka host, sehingga `127.0.0.1:9444/udp` adalah loopback host dan demo berjalan tanpa perubahan.
+- **Ikat di luar loopback**: sajikan pada alamat distribusinya dan buka
+  `https://<alamat-distribusi>:9444/`. Sertifikatnya lalu harus memuat alamat itu di SAN-nya, yang tidak
+  dimiliki sertifikat demo yang ada di repo.
+
+Dengan cara mana pun, sertifikatnya tetap harus dipercaya alih-alih diterima lewat click-through: Chromium
+mengabaikan `Alt-Svc` yang origin-nya berstatus error sertifikat, dan click-through adalah error, bukan
+kepercayaan. WebTransport pada deployment biasa tidak pernah butuh langkah ini karena servernya menyajikan
+sertifikat yang sudah dipercaya browser; demo self-signed lokal adalah kasus yang butuh.

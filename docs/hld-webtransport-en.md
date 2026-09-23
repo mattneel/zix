@@ -454,3 +454,26 @@ See ADR-069 (`docs/adr-en.md`) for the decision to serve WebTransport as a featu
 ---
 
 ###### end of hld-webtransport
+
+## Reaching the demo from a Windows browser (WSL2)
+
+The demo binds `127.0.0.1`, and the session is QUIC over UDP. WSL2 in its default NAT mode forwards
+**TCP** from the Windows side to the distribution, but **not UDP**. A browser on the Windows host can
+therefore load the page over TCP and can never reach the HTTP/3 listener: Chrome attempts the QUIC
+alternative service, gets no response, falls back to TCP, and the dial ends in `ERR_CONNECTION_RESET`
+(the TCP listener there speaks HTTP/1.1 and resets an unexpected request). A browser *inside* the
+distribution reaches both legs, which is why the same page and the same flags succeed there.
+
+Two ways to close the gap:
+
+- **Mirrored networking** (recommended): set `networkingMode=mirrored` under `[wsl2]` in
+  `%UserProfile%\.wslconfig`, run `wsl --shutdown`, and reopen. The distribution then shares the host's
+  interfaces, so `127.0.0.1:9444/udp` is the host's loopback and the demo works unchanged.
+- **Bind beyond loopback**: serve on the distribution's address and open
+  `https://<distribution-address>:9444/`. The certificate must then carry that address in its SAN, which
+  the checked-in demo certificate does not.
+
+Either way, the certificate still has to be trusted rather than click-through accepted: Chromium ignores
+an `Alt-Svc` whose origin has a certificate error, and a click-through is an error, not trust. WebTransport
+in an ordinary deployment never needs this step because the server presents a certificate the browser
+already trusts; a local self-signed demo is the case that does.
