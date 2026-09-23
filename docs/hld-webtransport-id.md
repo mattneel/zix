@@ -484,10 +484,17 @@ sertifikat yang sudah dipercaya browser; demo self-signed lokal adalah kasus yan
 
 ## Membuka demo di Chrome, dan kenapa butuh dua switch
 
-Chrome memverifikasi sertifikat koneksi QUIC secara terpisah dari sertifikat koneksi HTTPS. Pada setiap
-konfigurasi yang diuji di sini, sertifikat leaf yang sama diterima untuk HTTPS dan ditolak untuk QUIC
-dengan `46: certificate unknown`, termasuk saat CA-nya dipercaya di system store maupun di store browser
-itu sendiri. Yang diterima jalur QUIC adalah sertifikat yang disebut oleh SPKI-nya:
+Chromium menerapkan aturan sertifikat produksinya pada QUIC - dan karena itu pada WebTransport - bahkan
+di loopback, dan jalan keluar biasa untuk pengembangan lokal tidak berlaku untuknya: click-through,
+`--ignore-certificate-errors`, dan CA yang dipercaya di system store maupun di store browser semuanya
+membuat handshake QUIC tetap gagal dengan `46: certificate unknown`. Cara yang didokumentasikan untuk
+menjalankan server WebTransport lokal adalah menyebut sertifikatnya lewat SPKI-nya:
+
+- <https://www.chromium.org/quic/playing-with-quic/>
+- <https://groups.google.com/a/chromium.org/g/web-transport-dev/c/qDt0dek65ZU>
+
+Terukur di sini dan sejalan dengan panduan itu: leaf yang sama yang memuaskan HTTPS ditolak untuk QUIC
+pada setiap kombinasi store dan bypass yang dicoba, dan diterima di bawah pin.
 
 ```
 chrome --origin-to-force-quic-on=127.0.0.1:9444 \

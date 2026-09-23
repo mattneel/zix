@@ -480,10 +480,16 @@ already trusts; a local self-signed demo is the case that does.
 
 ## Opening the demo in Chrome, and why it needs two switches
 
-Chrome verifies the certificate of a QUIC connection separately from the certificate of an HTTPS
-connection. In every configuration tested here the same leaf certificate was accepted for HTTPS and
-rejected for QUIC with `46: certificate unknown`, including with the CA trusted in the system store and in
-the browser's own store. What the QUIC path did accept was the certificate named by its SPKI:
+Chromium applies its production certificate rules to QUIC - and so to WebTransport - even on loopback, and
+the usual local-development escapes do not apply to it: a click-through, `--ignore-certificate-errors`, and
+a CA trusted in the system or browser store all leave the QUIC handshake failing with `46: certificate
+unknown`. The documented way to run a local WebTransport server is to name the certificate by its SPKI:
+
+- <https://www.chromium.org/quic/playing-with-quic/>
+- <https://groups.google.com/a/chromium.org/g/web-transport-dev/c/qDt0dek65ZU>
+
+Measured here and matching that guidance: the same leaf that satisfied HTTPS was rejected for QUIC in
+every store and bypass combination tried, and accepted under the pin.
 
 ```
 chrome --origin-to-force-quic-on=127.0.0.1:9444 \
