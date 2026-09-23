@@ -73,12 +73,17 @@ that TLS ends inside it, an HTTP challenge port is a second surface that exists 
   PKCS#8).
 - Renewal runs on the machine.
 
-### Known limit: one certificate per file
+### The chain is served whole
 
-The PEM reader accepts a single certificate, so the server cannot present a chain. A client that already
-holds the intermediate authority accepts the leaf; a client that does not reports that it cannot get the
-local issuer certificate. Serving a chain needs the TLS Certificate message to carry more than one entry,
-which is a change in the TLS and HTTP/3 layers rather than a deployment matter.
+The PEM reader decodes every CERTIFICATE block of the document, end-entity first, and the TLS Certificate
+message carries each one as an entry, so a client receives the leaf and the intermediates that chain it
+back to its authority. That is what a strict client needs: one that does not already hold the intermediate
+reports that it cannot get the local issuer certificate and refuses the connection. The entrypoint
+therefore copies the ACME client's fullchain file rather than reducing it to a single certificate.
+
+A chain is several kilobytes, which is more than one QUIC Handshake packet carries, so the server splits
+the handshake flight across as many packets as it needs, each with its CRYPTO frame at the offset the peer
+reassembles from.
 
 ---
 
@@ -93,7 +98,11 @@ Each layer is checked on its own, because a failure at one looks like a failure 
 | Edge pass-through | request the page and inspect the issuer | the app's certificate, not the edge's |
 | Listeners | the process log | two listeners: HTTP/3 on the forwarded UDP port, HTTPS/1.1 on the internal port |
 | UDP delivery | a capture on the forwarded port while sending | datagrams arriving at the machine |
+| Chain | inspect the certificate the server presents | the leaf plus the intermediates that chain it to its authority |
 | Session | press the page's session control | session open, reported over HTTP/3 |
+| Session request | the page's protocol panel | two connections kept apart: the document's own, and the session over HTTP/3 with the binding the server agreed; the session rows are the CONNECT the server received, down to the `:protocol` token, the path and the authority |
+| Counters | the page's view state | messages received on the stream, patches that moved the durable view, and the durable revision: a measurement reply is a message and not a patch |
+| Rate | press the page's measure control | round trips on both channels with the batch each percentile came from, and one 4 KiB exchange labelled as one exchange |
 
 ---
 

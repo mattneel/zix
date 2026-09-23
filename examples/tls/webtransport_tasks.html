@@ -75,6 +75,51 @@
 
 <section class="grid">
   <div>
+    <h2>protocol <span class="badge" id="proto-badge">no session</span></h2>
+    <dl>
+      <dt>page and assets</dt><dd id="page-proto">: </dd>
+      <dt>live session</dt><dd id="session-proto">: </dd>
+      <dt>session method</dt><dd id="attest-method">: </dd>
+      <dt>session protocol</dt><dd id="attest-protocol">: </dd>
+      <dt>session path</dt><dd id="attest-path">: </dd>
+      <dt>session authority</dt><dd id="attest-authority">: </dd>
+      <dt>binding revision</dt><dd id="attest-dialect">: </dd>
+      <dt>datagram capable</dt><dd id="attest-datagrams">: </dd>
+      <dt>origin</dt><dd id="attest-origin">: </dd>
+    </dl>
+    <p class="hint">Two connections, and the rows keep them apart: the page and its assets arrive on the
+    document's own connection, while the live session is a WebTransport session over HTTP/3 that shares
+    nothing with it. The first row is read from the browser's own connection record; the session rows are
+    echoed by the server from the request it actually received, so neither side is taken on trust.
+    Reproduce it
+    without a browser: <code>python3 scripts/webtransport_interop.py zix.entwurfswerk.dev 443 /tasks</code>
+    walks the QUIC and TLS handshakes, sends the extended CONNECT, and reports the status this server
+    answered. Its echo checks are written for the echo example, so against this page they are expected to
+    report a mismatch.</p>
+  </div>
+  <div>
+    <h2>numbers <span class="badge" id="measure-run">idle</span></h2>
+    <p class="hint">One run is one batch of 100 round trips per channel. Each percentile names the batch it
+    describes, not the whole history, and batches vary. A round trip here is an application round trip: it
+    includes the network path and the work both ends do.</p>
+    <dl>
+      <dt>session setup</dt><dd id="m-setup">: </dd>
+      <dt>datagram rtt p50</dt><dd id="m-dg-p50">: </dd>
+      <dt>datagram rtt p95</dt><dd id="m-dg-p95">: </dd>
+      <dt>stream rtt p50</dt><dd id="m-st-p50">: </dd>
+      <dt>stream rtt p95</dt><dd id="m-st-p95">: </dd>
+      <dt>jitter</dt><dd id="m-jitter">: </dd>
+      <dt>4 KiB echo rate</dt><dd id="m-throughput">: </dd>
+      <dt>datagram samples</dt><dd id="m-dg-count">0</dd>
+      <dt>stream samples</dt><dd id="m-st-count">0</dd>
+      <dt>bytes echoed</dt><dd id="m-bytes">0</dd>
+    </dl>
+    <button id="measure" disabled>measure (100 datagram + 100 stream round trips + 4 KiB echo)</button>
+  </div>
+</section>
+
+<section class="grid">
+  <div>
     <h2>view state</h2>
     <dl>
       <dt>session</dt><dd id="status">closed</dd>
@@ -82,6 +127,7 @@
       <dt>revision</dt><dd id="revision">: </dd>
       <dt>tasks</dt><dd id="task-count">0</dd>
       <dt>worker</dt><dd id="worker">: </dd>
+      <dt>messages</dt><dd id="messages">0</dd>
       <dt>patches</dt><dd id="patches">0</dd>
       <dt>duplicates</dt><dd id="duplicates">0</dd>
       <dt>sessions</dt><dd id="sessions">0</dd>
@@ -116,12 +162,20 @@ const DEV_MARK = "m0";
 // record) for: dialing the port only ever worked under a browser launched with
 // --origin-to-force-quic-on, which is not a demo anybody can open.
 const ENDPOINT = new URL("/tasks", location.origin);
-const state = { sessions: 0, patches: 0, duplicates: 0, events: 0, revision: 0, lastKey: null };
+
+/// The session's protocol. WebTransport has no other transport to run over, so this is not an inference
+/// from the page's own connection: it is what a session that reached ready is.
+const SESSION_PROTOCOL = "WebTransport over HTTP/3";
+const state = { sessions: 0, messages: 0, patches: 0, duplicates: 0, events: 0, revision: 0, lastKey: null };
 
 const ui = {};
 for (const id of ["status", "whoami", "revision", "task-count", "worker", "patches", "duplicates", "sessions",
                   "last-key", "transient", "result", "applied", "event-count", "events", "tasks", "build",
-                  "principal", "tenant", "title", "create", "resubmit", "subscribe", "open"]) {
+                  "principal", "tenant", "title", "create", "resubmit", "subscribe", "open",
+                  "proto-badge", "page-proto", "session-proto", "attest-method", "attest-protocol", "attest-path",
+                  "attest-authority", "attest-dialect", "attest-datagrams", "attest-origin",
+                  "measure-run", "measure", "m-setup", "m-dg-p50", "m-dg-p95", "m-st-p50", "m-st-p95",
+                  "m-jitter", "m-throughput", "m-dg-count", "m-st-count", "m-bytes", "messages"]) {
   ui[id] = document.getElementById(id);
 }
 
@@ -144,6 +198,12 @@ function log(channel, text) {
 /// One revisioned patch. The server never sends a revision the view has already applied, and the view
 /// drops one if it arrives anyway: delivery is at least once, so the view has to be idempotent on its
 /// own too (a duplicate replay must not move the state backwards or double-count).
+/// The lines that carry the durable view: the snapshot and the outcomes of the tasks it lists.
+function isViewPatch(kind) {
+  return kind === "snapshot" || kind === "accepted" || kind === "rejected" ||
+         kind === "task_created" || kind === "task_running" || kind === "task_completed";
+}
+
 function apply(event, channel) {
   const rev = Number(event.rev ?? 0);
   if (rev !== 0 && rev <= state.revision) {
@@ -156,11 +216,62 @@ function apply(event, channel) {
     state.revision = rev;
     ui.revision.textContent = String(rev);
   }
-  state.patches++;
-  ui.patches.textContent = String(state.patches);
-  ui.applied.textContent = String(state.patches) + " applied";
+  // A patch is a line that moves the durable view. The attestation and the measurement replies update
+  // their own panels without touching the view, and counting them here would make this read as state that
+  // never changed.
+  if (isViewPatch(event.kind)) {
+    state.patches++;
+    ui.patches.textContent = String(state.patches);
+    ui.applied.textContent = String(state.patches) + " applied";
+  }
 
   switch (event.kind) {
+    case "attestation":
+      // Everything here is the server's account of the request it received, not the page's claim.
+      ui["attest-protocol"].textContent = event.protocol + " (:protocol)";
+      ui["attest-path"].textContent = event.path;
+      ui["attest-authority"].textContent = event.authority;
+      ui["attest-dialect"].textContent = event.dialect;
+
+      // The agreed revision names the binding, so it belongs with the session's protocol: that pair is the
+      // whole claim this panel makes.
+      ui["session-proto"].textContent = SESSION_PROTOCOL + (event.dialect ? ", " + event.dialect : "");
+      ui["proto-badge"].textContent = ui["session-proto"].textContent;
+      ui["attest-datagrams"].textContent = event.datagrams ? "yes" : "no";
+      ui["attest-origin"].textContent = event.origin || "(none)";
+      ui["attest-method"].textContent = "CONNECT (extended)";
+      ui["attest-datagrams"].textContent = ui["attest-datagrams"].textContent + " · session " + event.session;
+
+      break;
+
+    case "echo_reply": {
+      const key = "s:" + String(event.seq);
+      const sent = MEASURE.pending.get(key);
+
+      if (sent !== undefined) {
+        MEASURE.pending.delete(key);
+        MEASURE.streamSamples.push(performance.now() - sent);
+        ui["m-st-count"].textContent = String(MEASURE.streamSamples.length);
+        renderMeasure();
+      }
+
+      // A padded reply is the transfer measurement: the page counts what actually came back, so a reply
+      // the send window truncated shows up as the smaller number rather than as an inflated rate.
+      if (event.pad) {
+        MEASURE.bytes += event.pad.length;
+        ui["m-bytes"].textContent = String(MEASURE.bytes);
+        if (MEASURE.transferStart !== null) {
+          const ms = performance.now() - MEASURE.transferStart;
+          MEASURE.transferStart = null;
+          const mib = event.pad.length / (1024 * 1024);
+          ui["m-throughput"].textContent = (mib / (ms / 1000)).toFixed(2) + " MiB/s · " + event.pad.length +
+                                       " bytes in " + ms.toFixed(1) + " ms · one exchange, not a sustained rate";
+        }
+      }
+
+      break;
+    }
+
     case "snapshot":
       state.revision = rev;
       ui.revision.textContent = String(rev);
@@ -184,7 +295,9 @@ function apply(event, channel) {
       break;
   }
 
-  log(channel, JSON.stringify(event));
+  // A measurement arrives in its hundreds and one of them carries a four kilobyte pad, so the event log
+  // shows what moved the state and the numbers panel reports the round trips.
+  if (event.kind !== "echo_reply") log(channel, JSON.stringify(event));
 }
 
 function renderTasks(tasks) {
@@ -227,6 +340,12 @@ async function readEvents(reader, channel) {
         const line = buffer.slice(0, end).trim();
         buffer = buffer.slice(end + 1);
         if (!line) continue;
+
+        // Every line the server put on this stream, counted before anything is decided about it: a message
+        // that turns out to be a duplicate, or a measurement, is still a message.
+        state.messages++;
+        ui.messages.textContent = String(state.messages);
+
         try { apply(JSON.parse(line), channel); } catch (err) { log(channel, "unparsed: " + line); }
       }
       if (done) return;
@@ -247,7 +366,25 @@ function command(object) {
 async function readTransient() {
   try {
     for await (const datagram of session.datagrams.readable) {
-      ui.transient.textContent = new TextDecoder().decode(datagram);
+      const text = new TextDecoder().decode(datagram);
+
+      // The measurement ping comes back exactly as it went out, so both stamps in it are the page's own:
+      // the difference is one datagram over the air, out and back, with nothing retransmitted for it.
+      if (text.startsWith("p:")) {
+        const key = "d:" + text.split(":")[1];
+        const sent = MEASURE.pending.get(key);
+
+        if (sent !== undefined) {
+          MEASURE.pending.delete(key);
+          MEASURE.datagramSamples.push(performance.now() - sent);
+          ui["m-dg-count"].textContent = String(MEASURE.datagramSamples.length);
+          renderMeasure();
+        }
+
+        continue;
+      }
+
+      ui.transient.textContent = text;
     }
   } catch (err) {
     // The readable rejects when the session closes; that is the end of the channel.
@@ -265,15 +402,114 @@ async function readServerStreams() {
   }
 }
 
+// --------------------------------------------------------- //
+/// What the measurement run accumulates. The page stamps the clock with its own monotonic timer and the
+/// server returns that stamp untouched, so a round trip is measured end to end without trusting a clock on
+/// the other machine.
+const MEASURE = { pending: new Map(), streamSamples: [], datagramSamples: [], transferStart: null, bytes: 0, batch: 0 };
+
+function percentile(samples, fraction) {
+  if (samples.length === 0) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.floor(fraction * sorted.length));
+
+  return sorted[index];
+}
+
+/// The mean absolute difference between consecutive round trips: the number that matters for anything
+/// real-time, and the reason a p50 alone is not enough.
+function jitterOf(samples) {
+  if (samples.length < 2) return null;
+
+  let total = 0;
+  let previous = samples[0];
+  for (const sample of samples.slice(1)) {
+    total += Math.abs(sample - previous);
+    previous = sample;
+  }
+
+  return total / (samples.length - 1);
+}
+
+function renderMeasure() {
+  const dgP50 = percentile(MEASURE.datagramSamples, 0.5);
+  const dgP95 = percentile(MEASURE.datagramSamples, 0.95);
+  const stP50 = percentile(MEASURE.streamSamples, 0.5);
+  const stP95 = percentile(MEASURE.streamSamples, 0.95);
+  const jitter = jitterOf([...MEASURE.datagramSamples]);
+
+  const dgSamples = MEASURE.datagramSamples.length;
+  const stSamples = MEASURE.streamSamples.length;
+
+  if (dgP50 !== null) ui["m-dg-p50"].textContent = dgP50.toFixed(2) + " ms · " + dgSamples + " samples";
+  if (dgP95 !== null) ui["m-dg-p95"].textContent = dgP95.toFixed(2) + " ms · " + dgSamples + " samples";
+  if (stP50 !== null) ui["m-st-p50"].textContent = stP50.toFixed(2) + " ms · " + stSamples + " samples";
+  if (stP95 !== null) ui["m-st-p95"].textContent = stP95.toFixed(2) + " ms · " + stSamples + " samples";
+  if (jitter !== null) ui["m-jitter"].textContent = jitter.toFixed(2) + " ms (mean |delta|, this batch)";
+}
+
+/// One run: a hundred datagram round trips, a hundred stream round trips, and one padded reply that
+/// measures a transfer. Datagrams go out without waiting for each other, which is what makes them a load
+/// measurement rather than a request/response one.
+async function measure() {
+  if (!session || !datagramWriter || !feedWriter) return;
+
+  MEASURE.batch++;
+  ui["measure-run"].textContent = "batch " + MEASURE.batch + " running";
+  MEASURE.pending.clear();
+  MEASURE.streamSamples.length = 0;
+  MEASURE.datagramSamples.length = 0;
+
+  const encoder = new TextEncoder();
+  const rounds = 100;
+
+  for (let i = 0; i < rounds; i++) {
+    const t = Math.round(performance.now());
+    MEASURE.pending.set("d:" + String(i), t);
+    await datagramWriter.write(encoder.encode("p:" + String(i) + ":" + String(t)));
+  }
+
+  for (let i = 0; i < rounds; i++) {
+    const t = Math.round(performance.now());
+    MEASURE.pending.set("s:" + String(i), t);
+    await command({ kind: "echo", t: t, seq: i });
+  }
+
+  MEASURE.transferStart = performance.now();
+  await command({ kind: "echo", t: Math.round(performance.now()), seq: -1, bytes: 4096 });
+
+  // The echoes land as they come back, so the run settles on a timer rather than on a count: a datagram
+  // lost in flight is a sample the page never gets, which is the honest result for an unreliable channel.
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  renderMeasure();
+  ui["measure-run"].textContent = "batch " + MEASURE.batch + " done";
+  log("measure", "datagram p50 " + (percentile(MEASURE.datagramSamples, 0.5) ?? 0).toFixed(2) + " ms · stream p50 " +
+                 (percentile(MEASURE.streamSamples, 0.5) ?? 0).toFixed(2) + " ms");
+}
+
 async function openSession() {
   session = new WebTransport(ENDPOINT);
   ui.status.textContent = "connecting";
   log("session", "dialing " + ENDPOINT.href);
+  const dialed = performance.now();
   await session.ready;
+  ui["m-setup"].textContent = (performance.now() - dialed).toFixed(1) + " ms · one dial";
   ui.status.textContent = "open";
   state.sessions++;
   ui.sessions.textContent = String(state.sessions);
   log("session", "ready (HTTP/3, " + ENDPOINT.host + ")");
+
+  // The document's own connection, read from the browser's record rather than inferred. It is a different
+  // connection from the session shown beside it: this page can arrive over HTTP/1.1 while the session it
+  // opens runs over HTTP/3.
+  const navigation = performance.getEntriesByType("navigation")[0];
+  const pageProtocol = navigation ? navigation.nextHopProtocol : "";
+  ui["page-proto"].textContent = pageProtocol || "(not reported)";
+
+  // The session is WebTransport, which exists only over HTTP/3, so a session that reached ready is an
+  // HTTP/3 session. The binding revision is added from the server's own account of the request.
+  ui["session-proto"].textContent = SESSION_PROTOCOL;
+  ui["proto-badge"].textContent = SESSION_PROTOCOL;
 
   session.closed.then(() => { ui.status.textContent = "closed"; log("session", "closed"); })
                  .catch((err) => { ui.status.textContent = "failed"; log("session", "closed with " + err); });
@@ -281,6 +517,8 @@ async function openSession() {
   datagramWriter = session.datagrams.writable.getWriter();
   void readTransient();
   void readServerStreams();
+  ui.measure.disabled = false;
+  ui.measure.onclick = () => void measure();
   toggle(true);
 }
 

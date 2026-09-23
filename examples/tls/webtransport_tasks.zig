@@ -111,6 +111,50 @@ const View = struct {
 };
 
 var views: [32]View = @splat(.{});
+
+/// One session's account of the request that opened it. The engine's own request slices are only readable
+/// during on_session, so the text is copied here and read later, when the page asks what it is talking to.
+const Attestation = struct {
+    protocol: [32]u8 = @splat(0),
+    protocol_len: usize = 0,
+    path: [160]u8 = @splat(0),
+    path_len: usize = 0,
+    authority: [128]u8 = @splat(0),
+    authority_len: usize = 0,
+    origin: [160]u8 = @splat(0),
+    origin_len: usize = 0,
+    dialect: zix.Webtransport.Dialect = .draft16,
+    datagram_capable: bool = false,
+
+    fn protocolText(self: *const Attestation) []const u8 {
+        return self.protocol[0..self.protocol_len];
+    }
+
+    fn pathText(self: *const Attestation) []const u8 {
+        return self.path[0..self.path_len];
+    }
+
+    fn authorityText(self: *const Attestation) []const u8 {
+        return self.authority[0..self.authority_len];
+    }
+
+    fn originText(self: *const Attestation) []const u8 {
+        return self.origin[0..self.origin_len];
+    }
+};
+
+/// Keyed the same way the views are, by the handle the engine reuses: a new session overwrites the slot it
+/// was handed, so an attestation can never outlive the session it describes.
+var attestations: [32]Attestation = @splat(.{});
+
+/// Copy a request field into its fixed slot, truncating rather than failing: an authority longer than the
+/// buffer is still worth showing in part, and nothing here is the value of a promise.
+fn copyField(dest: []u8, source: []const u8) usize {
+    const len = @min(dest.len, source.len);
+    @memcpy(dest[0..len], source[0..len]);
+
+    return len;
+}
 var feed: tasks.Feed = undefined;
 var stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -258,6 +302,16 @@ fn onSession(session: *zix.Webtransport.Session) ?u16 {
 
     if (!std.mem.eql(u8, request.path, SESSION_PATH)) return 404;
 
+    // The request is readable here and nowhere later, so this is where the page's view of it is taken.
+    const slot = &attestations[session.id() % attestations.len];
+    slot.* = .{};
+    slot.protocol_len = copyField(&slot.protocol, request.protocol);
+    slot.path_len = copyField(&slot.path, request.path);
+    slot.authority_len = copyField(&slot.authority, request.authority);
+    slot.origin_len = copyField(&slot.origin, request.origin);
+    slot.dialect = request.dialect;
+    slot.datagram_capable = request.datagram_capable;
+
     // A session handle's address is what this file can key a view by, and the engine reuses that address
     // once a session closes: clear every slot that still names this session, so a new session can never
     // inherit the identity a previous one subscribed with.
@@ -318,6 +372,12 @@ fn handleCommand(session: *zix.Webtransport.Session, stream: *const zix.Webtrans
         return;
     }
 
+    if (std.mem.eql(u8, kind, "echo")) {
+        echoReply(stream, object);
+
+        return;
+    }
+
     writeLine(stream, "{\"kind\":\"rejected\",\"reason\":\"unknown command\"}");
 }
 
@@ -347,9 +407,31 @@ fn subscribe(session: *zix.Webtransport.Session, stream: *const zix.Webtransport
         return;
     }
 
+    sendAttestation(session, stream);
     sendSnapshot(session, stream, view, tenant);
 
     log("session {d}: {s} subscribed to {s}", .{ session.id(), principal, tenant });
+}
+
+/// The wire-level facts of this session, read off the request the client sent rather than assumed: the
+/// `:protocol` token, the path and authority it was requested for, the binding revision, whether the
+/// client's transport parameters left datagrams available, and the `Origin` the browser attached. The page
+/// shows these beside what it measured on its own connection.
+fn sendAttestation(session: *zix.Webtransport.Session, stream: *const zix.Webtransport.Stream) void {
+    const request = &attestations[session.id() % attestations.len];
+
+    var buf: [768]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{{\"kind\":\"attestation\",\"protocol\":\"{s}\",\"path\":\"{s}\",\"authority\":\"{s}\",\"origin\":\"{s}\",\"dialect\":\"{s}\",\"datagrams\":{s},\"session\":{d}}}", .{
+        request.protocolText(),
+        request.pathText(),
+        request.authorityText(),
+        request.originText(),
+        @tagName(request.dialect),
+        if (request.datagram_capable) "true" else "false",
+        session.id(),
+    }) catch return;
+
+    writeLine(stream, line);
 }
 
 /// Write the committed state as one revisioned snapshot line, and set the view's cursor to the feed's
@@ -464,8 +546,15 @@ fn drain(session: *zix.Webtransport.Session, stream: *const zix.Webtransport.Str
 
 /// A datagram is used only for transient state. The page sends a typing hint; it is replaceable, so a lost
 /// one costs nothing and nothing here retransmits.
+///
+/// It also carries the measurement ping, which is echoed straight back so the page can time one datagram
+/// over the air. An echo costs nothing to lose: the next ping carries a fresh stamp.
 fn onDatagram(session: *zix.Webtransport.Session, datagram: []const u8) void {
-    _ = session;
+    if (std.mem.startsWith(u8, datagram, ping_prefix)) {
+        _ = session.sendDatagram(datagram);
+
+        return;
+    }
 
     if (std.mem.startsWith(u8, datagram, "typing")) log("transient: {s}", .{datagram});
 }
@@ -601,6 +690,73 @@ fn flushView(view: *View, stream: *const zix.Webtransport.Stream) void {
 
 /// A line with no view behind it: a refusal before a subscription accepted, which is small enough to hand
 /// over in one write and is not part of any view's patch stream.
+/// The prefix a measurement ping carries. The page sends `p:<seq>:<stamp>` and this returns it unchanged,
+/// so the page knows a datagram that comes back is its own and not a stray hint.
+const ping_prefix = "p:";
+
+/// The largest payload the echo op builds. The stream window is the client's to advertise and it is not
+/// large: a browser takes a few kilobytes on a fresh stream, so an answer is sized to fit one window
+/// rather than to prove a point about buffering. A larger request is answered with this much.
+const max_echo_bytes = 4096;
+
+/// Read a JSON number that may arrive as either an integer or a float. A page stamping its clock sends a
+/// fractional number and a payload size a whole one, and both are the same field kind to the client, so
+/// both are read here rather than trusted to be the one the server expected.
+fn numberField(object: std.json.ObjectMap, name: []const u8) f64 {
+    const value = object.get(name) orelse return 0;
+
+    return switch (value) {
+        .integer => |int| @floatFromInt(int),
+        .float => |float| float,
+        else => 0,
+    };
+}
+
+/// Answer the measurement op on the stream the page is already reading. `t` is the page's own stamp and is
+/// returned untouched, and `seq` says which round trip this answers: a batch of them leaves in a couple of
+/// milliseconds, so the stamp alone does not tell two of them apart. `bytes` asks for a payload that size,
+/// which is what lets one op measure a transfer as well as a round trip.
+///
+/// Note:
+/// - A payload larger than the stream window is queued as far as it goes, the same way every other writer
+///   here behaves. The reply carries the size it actually sent, so a short one is visible, not silent.
+fn echoReply(stream: *const zix.Webtransport.Stream, object: std.json.ObjectMap) void {
+    const stamp: i64 = @intFromFloat(numberField(object, "t"));
+    const sequence: i64 = @intFromFloat(numberField(object, "seq"));
+    const requested = numberField(object, "bytes");
+    const size: usize = @intFromFloat(@max(0, @min(requested, @as(f64, max_echo_bytes))));
+
+    var head_buf: [128]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf, "{{\"kind\":\"echo_reply\",\"t\":{d},\"seq\":{d},\"bytes\":{d},\"pad\":\"", .{ stamp, sequence, size }) catch return;
+
+    _ = stream.write(head);
+
+    var pad: [1024]u8 = undefined;
+    @memset(&pad, 'a');
+
+    // One write, sized to the room the peer advertised: a stream that is asked for more than its window
+    // holds is the client's limit to state, and writing past it is what makes the engine fail the session.
+    // The reply is closed either way, so the page always has a line to read.
+    const room = stream.writable();
+    const take = @min(size, @min(pad.len, room));
+    if (take > 0) _ = stream.write(pad[0..take]);
+
+    var remaining = size - take;
+    while (remaining > 0) {
+        const next = stream.writable();
+        if (next == 0) break;
+
+        const chunk = @min(remaining, @min(pad.len, next));
+        const queued = stream.write(pad[0..chunk]);
+        remaining -= queued;
+        if (queued < chunk) break;
+    }
+
+    // The pad this could not write is left out rather than sent late: the reply has to be a whole line, and
+    // the page reads the size it was given back from the JSON rather than from what it asked for.
+    if (size == 0 or remaining == 0) _ = stream.write("\"}\n");
+}
+
 fn writeLine(stream: *const zix.Webtransport.Stream, line: []const u8) void {
     if (line.len == 0) return;
 

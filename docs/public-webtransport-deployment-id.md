@@ -73,12 +73,17 @@ TLS berakhir di dalamnya, port untuk challenge HTTP adalah permukaan kedua yang 
 - Key dari klien ACME dikonversi ke bentuk yang diterima pembaca PEM server ini (SEC1, bukan PKCS#8).
 - Perpanjangan berjalan di mesinnya.
 
-### Batasan yang diketahui: satu sertifikat per berkas
+### Rantai sertifikat disajikan utuh
 
-Pembaca PEM menerima satu sertifikat, sehingga server tidak bisa menyajikan chain. Klien yang sudah
-memegang otoritas perantaranya menerima leaf-nya; klien yang belum melaporkan bahwa ia tidak bisa
-mendapatkan sertifikat penerbit lokal. Menyajikan chain membutuhkan pesan Certificate pada TLS untuk
-membawa lebih dari satu entri, dan itu perubahan di lapisan TLS dan HTTP/3, bukan urusan deployment.
+Pembaca PEM mendekode setiap blok CERTIFICATE pada berkas, entitas akhir lebih dulu, dan pesan Certificate
+pada TLS membawa tiap blok sebagai satu entri, sehingga klien menerima leaf beserta intermediate yang
+merantainya ke otoritasnya. Itulah yang dibutuhkan klien ketat: klien yang belum memegang intermediate
+melaporkan penerbit lokalnya tidak ditemukan lalu menolak koneksi. Entrypoint karena itu menyalin berkas
+fullchain dari klien ACME, bukan menyederhanakannya menjadi satu sertifikat.
+
+Satu rantai berukuran beberapa kilobyte, lebih besar daripada satu paket Handshake QUIC, jadi server memecah
+handshake flight ke sebanyak paket yang diperlukan, masing-masing membawa CRYPTO frame pada offset yang
+dipakai peer untuk menyusun ulang.
 
 ---
 
@@ -94,7 +99,11 @@ lapisan berikutnya.
 | Passthrough edge | minta halamannya lalu periksa penerbitnya | sertifikat aplikasinya, bukan milik edge |
 | Listener | log prosesnya | dua listener: HTTP/3 pada port UDP yang diteruskan, HTTPS/1.1 pada port internal |
 | Pengantaran UDP | penangkapan pada port yang diteruskan sambil mengirim | datagram tiba di mesinnya |
+| Rantai | periksa sertifikat yang disajikan server | leaf beserta intermediate yang merantainya ke otoritasnya |
 | Session | tekan kontrol session di halamannya | session terbuka, dilaporkan lewat HTTP/3 |
+| Permintaan session | panel protokol di halamannya | dua koneksi yang dipisahkan: koneksi dokumennya sendiri, dan session lewat HTTP/3 dengan binding yang disepakati server; baris session adalah CONNECT yang diterima server, sampai ke token `:protocol`, path, dan authority |
+| Penghitung | view state di halamannya | pesan yang diterima pada stream, patch yang menggerakkan view durable, dan revisi durable: balasan pengukuran adalah pesan, bukan patch |
+| Laju | tekan tombol ukur di halamannya | round trip pada kedua kanal beserta batch asal tiap persentil, dan satu pertukaran 4 KiB yang dilabeli sebagai satu pertukaran |
 
 ---
 

@@ -293,7 +293,7 @@ QUIC folds TLS 1.3 into the transport. The deterministic layers are pure-Zig fro
 | Initial keys | Derived from the client's Destination Connection ID (RFC 9001 5.2), AES-128-GCM. |
 | ClientHello | Reassembled from CRYPTO frames, X25519 key share and transport parameters read out. |
 | ServerHello | X25519 ECDHE, cipher / group negotiation, sealed into an Initial packet. Handshake keys derived. |
-| Handshake flight | EncryptedExtensions (ALPN `h3` + `quic_transport_parameters`), Certificate, CertificateVerify, Finished, all in one CRYPTO frame sealed with the Handshake keys. 1-RTT application keys derived. |
+| Handshake flight | EncryptedExtensions (ALPN `h3` + `quic_transport_parameters`), Certificate, CertificateVerify, Finished, as CRYPTO frames across as many Handshake packets as the flight needs: a certificate chain runs to several kilobytes and one packet carries about eleven hundred bytes of it. Each packet holds its frame at the offset the peer reassembles from. 1-RTT application keys derived. |
 | 1-RTT | Short-header packets, application keys, requests served. |
 
 The certificate can be ECDSA P-256, Ed25519, or RSA, from the same `Tls.Context` as the TCP engines (an RSA cert signs with `rsa_pss_rsae_sha256`). 0-RTT is rejected by default.

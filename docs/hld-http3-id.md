@@ -293,7 +293,7 @@ QUIC melipat TLS 1.3 ke dalam transport. Layer deterministik pure-Zig dari RFC, 
 | Initial keys | Diturunkan dari Destination Connection ID client (RFC 9001 5.2), AES-128-GCM. |
 | ClientHello | Direassembly dari CRYPTO frame, X25519 key share dan transport parameter dibaca. |
 | ServerHello | X25519 ECDHE, negosiasi cipher / group, di-seal ke Initial packet. Handshake keys diturunkan. |
-| Handshake flight | EncryptedExtensions (ALPN `h3` + `quic_transport_parameters`), Certificate, CertificateVerify, Finished, semuanya dalam satu CRYPTO frame yang di-seal dengan Handshake keys. Application keys 1-RTT diturunkan. |
+| Handshake flight | EncryptedExtensions (ALPN `h3` + `quic_transport_parameters`), Certificate, CertificateVerify, Finished, sebagai CRYPTO frame pada sebanyak paket Handshake yang dibutuhkan: satu rantai sertifikat mencapai beberapa kilobyte dan satu paket membawa sekitar sebelas ratus byte. Tiap paket membawa frame-nya pada offset yang dipakai peer untuk menyusun ulang. Application keys 1-RTT diturunkan. |
 | 1-RTT | Short-header packet, application keys, request dilayani. |
 
 Sertifikat bisa ECDSA P-256, Ed25519, atau RSA, dari `Tls.Context` yang sama seperti engine TCP (sertifikat RSA menandatangani dengan `rsa_pss_rsae_sha256`). 0-RTT ditolak secara default.
