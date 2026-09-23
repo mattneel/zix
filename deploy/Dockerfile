@@ -16,7 +16,7 @@ RUN zig build example-webtransport_tasks --prefix /out
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl postgresql openssl \
+    && apt-get install -y --no-install-recommends ca-certificates curl openssl postgresql tcpdump \
     && rm -rf /var/lib/apt/lists/*
 # lego rather than certbot: it has a Spaceship DNS provider, and a DNS-01 challenge needs nothing inbound -
 # no port 80 through a proxy, no HTTP surface on a machine whose whole point is that TLS ends inside it.
