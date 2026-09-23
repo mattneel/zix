@@ -16,7 +16,7 @@ RUN zig build example-webtransport_tasks --prefix /out
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates certbot libnss3-tools \
+    && apt-get install -y --no-install-recommends ca-certificates certbot libnss3-tools postgresql \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/bin/zix-example-webtransport_tasks-x86_64-linux-debug /app/zix-demo
