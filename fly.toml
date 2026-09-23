@@ -47,14 +47,17 @@ primary_region = "iad"
   [[services.ports]]
     port = 443
 
-# ACME HTTP-01: certbot's standalone responder binds 80 inside the machine and the proxy passes the
-# challenge through untouched.
-[[services]]
-  internal_port = 80
-  protocol = "tcp"
-
-  [[services.ports]]
-    port = 80
+# Port 80 is deliberately absent until a certificate is being issued. certbot's standalone responder needs it
+# for the ACME HTTP-01 challenge, but with no DOMAIN set nothing binds it, and an edge that finds no listener
+# on a declared service refuses connections for the whole app rather than just that port. Add this block back
+# at the same time as DOMAIN and ACME_EMAIL:
+#
+#   [[services]]
+#     internal_port = 80
+#     protocol = "tcp"
+#
+#     [[services.ports]]
+#       port = 80
 
 [[vm]]
   size = "shared-cpu-1x"
