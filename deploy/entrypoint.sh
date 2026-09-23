@@ -16,10 +16,9 @@ STATE=/data/letsencrypt
 # certificate is served instead and browsers need the SPKI pin - the machine still runs, which is what makes
 # a staged deployment possible.
 if [ -n "$DOMAIN" ]; then
-    if [ ! -d "$STATE/live/$DOMAIN" ]; then
-        echo "[entrypoint] requesting a certificate for $DOMAIN"
-        certbot certonly --standalone --non-interactive --agree-tos --email "$ACME_EMAIL" \
-            -d "$DOMAIN" --config-dir "$STATE" --work-dir /data/work --logs-dir /data/logs
+    if [ ! -d "$STATE/certificates/$DOMAIN" ]; then
+        echo "[entrypoint] requesting a certificate for $DOMAIN through a DNS-01 challenge"
+        lego --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN" --path "$STATE" --accept-tos run
     fi
 
     # A renewal loop: certificates last 90 days and nothing else here would notice. A renewed certificate
@@ -27,12 +26,18 @@ if [ -n "$DOMAIN" ]; then
     (
         while :; do
             sleep 12h
-            certbot renew --quiet --config-dir "$STATE" --work-dir /data/work --logs-dir /data/logs || true
+            lego --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN" --path "$STATE" --accept-tos renew --days 30 || true
         done
     ) &
 
-    export ZIX_CERT="$STATE/live/$DOMAIN/fullchain.pem"
-    export ZIX_KEY="$STATE/live/$DOMAIN/privkey.pem"
+    # The server reads one certificate and a SEC1 key. lego writes the leaf chain and a PKCS#8 key, so the
+    # leaf is taken out of the chain and the key converted - the same form the bundled certificate uses.
+    openssl x509 -in "$STATE/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem"
+    openssl ec -in "$STATE/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
+        || cp "$STATE/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
+
+    export ZIX_CERT="$STATE/serving-cert.pem"
+    export ZIX_KEY="$STATE/serving-key.pem"
 else
     # No domain, so no certificate authority will issue for this name. Mint one for the app's own hostname
     # instead: still self-signed, so a browser needs the pin, but its SAN matches the Host a browser sends -

@@ -16,8 +16,12 @@ RUN zig build example-webtransport_tasks --prefix /out
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates certbot libnss3-tools postgresql \
+    && apt-get install -y --no-install-recommends ca-certificates curl postgresql openssl \
     && rm -rf /var/lib/apt/lists/*
+# lego rather than certbot: it has a Spaceship DNS provider, and a DNS-01 challenge needs nothing inbound -
+# no port 80 through a proxy, no HTTP surface on a machine whose whole point is that TLS ends inside it.
+RUN curl -fsSL https://github.com/go-acme/lego/releases/latest/download/lego_v4.25.0_linux_amd64.tar.gz \
+    | tar -xz -C /usr/local/bin lego
 WORKDIR /app
 COPY --from=build /out/bin/zix-example-webtransport_tasks-x86_64-linux-debug /app/zix-demo
 # The development certificate, so the machine runs before a domain exists; the entrypoint moves ZIX_CERT and
