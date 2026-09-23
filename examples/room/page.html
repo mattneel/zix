@@ -42,6 +42,7 @@
       <dt>members</dt><dd id="members">—</dd>
       <dt>log</dt><dd id="logbytes">—</dd>
       <dt>presence</dt><dd id="presence">—</dd>
+      <dt>replay</dt><dd><button id="replay">download the run log</button> <span class="dim" id="replay-state">—</span></dd>
     </dl>
     <h2 style="font-size:13px;margin:16px 0 6px" class="dim">events</h2>
     <pre id="events"></pre>
@@ -49,7 +50,7 @@
 </main>
 <script type="module">
 const ui = {};
-for (const id of ["conn","agree","room","source","tick","server-digest","tab-digest","members","logbytes","presence","events","view"]) {
+for (const id of ["conn","agree","room","source","tick","server-digest","tab-digest","members","logbytes","presence","events","view","replay","replay-state"]) {
   ui[id] = document.getElementById(id);
 }
 // Element ids are dashed, so the map is the only accessor: ui["server-digest"], never a camelCase name.
@@ -71,11 +72,28 @@ const u64 = (v) => BigInt.asUintN(64, BigInt(v));
 let session = null, writer = null, feedWriter = null;
 let seed = 0, source = 0;
 
+/// Open a session, and open it again whenever one ends.
+///
+/// The room lives on the server, so a client never has to recover state — it has to reconnect and replay.
+/// That is the same recovery for every failure: a closed session, a stream that ended, or a confirmed record
+/// the client cannot apply because it fell behind. gkz's own page does exactly this, and for the same reason.
+let attempts = 0;
+let closing = false;
+
 async function open() {
-  session = new WebTransport(new URL("/room", location.origin));
-  ui.conn.textContent = "dialing";
-  await session.ready;
+  try {
+    session = new WebTransport(new URL("/room", location.origin));
+    ui.conn.textContent = "dialing";
+    await session.ready;
+  } catch (err) {
+    ui.conn.textContent = "failed";
+    scheduleReconnect("dial failed: " + err);
+
+    return;
+  }
+
   ui.conn.textContent = "open";
+  attempts = 0;
   log("session", "ready (HTTP/3)");
 
   const control = await session.createBidirectionalStream();
@@ -83,8 +101,21 @@ async function open() {
   void readControl(control.readable.getReader());
   void readPresence();
 
-  session.closed.then(() => { ui.conn.textContent = "closed"; log("session", "closed"); })
-                 .catch((err) => { ui.conn.textContent = "failed"; log("session", "closed: " + err); });
+  session.closed.then((info) => {
+    if (closing) return;
+    ui.conn.textContent = "closed";
+    scheduleReconnect("closed (" + (info?.reason ?? "no reason") + ")");
+  }).catch((err) => { ui.conn.textContent = "failed"; scheduleReconnect("closed: " + err); });
+}
+
+/// Back off, then rejoin. The room is the server's: rejoining seats this client again and hands it the
+/// confirmed stream so far, so the arena it renders is the one everyone else is in.
+function scheduleReconnect(why) {
+  if (closing) return;
+  const delay = Math.min(4000, 250 * (attempts + 1));
+  attempts++;
+  log("session", why + " — rejoining in " + delay + "ms");
+  setTimeout(() => { void open(); }, delay);
 }
 
 // The server frames two kinds of message on the stream: [1][len] JSON, [2][len] run-log INPUT records.
@@ -108,7 +139,9 @@ async function readControl(reader) {
         else if (tag === 2) applyRecords(payload);
       }
     }
-  } catch (err) { log("stream", "ended: " + err); }
+  } catch (err) {
+    if (!closing) { log("stream", "ended: " + err); scheduleReconnect("stream ended"); }
+  }
 }
 
 function applyRecords(payload) {
@@ -131,6 +164,9 @@ function applyRecords(payload) {
       if (x.cl_apply(frame.length) === 0) {
         const at = new DataView(payload.buffer, payload.byteOffset + p + 5, 8).getBigUint64(0, true);
         log("apply", "refused a record for tick " + at + " while at tick " + x.cl_tick());
+        scheduleReconnect("stream gap");
+
+        return;
       }
     }
     p += 5 + len;
@@ -218,8 +254,59 @@ function draw() {
   }
 }
 
+/// The run log, on a stream of its own. The host answers on a second stream rather than the control one:
+/// the log is the whole session, it is wanted on demand, and mixing it into the confirmed stream would put
+/// the replay in the path of the thing being replayed. Whatever comes back is byte-for-byte what a native
+/// replay consumes, so the download is not a rendering of the session — it is the session.
+async function fetchRunLog() {
+  const state = ui["replay-state"];
+  state.textContent = "requesting…";
+  const stream = await session.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  const reader = stream.readable.getReader();
+  await writer.write(new Uint8Array([1]));
+
+  let buf = new Uint8Array(0);
+  const push = (chunk) => { const out = new Uint8Array(buf.length + chunk.length); out.set(buf); out.set(chunk, buf.length); buf = out; };
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (value) {
+      push(value);
+      // Credit to continue: a stream is written as far as its window allows, so the host needs a nudge per
+      // chunk it gets to send.
+      if (buf.length < 4 || buf.length < 4 + new DataView(buf.buffer, buf.byteOffset).getUint32(0, true)) {
+        await writer.write(new Uint8Array([2]));
+      }
+    }
+    if (done) break;
+    if (buf.length >= 4 && buf.length >= 4 + new DataView(buf.buffer, buf.byteOffset).getUint32(0, true)) break;
+  }
+
+  const len = new DataView(buf.buffer, buf.byteOffset).getUint32(0, true);
+  const bytes = buf.slice(4, 4 + len);
+  state.textContent = len + " bytes";
+  log("replay", "run log: " + len + " bytes");
+  return bytes;
+}
+
 // The module and the host-side handles, for scripted checks against a running page.
-window.room = { x, u64, read: { tick: () => x.cl_tick(), confirmed: () => x.cl_confirmed(), digest: () => String(u64(x.cl_digest())), ptick: () => x.cl_ptick() }, session: () => session, log };
+//
+// Not `window.room`: this page has an element with that id, and a named element is already a property of
+// the window, so the name would address the element rather than this object.
+window.gkz = { x, u64, read: { tick: () => x.cl_tick(), confirmed: () => x.cl_confirmed(), digest: () => String(u64(x.cl_digest())), ptick: () => x.cl_ptick() }, session: () => session, log, fetchRunLog,
+  lastLog: null };
+
+ui.replay.addEventListener("click", async () => {
+  try {
+    const bytes = await fetchRunLog();
+    window.gkz.lastLog = bytes;
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+    const a = document.createElement("a");
+    a.href = url; a.download = "room-" + ui.room.textContent + ".gkzl";
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (err) { ui["replay-state"].textContent = "failed: " + err; }
+});
 
 await open();
 // A pull a few times a second keeps the confirmed stream flowing even when nobody moves.

@@ -200,7 +200,7 @@ fn onStream(session: *zix.Webtransport.Session, stream: *const zix.Webtransport.
 
     if (p.control_stream == 0) {
         p.control_stream = stream.id();
-        sendHello(stream, p) catch {};
+        _ = sendHello(stream, p);
         sendPending(stream, p) catch {};
 
         return;
@@ -311,11 +311,11 @@ fn seat(session: *zix.Webtransport.Session) ?*Participant {
     return p;
 }
 
-fn sendHello(stream: *const zix.Webtransport.Stream, p: *Participant) !void {
+fn sendHello(stream: *const zix.Webtransport.Stream, p: *Participant) bool {
     var buf: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(&buf, "{{\"type\":\"hello\",\"room\":\"{s}\",\"seed\":{d},\"source\":{d},\"tick\":{d},\"policy\":\"reactive\"}}", .{
+    const line = std.fmt.bufPrint(&buf, "{{\"type\":\"hello\",\"room\":\"{s}\",\"seed\":{d},\"source\":{d},\"tick\":{d},\"policy\":\"reactive\"}}", .{
         room_host.code, room_host.seed, p.source, room_host.tick(),
-    });
+    }) catch return false;
 
     return sendJson(stream, line);
 }
@@ -327,35 +327,55 @@ fn sendPending(stream: *const zix.Webtransport.Stream, p: *Participant) !void {
     const status = try std.fmt.bufPrint(&buf, "{{\"type\":\"status\",\"tick\":{d},\"digest\":\"{d}\",\"members\":{d},\"horizon\":{d},\"logBytes\":{d}}}", .{
         room_host.tick(), room_host.digest(), room_host.members(), room_host.horizon(), room_host.log.items.len,
     });
-    try sendJson(stream, status);
+    _ = sendJson(stream, status);
 
     filtered.clearRetainingCapacity();
     try host.filterInputs(gpa, room_host.log.items, &filtered);
 
     while (p.sent < filtered.items.len) {
-        const room = stream.writable();
-        if (room < 5) break; // the frame header alone will not fit: the next pull continues
-        const take = @min(@min(room - 5, max_record_frame), filtered.items.len - p.sent);
-        try sendRecords(stream, filtered.items[p.sent..][0..take]);
-        p.sent += take;
+        const remaining = filtered.items.len - p.sent;
+        const budget = @min(remaining, max_record_frame);
+        // A frame smaller than the budget is written whole if it fits at all, so a busy stream makes
+        // progress in smaller steps rather than waiting for a window it may never get.
+        if (!sendRecords(stream, filtered.items[p.sent..][0..budget])) {
+            const room = stream.writable();
+            const smaller = @min(remaining, if (room > 5) room - 5 else 0);
+            if (smaller == 0 or !sendRecords(stream, filtered.items[p.sent..][0..smaller])) break;
+            p.sent += smaller;
+
+            continue;
+        }
+        p.sent += budget;
     }
 }
 
-fn sendJson(stream: *const zix.Webtransport.Stream, line: []const u8) !void {
-    var buf: [520]u8 = undefined;
-    buf[0] = tag_json;
-    std.mem.writeInt(u32, buf[1..5], @intCast(line.len), .little);
-    @memcpy(buf[5..][0..line.len], line);
+/// Scratch for one framed message. The largest frame the host writes is a record batch plus its header.
+var frame_buf: [max_record_frame + 5]u8 = undefined;
 
-    _ = stream.write(buf[0 .. 5 + line.len]);
+/// Write one framed message whole or not at all, and report whether it went.
+///
+/// Whole or not at all matters here: a stream is a byte stream, so a frame that is half written would leave
+/// the reader's parser expecting the rest of a message that never comes, and every later frame would be read
+/// as the tail of this one. If the window cannot take it, the caller keeps the bytes and the next pull sends
+/// them — the participant's cursor must only ever advance over bytes the peer actually has.
+fn writeFrame(stream: *const zix.Webtransport.Stream, tag: u8, payload: []const u8) bool {
+    const need = 5 + payload.len;
+    if (need > frame_buf.len) return false;
+    if (stream.writable() < need) return false;
+
+    frame_buf[0] = tag;
+    std.mem.writeInt(u32, frame_buf[1..5], @intCast(payload.len), .little);
+    @memcpy(frame_buf[5..][0..payload.len], payload);
+
+    return stream.write(frame_buf[0..need]) == need;
 }
 
-fn sendRecords(stream: *const zix.Webtransport.Stream, records: []const u8) !void {
-    var header: [5]u8 = undefined;
-    header[0] = tag_records;
-    std.mem.writeInt(u32, header[1..5], @intCast(records.len), .little);
-    _ = stream.write(&header);
-    _ = stream.write(records);
+fn sendJson(stream: *const zix.Webtransport.Stream, line: []const u8) bool {
+    return writeFrame(stream, tag_json, line);
+}
+
+fn sendRecords(stream: *const zix.Webtransport.Stream, records: []const u8) bool {
+    return writeFrame(stream, tag_records, records);
 }
 
 /// The run log on its own stream: the replay, and what a natively replayable session is proven by. One byte
@@ -374,8 +394,11 @@ fn sendRunLog(stream: *const zix.Webtransport.Stream, p: *Participant) void {
     while (p.replay_sent < run_log.len) {
         const take = @min(stream.writable(), run_log.len - p.replay_sent);
         if (take == 0) break;
-        _ = stream.write(run_log[p.replay_sent..][0..take]);
-        p.replay_sent += take;
+        // Advance by what the stream took, not by what was offered: a short write means the rest is still
+        // owed, and the reader is assembling the log by its length rather than by frames.
+        const written = stream.write(run_log[p.replay_sent..][0..take]);
+        if (written == 0) break;
+        p.replay_sent += written;
     }
 
     if (p.replay_sent >= run_log.len) stream.finish();
