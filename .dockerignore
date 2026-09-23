@@ -1,0 +1,12 @@
+# Only the sources, the build script and the deployment directory belong in the build context. The compiler
+# cache alone is tens of gigabytes, and every byte of the context is uploaded to the builder on every
+# deploy and copied into an image that never reads it.
+.zig-cache/
+zig-out/
+.git/
+.gitignore
+rnd/
+docs/
+deploy/README.md
+examples/*.html
+**/__pycache__/
