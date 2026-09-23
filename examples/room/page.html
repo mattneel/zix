@@ -19,6 +19,13 @@
   dd { margin:0; }
   .ok { color:var(--accent); } .bad { color:#ff7b72; }
   pre { margin:0; padding:10px; background:#05070a; border:1px solid var(--line); border-radius:6px; max-height:220px; overflow:auto; font-size:12px; }
+  .forkrow { display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+  .forkrow input[type=range] { flex:1; min-width:120px; }
+  .forkrow button { padding:2px 10px; }
+  #branch-view { margin-top:10px; border-color:#3a2c4a; }
+  dl.inline { grid-template-columns:auto 1fr; margin-top:8px; }
+  details#hood { border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  details#hood summary { cursor:pointer; color:var(--dim); }
 </style>
 </head>
 <body>
@@ -31,8 +38,33 @@
   <section>
     <canvas id="view" width="320" height="200"></canvas>
     <p class="dim">Arrow keys or WASD move. Every keypress is one Command on the room's input channel.</p>
+
+    <h2>time machine</h2>
+    <p class="dim">Scrub back through the confirmed stream, branch at any tick, and give the branch a different
+    first move. Both futures then run side by side: the living room for everyone else, and yours.</p>
+    <div class="forkrow">
+      <label for="fork-at" class="dim">branch at</label>
+      <input type="range" id="fork-at" min="1" max="1" value="1" disabled>
+      <span class="dim" id="fork-label">—</span>
+    </div>
+    <div class="forkrow">
+      <span class="dim">then move</span>
+      <button data-move="0,-1">up</button><button data-move="0,1">down</button>
+      <button data-move="-1,0">left</button><button data-move="1,0">right</button>
+      <span class="dim" id="fork-state">—</span>
+    </div>
+    <canvas id="branch-view" width="320" height="200"></canvas>
+    <dl class="inline">
+      <dt>branch tick</dt><dd id="branch-tick">—</dd>
+      <dt>branch digest</dt><dd id="branch-digest">—</dd>
+      <dt>fork point</dt><dd id="fork-point">—</dd>
+    </dl>
+    <p class="dim" id="branch-note">A branch starts as a copy of the room at the tick you chose: replaying the
+    same confirmed inputs has to produce the same digest, and after a different move it must not.</p>
   </section>
   <section>
+    <details id="hood">
+    <summary>Under the hood — transport and durable state</summary>
     <dl>
       <dt>room</dt><dd id="room">—</dd>
       <dt>source</dt><dd id="source">—</dd>
@@ -46,11 +78,12 @@
     </dl>
     <h2 style="font-size:13px;margin:16px 0 6px" class="dim">events</h2>
     <pre id="events"></pre>
+    </details>
   </section>
 </main>
 <script type="module">
 const ui = {};
-for (const id of ["conn","agree","room","source","tick","server-digest","tab-digest","members","logbytes","presence","events","view","replay","replay-state"]) {
+for (const id of ["conn","agree","room","source","tick","server-digest","tab-digest","members","logbytes","presence","events","view","replay","replay-state","hood","fork-at","fork-label","fork-state","branch-view","branch-tick","branch-digest","fork-point","branch-note"]) {
   ui[id] = document.getElementById(id);
 }
 // Element ids are dashed, so the map is the only accessor: ui["server-digest"], never a camelCase name.
@@ -144,6 +177,19 @@ async function readControl(reader) {
   }
 }
 
+/// The confirmed stream as this tab received it: one run-log INPUT record per confirmed tick, in order.
+/// It is the same bytes a native replay consumes, which is what a branch is replayed from.
+let recorded = [];
+
+/// Apply one run-log record to an instance. Both the living room and a branch go through here, because a
+/// branch is not a different kind of thing — it is the same room, fed a different stream from one tick on.
+function applyTo(inst, frame) {
+  const inbox = inst.in_reserve(frame.length);
+  new Uint8Array(inst.memory.buffer, inbox, frame.length).set(frame);
+
+  return inst.cl_apply(frame.length);
+}
+
 function applyRecords(payload) {
   // Each record is [u8 kind][u32 len][payload]; the client refuses a snapshot rather than accepting world
   // state from the wire, so the filter here mirrors the server's.
@@ -157,11 +203,11 @@ function applyRecords(payload) {
       // The whole record, header included: `cl_apply` walks its inbox with the run-log reader, so what it
       // wants is exactly the bytes the host put on the wire, not the input frame inside them.
       const frame = payload.subarray(p, p + 5 + len);
-      const inbox = x.in_reserve(frame.length);
-      new Uint8Array(x.memory.buffer, inbox, frame.length).set(frame);
+      const took = applyTo(x, frame);
+      if (took !== 0) recorded.push(frame.slice());
       // A refusal is a gap in the confirmed stream, a replay of something already applied, or world state on
       // the wire. Reporting it is the difference between "the view is behind" and "the view is wrong".
-      if (x.cl_apply(frame.length) === 0) {
+      if (took === 0) {
         const at = new DataView(payload.buffer, payload.byteOffset + p + 5, 8).getBigUint64(0, true);
         log("apply", "refused a record for tick " + at + " while at tick " + x.cl_tick());
         scheduleReconnect("stream gap");
@@ -177,6 +223,8 @@ function applyRecords(payload) {
 function handleJson(msg) {
   if (msg.type === "hello") {
     seed = msg.seed; source = msg.source;
+    recorded = [];
+    branch = null;
     x.cl_init(seed);
     x.cl_set_source(source);
     ui.room.textContent = msg.room;
@@ -235,17 +283,111 @@ function refresh() {
   const agree = u64(x.cl_digest()) === BigInt(ui["server-digest"].textContent || "-1");
   ui.agree.textContent = agree ? "digests agree ✓" : "catching up…";
   ui.agree.className = agree ? "ok" : "dim";
-  draw();
+
+  // The scrubber spans what has been confirmed so far; the newest tick is one past the last record.
+  ui["fork-at"].max = String(Math.max(1, recorded.length));
+  if (Number(ui["fork-at"].value) > recorded.length) ui["fork-at"].value = String(recorded.length);
+  ui["fork-label"].textContent = recorded.length === 0 ? "—" : (recorded.length + " confirmed ticks");
+  ui["fork-at"].disabled = recorded.length === 0;
+
+  draw(x, ui.view);
+  refreshBranch();
 }
 
-function draw() {
-  const live = x.cl_live();
-  const n = x.cl_extent();
-  const buf = new DataView(x.memory.buffer, x.cl_buf(), n * 4 * 4);
-  const ctx = ui.view.getContext("2d");
+ui["fork-at"].addEventListener("input", () => {
+  const at = Number(ui["fork-at"].value);
+  ui["fork-point"].textContent = "record " + at + " of " + recorded.length;
+});
+
+for (const button of document.querySelectorAll("[data-move]")) {
+  button.addEventListener("click", () => {
+    const [dx, dy] = button.dataset.move.split(",").map(Number);
+    void forkBranch(dx, dy);
+  });
+}
+
+/// One Command, in the room's own layout: `[u32 index][u32 generation][u16 verb][u16 source][i64 a0]
+/// [i64 a1][i64 a2]`, little-endian, 36 bytes. The hero is entity {0,0} (gkz's example spawns the player
+/// first for exactly this reason) and a move is verb 3 with the two deltas in a0/a1 — the same command the
+/// server builds when a key is pressed.
+function moveFrame(tick, source, dx, dy) {
+  const command = new ArrayBuffer(36);
+  const cv = new DataView(command);
+  cv.setUint32(0, 0, true);          // actor.index
+  cv.setUint32(4, 0, true);          // actor.generation
+  cv.setUint16(8, 3, true);          // verb MOVE
+  cv.setUint16(10, source, true);    // provenance: which participant issued it
+  cv.setBigInt64(12, BigInt(dx), true);
+  cv.setBigInt64(20, BigInt(dy), true);
+  cv.setBigInt64(28, 0n, true);
+
+  const payload = new Uint8Array(8 + 4 + 36);
+  const pv = new DataView(payload.buffer);
+  pv.setBigUint64(0, BigInt(tick), true);
+  pv.setUint32(8, 1, true);          // one command
+  payload.set(new Uint8Array(command), 12);
+
+  // Wrapped as the run-log record `cl_apply` reads: [u8 kind = INPUT][u32 len][payload].
+  const frame = new Uint8Array(5 + payload.length);
+  const fv = new DataView(frame.buffer);
+  fv.setUint8(0, 1);
+  fv.setUint32(1, payload.length, true);
+  frame.set(payload, 5);
+
+  return frame;
+}
+
+/// Fork the room. A fresh instance replays the confirmed prefix — which must produce the digest the living
+/// room had at that tick — and then takes one different decision. From there the two futures are two
+/// instances of the same room, and nobody else is in yours.
+async function forkBranch(dx, dy) {
+  const at = Number(ui["fork-at"].value);
+  if (recorded.length === 0) { ui["fork-state"].textContent = "nothing to branch from yet"; return; }
+
+  const inst = (await WebAssembly.instantiate(wasmBytes, {})).instance.exports;
+  inst.cl_init(seed);
+  inst.cl_set_source(source);
+
+  for (const f of recorded.slice(0, at)) {
+    if (applyTo(inst, f) === 0) { ui["fork-state"].textContent = "the prefix did not replay"; return; }
+  }
+  const forkTick = inst.cl_tick();
+  const forkDigest = String(u64(inst.cl_digest()));
+
+  const tick = forkTick + 1;
+  if (applyTo(inst, moveFrame(tick, source, dx, dy)) === 0) {
+    ui["fork-state"].textContent = "the branch refused its first move";
+    return;
+  }
+  inst.cl_predict(dx, dy);
+
+  branch = { x: inst, forkTick, forkDigest };
+  ui["fork-point"].textContent = "tick " + forkTick + " (record " + at + " of " + recorded.length + ")";
+  ui["fork-state"].textContent = "branched";
+  const note = "same prefix, different move: the fork replayed to digest " + forkDigest +
+    ", and the branch now reads " + String(u64(inst.cl_digest())) + ".";
+  ui["branch-note"].textContent = note;
+  log("branch", note);
+  refreshBranch();
+}
+
+let branch = null;
+
+function refreshBranch() {
+  if (!branch) return;
+  ui["branch-tick"].textContent = String(branch.x.cl_tick());
+  ui["branch-digest"].textContent = String(u64(branch.x.cl_digest()));
+  draw(branch.x, ui["branch-view"]);
+}
+
+function draw(inst, canvas) {
+  const live = inst.cl_live();
+  const n = inst.cl_extent();
+  const buf = new DataView(inst.memory.buffer, inst.cl_buf(), n * 4 * 4);
+  const ctx = canvas.getContext("2d");
   ctx.fillStyle = "#05070a";
-  ctx.fillRect(0, 0, ui.view.width, ui.view.height);
-  const sx = ui.view.width / 32, sy = ui.view.height / 20;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const sx = canvas.width / 32, sy = canvas.height / 20;
   for (let i = 0; i < live; i++) {
     const px = buf.getInt32(i * 16), py = buf.getInt32(i * 16 + 4);
     const hp = buf.getInt32(i * 16 + 8), team = buf.getInt32(i * 16 + 12);
