@@ -5,7 +5,7 @@ The development loop is: save an edit, rebuild, restart/reload, see the change. 
 rebuild half of that, and does it by *edit depth* so the growth question ("what does an edit cost as the
 application grows?") has a number instead of a guess:
 
-  - no-op: nothing changed, everything cached — the floor (process start plus build graph)
+  - no-op: nothing changed, everything cached: the floor (process start plus build graph)
   - page: the embedded HTML changes, so no Zig is recompiled at all
   - slice module, example, core library file: progressively deeper Zig compilation
 
