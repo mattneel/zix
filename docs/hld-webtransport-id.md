@@ -347,7 +347,7 @@ Masing-masing dengan alasannya, supaya tidak ada yang menurunkan ulang pertanyaa
 | :- | :- | :- |
 | `http3_webtransport` | 9089 | session di `/echo`: setiap chunk stream data dipantulkan kembali (dengan FIN setelah seluruh chunk keluar), setiap datagram dipantulkan, satu stream unidirectional per session yang menulis banner lalu FIN, dan lifecycle session dicetak ke stderr |
 | `webtransport_live` | 9443 (TCP dan UDP) | live view yang dirender browser: halaman lewat HTTPS/1.1 di TCP dan session lewat HTTP/3 di UDP, satu port dan satu origin. Satu tick pada stream bidirectional menjadi increment event dan patch DOM, sebuah datagram membawa note dan mengembalikan patch-nya, stream kedua mengunggah 64 KiB dengan progress sementara tick tetap mengalir, dan reconnect menyinkronkan ulang dari snapshot. |
-| `webtransport_tasks` | 9444 (TCP dan UDP) | satu aksi durable dari ujung ke ujung: halaman mengirim typed form event dengan idempotency key lewat stream reliabel, server memvalidasi dan mengotorisasi, satu transaksi menulis task dan job-nya, worker me-lease dan menjalankan job, satu transaksi completion menulis update task, penyelesaian job, dan baris outbox, dispatcher mempublikasikannya, dan view yang terotorisasi mem-patch dirinya dari state yang sudah commit. `examples/durable/tasks.zig` memuat slice-nya; `zig build test-durable` menjalankan tujuh skenario acceptance terhadap PostgreSQL nyata, dan `scripts/bench_durable_tasks.py` mengukurnya. |
+| `webtransport_tasks` | 9444 QUIC · 9445 TCP | satu aksi durable dari ujung ke ujung: halaman mengirim typed form event dengan idempotency key lewat stream reliabel, server memvalidasi dan mengotorisasi, satu transaksi menulis task dan job-nya, worker me-lease dan menjalankan job, satu transaksi completion menulis update task, penyelesaian job, dan baris outbox, dispatcher mempublikasikannya, dan view yang terotorisasi mem-patch dirinya dari state yang sudah commit. `examples/durable/tasks.zig` memuat slice-nya; `zig build test-durable` menjalankan tujuh skenario acceptance terhadap PostgreSQL nyata, dan `scripts/bench_durable_tasks.py` mengukurnya. |
 
 ### Aksi durable
 
@@ -372,6 +372,46 @@ rujukan untuk satu aksi:
 
 Mutasi durable menumpang stream bidirectional yang reliabel. Datagram tetap untuk apa yang memang cocok:
 state transient yang boleh hilang — halaman memakainya hanya untuk typing hint.
+
+Yang *bukan* demo ini, dan yang dibutuhkan sebuah produk sebagai gantinya: identitasnya adalah dropdown
+yang dikirim halaman pada setiap subscription, jadi otorisasinya adalah pencarian baris pada tabel yang
+di-seed, bukan principal terautentikasi yang bisa dipercaya telah dibangun oleh transport; dan schema dibuat
+saat start serta tabel demo di-truncate agar satu run mulai bersih, bukan diterapkan lewat migrasi dengan
+riwayat yang dibutuhkan deployment nyata. Keduanya adalah pekerjaan framework di sekitar jalur ini, bukan
+bagian dari jalur itu: invarian slice-nya sendiri — satu transaksi per langkah, lease dengan token,
+idempotensi lewat unique key, dan outbox dengan revisi — tidak bergantung pada keduanya.
+
+Demo ini menyajikan halamannya lewat TCP di 9445 dan session lewat QUIC di 9444, dan bentuk itu berbeda dari
+contoh lain dengan sengaja. Browser yang diminta memaksa QUIC untuk sebuah origin — yang dibutuhkan sertifikat
+self-signed — mengirim *setiap* request ke origin itu lewat QUIC, dan halaman yang dilayani di sana tidak bisa
+reload saat server sedang dibangun ulang: reload-nya, dan poll versi yang memicunya, gagal dengan handshake.
+Melayani halaman lewat TCP menjaga reload tetap bebas dari siklus hidup server QUIC, yang persis itulah yang
+diukur development loop di bawah, sementara session tetap menuju port QUIC.
+
+### Development loop
+
+`scripts/dev_loop_bench.py` mengukur loop yang benar-benar dijalani developer pada slice ini: dari suntingan
+sumber sampai *browser* memperlihatkan perubahannya. Ini pengukuran yang berbeda dari benchmark runtime di
+atas, dan perbedaannya justru intinya — runtime yang cepat tidak mengatakan apa pun tentang berapa lama
+sebuah save menjadi terlihat.
+
+Stopwatch mulai pada penulisan file dan berakhir saat browser melapor kembali, jadi ia mencakup hal yang
+tidak ditangkap angka compiler saja: build, restart server, reload halaman, dan reconnect session setelahnya.
+Tiga suntingan diukur, masing-masing dengan observabelnya sendiri:
+
+| Suntingan | Yang berubah | Yang dibuktikan browser |
+| :- | :- | :- |
+| handler | balasan handler WebTransport, plus build token yang dirender halaman | token yang disubstitusi server ada di DOM, dan aksi durable tetap selesai |
+| render | markup halaman itu sendiri dan mark yang direndernya | mark yang dirender halaman ada di DOM, dan aksi durable tetap selesai |
+| type | tipe `Task` milik slice bersama, yang memaksa modul, contoh, dan setiap konsumennya dibangun ulang | hal yang sama, setelah build yang harus mengompilasi ulang modulnya juga |
+
+Mekanismenya kecil dan berguna diketahui saat membaca angkanya: server menyajikan halaman dengan token
+disubstitusi, mengekspos `/devloop/version` (hash dari byte yang persis disajikan) dan `/verified` (laporan
+browser); halaman — dibuka sekali dengan `?devloop` — mem-poll versi, me-reload dirinya saat berubah, lalu
+dial, subscribe, mengirim aksi durable, menunggu patch completion, dan baru melapor ketika perubahan yang
+menjadi asal build-nya terlihat di DOM. Satu instance Chromium tetap terbuka antar iterasi, jadi satu iterasi
+membayar reload dan reconnect, bukan startup browser, dan skrip memulihkan working tree dari salinan di
+memori sehingga satu run tidak pernah menyentuh apa pun yang belum di-commit developer.
 
 ### Menjalankan demo browser
 

@@ -51,9 +51,19 @@ CHROME = Path(
     os.environ.get("ZIX_CHROME", "/home/autark/.omp/puppeteer/chrome/linux-150.0.7871.24/chrome-linux64/chrome")
 )
 SPKI = "icvjpo9jth21Jte9ZDs5vIYTVbMdL4UUewni7JD1ZsI="
-PORT = 9444
+# The session's QUIC port (the origin Chrome is told to force QUIC on) and the page's TCP port.
+QUIC_PORT = 9444
+PAGE_PORT = 9445
 
 # Each edit is a list of (file, old, new) where `new` may carry a {mark} the runner fills in per iteration.
+# The token lives in the Zig source (the server substitutes it into the page); the mark lives in the page
+# itself. An edit moves one of them, so the pair the page reports back differs per kind.
+EXPECTED = {
+    "handler": lambda mark: (mark, "m0"),
+    "render": lambda mark: ("d0", mark),
+    "type": lambda mark: (mark, "m0"),
+}
+
 EDITS = {
     "handler": [
         (
@@ -63,8 +73,8 @@ EDITS = {
         ),
         (
             EXAMPLE,
-            '"{{\\"kind\\":\\"accepted\\",\\"task_id\\":{d},\\"rev\\":{d},\\"duplicate\\":{}}}\\n"',
-            '"{{\\"kind\\":\\"accepted\\",\\"task_id\\":{d},\\"rev\\":{d},\\"duplicate\\":{},\\"dev\\":\\"{mark}\\"}}\\n"',
+            '\\"duplicate\\":{}}}\\n"',
+            '\\"duplicate\\":{},\\"dev\\":\\"{mark}\\"}}\\n"',
         ),
     ],
     "render": [
@@ -137,12 +147,50 @@ def metadata(chrome_path: Path) -> dict:
             "flags": [
                 "--ignore-certificate-errors",
                 f"--ignore-certificate-errors-spki-list={SPKI}",
-                f"--origin-to-force-quic-on=127.0.0.1:{PORT}",
+                f"--origin-to-force-quic-on=127.0.0.1:{QUIC_PORT}",
             ],
             "note": "one instance for the whole run: the page reloads itself, so iterations pay reload, not launch",
         },
         "commit": subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip(),
     }
+
+
+def launch_browser(chrome_path: Path, tag: str) -> subprocess.Popen:
+    """One headless Chromium on the demo page, in its own profile.
+
+    Note:
+    - The flags are the harness's own set for this demo: accept the self-signed certificate by its SPKI,
+      force QUIC for the session's origin, and never throttle timers (a throttled poll loop would measure
+      Chrome rather than the build).
+    """
+    return subprocess.Popen(
+        [
+            str(chrome_path),
+            "--headless=new",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--ignore-certificate-errors",
+            f"--ignore-certificate-errors-spki-list={SPKI}",
+            f"--origin-to-force-quic-on=127.0.0.1:{QUIC_PORT}",
+            f"--user-data-dir=/tmp/dev-loop-profile-{tag}",
+            f"https://127.0.0.1:{PAGE_PORT}/?devloop",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def close_browser(browser: subprocess.Popen | None) -> None:
+    if browser is None:
+        return
+    browser.terminate()
+    try:
+        browser.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        browser.kill()
 
 
 class Server:
@@ -173,13 +221,15 @@ class Server:
             self.process.kill()
         self.process = None
 
-    def wait_for(self, needle: str, offset: int, timeout: float, started: float) -> float:
+    def wait_for(self, needle: str, offset: int, timeout: float, started: float, fail_on: str = "") -> float:
+        """Wait for the browser's success report, and stop early when it reports a failure instead."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             text = self.log_path.read_text(errors="ignore")
-            index = text.find(needle, offset)
-            if index >= 0:
+            if text.find(needle, offset) >= 0:
                 return (time.monotonic() - started) * 1000
+            if fail_on and text.find(fail_on, offset) >= 0:
+                raise TimeoutError(f"the browser reported that it never rendered the change ({needle!r})")
             time.sleep(0.005)
 
         raise TimeoutError(f"browser never verified {needle!r}")
@@ -205,7 +255,9 @@ class Editor:
             text = path.read_text()
             if old not in text:
                 raise SystemExit(f"{path}: edit anchor not found for {kind}")
-            path.write_text(text.replace(old, new, 1))
+            # Only {mark} is substituted, with a plain replace: the Zig format strings in these edits are full
+            # of braces that python's format() would try to interpret.
+            path.write_text(text.replace(old, new.replace("{mark}", mark), 1))
 
     def restore(self) -> None:
         for path, content in self.original.items():
@@ -226,6 +278,17 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=120.0, help="seconds one iteration may take")
     parser.add_argument("--json", default="")
     parser.add_argument("--chrome", default=str(CHROME))
+    parser.add_argument(
+        "--fresh-browser",
+        action="store_true",
+        help="launch a browser per iteration instead of keeping one open (a page reload cannot always re-dial "
+        "an origin Chrome was told to force QUIC on)",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="drive an already-open page instead of launching Chromium (the page must already be in ?devloop mode)",
+    )
     args = parser.parse_args()
 
     chrome_path = Path(args.chrome)
@@ -239,22 +302,34 @@ def main() -> int:
     log_path.write_text("")
     server = Server(log_path)
 
-    print("starting the browser (it stays open for the whole run)")
-    browser = subprocess.Popen(
+    # The server comes up first, so the browser's very first load has something to talk to.
+    server.start()
+
+    if args.no_browser:
+        print("using the page that is already open")
+        browser = None
+    else:
+        print("starting the browser (it stays open for the whole run)")
+        browser = subprocess.Popen(
         [
             str(chrome_path),
             "--headless=new",
             "--no-sandbox",
             "--disable-dev-shm-usage",
+            # Headless Chrome throttles timers in a backgrounded page, which would starve the poll loop the
+            # page runs to notice a new build: the loop would measure Chrome's throttling, not the build.
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
             f"--user-data-dir=/tmp/dev-loop-profile-{os.getpid()}",
             "--ignore-certificate-errors",
             f"--ignore-certificate-errors-spki-list={SPKI}",
-            f"--origin-to-force-quic-on=127.0.0.1:{PORT}",
-            f"https://127.0.0.1:{PORT}/?devloop",
+            f"--origin-to-force-quic-on=127.0.0.1:{QUIC_PORT}",
+            f"https://127.0.0.1:{PAGE_PORT}/?devloop",
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     editor = Editor()
     results: dict[str, dict[str, list[float]]] = {}
@@ -272,9 +347,13 @@ def main() -> int:
                 mark = f"{kind[0]}{iteration + 1}"
                 editor.restore()
                 log_path.write_text("")
-                server.stop()
-                server.start()  # a warm server so the page's polls survive the iteration's own restart
                 time.sleep(0.2)
+
+                if args.fresh_browser:
+                    server.start()
+                    browser = launch_browser(chrome_path, f"{kind}{iteration}-{os.getpid()}")
+                    time.sleep(1.5)
+                    server.stop()
 
                 # The stopwatch starts here, at the file write, exactly as a developer experiences it.
                 started = time.monotonic()
@@ -297,7 +376,12 @@ def main() -> int:
                 server.stop()
                 restart_ms = server.start()
 
-                total = server.wait_for(f"verified token={mark}&mark={mark}", fresh, args.timeout, started)
+                token, page_mark = EXPECTED[kind](mark)
+                success = f"verified {token}/{page_mark}"
+                total = server.wait_for(success, fresh, args.timeout, started, fail_on="verified none/none")
+
+                if args.fresh_browser:
+                    close_browser(browser)
 
                 measured["build"].append(build_ms)
                 measured["restart"].append(restart_ms)
@@ -306,11 +390,12 @@ def main() -> int:
                 print(f"  #{iteration + 1}: total {total:7.0f}ms  (build {build_ms:6.0f}  restart {restart_ms:5.0f}  reload+verify {total - build_ms - restart_ms:6.0f})")
     finally:
         server.stop()
-        browser.terminate()
-        try:
-            browser.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            browser.kill()
+        if browser is not None:
+            browser.terminate()
+            try:
+                browser.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                browser.kill()
         editor.restore()
 
     print("\n=== development loop: save -> visible browser change ===")

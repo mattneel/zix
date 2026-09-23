@@ -87,3 +87,5 @@ common_test.*
 ##
 ## file: exclude
 ##
+scripts/__pycache__/
+*.pyc

@@ -109,7 +109,9 @@
 const DEV_TOKEN = "__DEV_TOKEN__";
 const DEV_MARK = "m0";
 
-const ENDPOINT = new URL("/tasks", location.href);
+// The page is served over TCP and the session lives on the QUIC port, so the session's URL names that port
+// rather than this page's origin.
+const ENDPOINT = new URL("https://" + location.hostname + ":9444/tasks");
 const state = { sessions: 0, patches: 0, duplicates: 0, events: 0, revision: 0, lastKey: null };
 
 const ui = {};
@@ -350,23 +352,30 @@ async function devloop() {
     }
   }, 50);
 
-  await openSession();
-  await subscribe();
-  await create(null);
-  await tick(3);
+  // Retry for as long as it takes. An attempt can land while the server is being rebuilt or restarted — the
+  // loop's own subject — and a development loop that gave up on the first refusal would measure nothing.
+  for (;;) {
+    try {
+      await openSession();
+      await subscribe();
+      await create(null);
 
-  const deadline = Date.now() + 20000;
-  while (Date.now() < deadline) {
-    const row = document.querySelector("#tasks tr td.state span");
-    const build = (document.querySelector("#build") || {}).textContent || "";
-    if (row && row.textContent === "completed" && build === DEV_TOKEN + "·" + DEV_MARK) {
-      await fetch("/verified?token=" + encodeURIComponent(DEV_TOKEN) + "&mark=" + encodeURIComponent(DEV_MARK));
-      return;
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        const row = document.querySelector("#tasks tr td.state span");
+        const build = (document.querySelector("#build") || {}).textContent || "";
+        if (row && row.textContent === "completed" && build === DEV_TOKEN + "·" + DEV_MARK) {
+          await fetch("/verified/" + encodeURIComponent(DEV_TOKEN) + "/" + encodeURIComponent(DEV_MARK));
+          return;
+        }
+        await sleepFor(100);
+      }
+    } catch (err) {
+      // The server may not be up yet, or the session it served is gone: try again.
     }
-    await sleepFor(100);
-  }
 
-  await fetch("/verified?token=none&mark=none");
+    await sleepFor(400);
+  }
 }
 
 function sleepFor(ms) {

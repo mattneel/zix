@@ -346,7 +346,7 @@ Each with a reason, so nobody re-derives the question:
 | :- | :- | :- |
 | `http3_webtransport` | 9089 | sessions on `/echo`: every data stream chunk echoed back (with a FIN once the whole chunk went out), every datagram echoed, one unidirectional stream per session writing a banner then a FIN, and the session lifecycle printed on stderr |
 | `webtransport_live` | 9443 (TCP and UDP) | a live view a browser renders: the page over HTTPS/1.1 on TCP and the session over HTTP/3 on UDP, one port and one origin. A tick on a bidirectional stream becomes an increment event and a DOM patch, a datagram carries a note and returns its patch, a second stream uploads 64 KiB with progress while the ticks keep flowing, and reconnecting resynchronizes from the snapshot. |
-| `webtransport_tasks` | 9444 (TCP and UDP) | a durable action end to end: the page submits a typed form event with an idempotency key over a reliable stream, the server validates and authorizes it, one transaction writes the task and its job, a worker leases and runs the job, one completion transaction writes the task update, the job completion and an outbox row, a dispatcher publishes it, and the authorized view patches itself from committed state. `examples/durable/tasks.zig` holds the slice; `zig build test-durable` runs its seven acceptance scenarios against a real PostgreSQL, and `scripts/bench_durable_tasks.py` measures it. |
+| `webtransport_tasks` | 9444 QUIC · 9445 TCP | a durable action end to end: the page submits a typed form event with an idempotency key over a reliable stream, the server validates and authorizes it, one transaction writes the task and its job, a worker leases and runs the job, one completion transaction writes the task update, the job completion and an outbox row, a dispatcher publishes it, and the authorized view patches itself from committed state. `examples/durable/tasks.zig` holds the slice; `zig build test-durable` runs its seven acceptance scenarios against a real PostgreSQL, and `scripts/bench_durable_tasks.py` measures it. |
 
 ### Durable actions
 
@@ -370,6 +370,45 @@ as the reference for one:
 
 Durable mutations ride reliable bidirectional streams. Datagrams stay what they are good for — replaceable
 transient state — which the page uses for its typing hint and nothing else.
+
+What the demo is *not*, and what a product needs instead: the identity is a dropdown the page sends with
+each subscription, so authorization is a row lookup against a seeded table rather than an authenticated
+principal the transport can be trusted to have established; and the schema is created on startup and the
+demo's tables are truncated so a run starts clean, rather than applied by migrations with the history a real
+deployment needs. Both are framework work around this path, not part of the path: the slice's own invariants
+— one transaction per step, a lease with a token, idempotency by unique key, and an outbox with revisions —
+do not depend on either.
+
+The demo serves its page over TCP on 9445 and the session over QUIC on 9444, which is not the same shape as
+the other examples on purpose. A browser told to force QUIC for an origin — what a self-signed certificate
+needs — sends *every* request to that origin over QUIC, and a page served there cannot reload while the
+server is being rebuilt: its reload, and the version poll that triggers it, fail with the handshake. Serving
+the page on TCP keeps the reload independent of the QUIC server's lifecycle, which is exactly what the
+development loop below measures, while the session still goes to the QUIC port.
+
+### Development loop
+
+`scripts/dev_loop_bench.py` measures the loop a developer actually lives in on this slice: a source edit until
+the *browser* shows the change. It is a different measurement from the runtime benchmark above, and the
+distinction is the point — a fast runtime says nothing about how long a save takes to become visible.
+
+The stopwatch starts at the file write and ends when the browser reports back, so it includes what a
+compiler-only number leaves out: the build, the server restart, the page reload, and the reconnection the
+session makes afterwards. Three edits are measured, each with its own observable:
+
+| Edit | What changes | What the browser proves |
+| :- | :- | :- |
+| handler | the WebTransport handler's reply, plus the build token the page renders | the token the server substituted is in the DOM, and a durable action still completes |
+| render | the page's own markup and the mark it renders | the mark the page rendered is in the DOM, and a durable action still completes |
+| type | the shared slice's `Task` type, which the module, the example and every consumer rebuild | the same, after a build that had to recompile the module too |
+
+The mechanism is small and worth knowing when reading the numbers: the server serves the page with the
+token substituted, exposes `/devloop/version` (a hash of exactly those bytes) and `/verified` (the browser's
+report); the page — opened once with `?devloop` — polls the version, reloads itself when it changes, and then
+dials, subscribes, submits a durable action, waits for the completion patch, and only reports when the change
+it was built from is visible in the DOM. One Chromium instance stays open across iterations, so an iteration
+pays reload and reconnection rather than browser startup, and the script restores the working tree from an
+in-memory copy so a run never touches anything the developer has not committed.
 
 ### Driving the browser demo
 

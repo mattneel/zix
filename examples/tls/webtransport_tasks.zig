@@ -32,8 +32,14 @@ const tasks = @import("durable_tasks");
 // --------------------------------------------------------- //
 
 const IP: []const u8 = "127.0.0.1";
-/// The port the demo binds twice: TCP for the page, UDP for the session.
+/// The session's port: HTTP/3 over QUIC, where the WebTransport binding lives.
 const PORT: u16 = 9444;
+/// The page's port: HTTPS/1.1 over TCP. It is deliberately *not* the QUIC port. A browser that is told to
+/// force QUIC for an origin sends every request to that origin over QUIC, so a page served there cannot
+/// reload while the server is being rebuilt — and the development loop is exactly a rebuild followed by a
+/// reload. Serving the page on TCP keeps reload (and the version poll that triggers it) independent of the
+/// QUIC server's lifecycle, while the session still goes to the QUIC port.
+const PAGE_PORT: u16 = 9445;
 /// Where the durable store lives. Every example in this repository points at a fixed local database; this
 /// is the one it points at.
 const DSN: []const u8 = "postgres://zix:zix@127.0.0.1:5432/zix_dev";
@@ -145,8 +151,8 @@ fn page(req: *zix.Http1.Request, res: *zix.Http1.Response, _: *zix.Http1.Context
     }
 
     // The browser's own report that it rendered the changed behaviour and finished a durable action.
-    if (std.mem.startsWith(u8, path, "/verified")) {
-        std.debug.print("[devloop] verified {s}\n", .{path["/verified".len..]});
+    if (std.mem.startsWith(u8, path, "/verified/")) {
+        std.debug.print("[devloop] verified {s}\n", .{path["/verified/".len..]});
 
         return sendText(res, "ok\n");
     }
@@ -599,7 +605,7 @@ pub fn main(process: std.process.Init) !void {
     var page_server = zix.Http1.Server.init(page, .{
         .io = process.io,
         .ip = IP,
-        .port = PORT,
+        .port = PAGE_PORT,
         .tls = &page_tls,
         .dispatch_model = if (builtin.os.tag == .linux) .URING else .ASYNC,
         .workers = 1,
@@ -643,7 +649,7 @@ pub fn main(process: std.process.Init) !void {
     }.serve, .{&page_server});
     page_thread.detach();
 
-    log("page https://{s}:{d}/ · session https://{s}:{d}{s}", .{ IP, PORT, IP, PORT, SESSION_PATH });
+    log("page https://{s}:{d}/ · session https://{s}:{d}{s}", .{ IP, PAGE_PORT, IP, PORT, SESSION_PATH });
 
     try tasks_server.run();
 }
