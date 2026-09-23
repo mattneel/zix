@@ -23,33 +23,32 @@ if [ -n "$DOMAIN" ]; then
     echo "[entrypoint] acme client: $(command -v lego || echo missing) $(lego --version 2>/dev/null | head -1)"
     if [ ! -d "$STATE/certificates/$DOMAIN" ]; then
         echo "[entrypoint] requesting a certificate for $DOMAIN through a DNS-01 challenge"
-        if ! lego --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN" --path "$STATE" --accept-tos run; then
+        if ! (cd "$STATE" && lego run --accept-tos --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN"); then
             echo "[entrypoint] WARNING: the certificate request failed; serving the development certificate"
             acme_ok=no
         fi
     fi
 
-    if [ "$acme_ok" = no ]; then
-        DOMAIN=""
+    if [ "$acme_ok" = yes ]; then
+        # A renewal loop: certificates last 90 days and nothing else here would notice. lego 5 has no renew
+        # command - `run` is both, deciding from the certificate's remaining lifetime - and a renewal takes
+        # effect on the next restart, which is this deployment's one manual step.
+        (
+            while :; do
+                sleep 12h
+                (cd "$STATE" && lego run --accept-tos --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN" --renew-days 30) || true
+            done
+        ) &
+
+        # The server reads one certificate and a SEC1 key. lego writes the leaf chain and a PKCS#8 key, so
+        # the leaf is taken out of the chain and the key converted, the form the bundled certificate uses.
+        openssl x509 -in "$STATE/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem"
+        openssl ec -in "$STATE/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
+            || cp "$STATE/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
+
+        export ZIX_CERT="$STATE/serving-cert.pem"
+        export ZIX_KEY="$STATE/serving-key.pem"
     fi
-
-    # A renewal loop: certificates last 90 days and nothing else here would notice. A renewed certificate
-    # is picked up on the next restart, which is the one manual step this deployment has.
-    (
-        while :; do
-            sleep 12h
-            lego --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN" --path "$STATE" --accept-tos renew --days 30 || true
-        done
-    ) &
-
-    # The server reads one certificate and a SEC1 key. lego writes the leaf chain and a PKCS#8 key, so the
-    # leaf is taken out of the chain and the key converted - the same form the bundled certificate uses.
-    openssl x509 -in "$STATE/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem"
-    openssl ec -in "$STATE/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
-        || cp "$STATE/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
-
-    export ZIX_CERT="$STATE/serving-cert.pem"
-    export ZIX_KEY="$STATE/serving-key.pem"
 else
     # No domain, so no certificate authority will issue for this name. Mint one for the app's own hostname
     # instead: still self-signed, so a browser needs the pin, but its SAN matches the Host a browser sends -
