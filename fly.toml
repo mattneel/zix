@@ -17,6 +17,8 @@
 app = "zix-webtransport-demo"
 primary_region = "iad"
 
+# This lives at the repository root because Fly resolves `dockerfile` relative to this file and uses this
+# file's directory as the build context: from deploy/ the sources would not be in the context at all.
 [build]
   dockerfile = "deploy/Dockerfile"
 
