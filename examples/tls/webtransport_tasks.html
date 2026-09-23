@@ -109,9 +109,13 @@
 const DEV_TOKEN = "__DEV_TOKEN__";
 const DEV_MARK = "m0";
 
-// The page is served over TCP and the session lives on the QUIC port, so the session's URL names that port
-// rather than this page's origin.
-const ENDPOINT = new URL("https://" + location.hostname + ":9444/tasks");
+// The session shares this page's origin: the server answers this page with
+// `Alt-Svc: h3=":9444"`, which is how a browser learns that this origin is also reachable over HTTP/3. The
+// WebTransport dial then rides that HTTP/3 connection. Naming the QUIC port directly would be a *different*
+// origin, and no browser can discover HTTP/3 for an origin it has never had an Alt-Svc (or an HTTPS DNS
+// record) for — dialing the port only ever worked under a browser launched with
+// --origin-to-force-quic-on, which is not a demo anybody can open.
+const ENDPOINT = new URL("/tasks", location.origin);
 const state = { sessions: 0, patches: 0, duplicates: 0, events: 0, revision: 0, lastKey: null };
 
 const ui = {};

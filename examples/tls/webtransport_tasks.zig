@@ -159,7 +159,12 @@ fn page(req: *zix.Http1.Request, res: *zix.Http1.Response, _: *zix.Http1.Context
 
     var head_buf: [192]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n\r\n", .{served_page_len}) catch return;
+    // Alt-Svc is how a browser finds out that this session's origin speaks HTTP/3. The page is served over
+    // TCP, and the session port is QUIC-only, so without this header a normal browser has no way to learn
+    // that https://host:9444 is reachable over QUIC: it tries TCP, finds nothing, and the WebTransport
+    // dial fails. Only a browser launched with --origin-to-force-quic-on could connect, which is not a demo
+    // anybody can run.
+    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAlt-Svc: h3=\":{d}\"; ma=86400\r\n\r\n", .{ served_page_len, PORT }) catch return;
 
     try res.sendRaw(head.buffered());
     try res.sendRaw(served_page[0..served_page_len]);
@@ -168,7 +173,7 @@ fn page(req: *zix.Http1.Request, res: *zix.Http1.Response, _: *zix.Http1.Context
 fn sendText(res: *zix.Http1.Response, body: []const u8) !void {
     var head_buf: [128]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n\r\n", .{body.len}) catch return;
+    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAlt-Svc: h3=\":{d}\"; ma=86400\r\n\r\n", .{ body.len, PORT }) catch return;
 
     try res.sendRaw(head.buffered());
     try res.sendRaw(body);

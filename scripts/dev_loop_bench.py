@@ -147,8 +147,7 @@ def metadata(chrome_path: Path) -> dict:
             "flags": [
                 "--ignore-certificate-errors",
                 f"--ignore-certificate-errors-spki-list={SPKI}",
-                f"--origin-to-force-quic-on=127.0.0.1:{QUIC_PORT}",
-            ],
+                ],
             "note": "one instance for the whole run: the page reloads itself, so iterations pay reload, not launch",
         },
         "commit": subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip(),
@@ -159,9 +158,10 @@ def launch_browser(chrome_path: Path, tag: str) -> subprocess.Popen:
     """One headless Chromium on the demo page, in its own profile.
 
     Note:
-    - The flags are the harness's own set for this demo: accept the self-signed certificate by its SPKI,
-      force QUIC for the session's origin, and never throttle timers (a throttled poll loop would measure
-      Chrome rather than the build).
+    - The flags are the harness's own set for this demo: accept the self-signed certificate by its SPKI and
+      never throttle timers (a throttled poll loop would measure Chrome rather than the build). No
+      force-QUIC flag is needed: the page advertises its HTTP/3 origin over Alt-Svc, which is also what
+      makes the demo reachable from an ordinary browser.
     """
     return subprocess.Popen(
         [
@@ -306,7 +306,13 @@ def main() -> int:
     server.start()
 
     if args.no_browser:
-        print("using the page that is already open")
+        print("using the page that is already open (--no-browser)")
+        browser = None
+    elif args.fresh_browser:
+        print(
+            "launching a browser per iteration (--fresh-browser: label these separately, browser startup is "
+            "part of what they measure)"
+        )
         browser = None
     else:
         print("starting the browser (it stays open for the whole run)")

@@ -320,6 +320,81 @@ test "durable tasks: a worker whose lease expired cannot complete the job anothe
     try testing.expectEqual(@as(i64, 4), try countOf(conn, outbox_in, t));
 }
 
+test "durable tasks: a takeover racing a completion leaves exactly one completion" {
+    var harness = Harness.init();
+    defer harness.deinit();
+
+    var tenant_buf: [32]u8 = undefined;
+    const t = try harness.tenant(&tenant_buf, "t-race");
+
+    var store = try harness.openStore();
+    defer store.deinit();
+
+    try store.truncate();
+    try harness.principal(&store, t, "alice");
+
+    const conn = try harness.conn();
+    defer conn.deinit();
+
+    // One race per round: a worker that stalled past its lease completes while another worker takes the job
+    // over. The guard must serialize them, because both sides are writes against the same row: the
+    // completion is a conditional UPDATE (attempts must still be this attempt's, state still running), and a
+    // takeover leases only rows that are queued or whose lease expired. Exactly one of them may win, and the
+    // task must never end up completed twice or completed by the attempt that lost.
+    var round: usize = 0;
+    while (round < 10) : (round += 1) {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "race-{d}", .{round});
+        const created = (try store.create(.{ .principal = "alice", .tenant = t, .idempotency_key = key, .title = "race" })).accepted;
+        store.reset();
+
+        const stale = (try store.lease(80)).?;
+        try testing.expectEqual(created.task_id, stale.task_id);
+        harness.io().sleep(.fromMilliseconds(120), .awake) catch {};
+
+        var takeover_store = try harness.openStore();
+        defer takeover_store.deinit();
+
+        var racer = Racer{ .store = &takeover_store, .result = null };
+        var thread = try std.Thread.spawn(.{}, Racer.run, .{&racer});
+
+        // The stale attempt completes at the same moment the takeover runs.
+        const stale_result = try store.complete(stale, "the stale attempt");
+        thread.join();
+        store.reset();
+
+        const leaser_won = racer.result != null;
+        const completer_won = stale_result == .committed;
+
+        // Exactly one of the two writes won the row.
+        try testing.expect(leaser_won != completer_won);
+
+        // And exactly one completion exists, whichever it was.
+        const completed = try store.snapshot(t);
+        const row = for (completed.tasks) |task| {
+            if (task.id == created.task_id) break task;
+        } else unreachable;
+
+        try testing.expectEqualStrings("completed", row.state);
+        const completions = try conn.queryRow(
+            CountRow,
+            "SELECT count(*)::int8 AS n FROM outbox WHERE tenant_id = $1 AND kind = 'task_completed' AND payload->'task'->>'id' = $2",
+            .{ t, try std.fmt.allocPrint(harness.allocator, "{d}", .{created.task_id}) },
+        );
+        try testing.expectEqual(@as(i64, 1), completions.?.n);
+    }
+}
+
+/// The other half of the race: a worker taking over a job while its previous attempt completes.
+const Racer = struct {
+    store: *tasks.Store,
+    result: ?tasks.Lease,
+
+    fn run(self: *Racer) void {
+        self.result = self.store.lease(5_000) catch null;
+    }
+};
+
 test "durable tasks: a crash after the commit, before publication, still delivers" {
     var harness = Harness.init();
     defer harness.deinit();
