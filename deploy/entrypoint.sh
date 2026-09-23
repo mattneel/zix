@@ -34,9 +34,28 @@ if [ -n "$DOMAIN" ]; then
     export ZIX_CERT="$STATE/live/$DOMAIN/fullchain.pem"
     export ZIX_KEY="$STATE/live/$DOMAIN/privkey.pem"
 else
-    echo "[entrypoint] DOMAIN is not set: serving the bundled development certificate."
-    echo "[entrypoint] Browsers need the SPKI pin for it. Set DOMAIN (and ACME_EMAIL) for a certificate"
-    echo "[entrypoint] this machine holds itself, which is what removes the flags."
+    # No domain, so no certificate authority will issue for this name. Mint one for the app's own hostname
+    # instead: still self-signed, so a browser needs the pin, but its SAN matches the Host a browser sends -
+    # and zix answers 421 Misdirected Request for a Host its certificate does not cover, so a certificate
+    # that only names localhost cannot serve this deployment at all. Kept on the volume so the pin is stable
+    # across deploys.
+    app_host=${FLY_APP_NAME:-localhost}.fly.dev
+    STATE=/data/selftest
+
+    if [ ! -f "$STATE/cert.pem" ]; then
+        echo "[entrypoint] minting a certificate for $app_host"
+        mkdir -p "$STATE"
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout "$STATE/key.pem" -out "$STATE/cert.pem" -days 3650 \
+            -subj "/O=zix demo/CN=$app_host" -addext "subjectAltName=DNS:$app_host" >/dev/null 2>&1
+    fi
+
+    export ZIX_CERT="$STATE/cert.pem"
+    export ZIX_KEY="$STATE/key.pem"
+
+    spki=$(openssl x509 -in "$STATE/cert.pem" -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl base64)
+    echo "[entrypoint] certificate for $app_host, self-signed. To open the page, launch a browser with:"
+    echo "[entrypoint]   --ignore-certificate-errors-spki-list=$spki --origin-to-force-quic-on=$app_host:443"
 fi
 
 # A database in this machine. The demo truncates and seeds its own fixtures at startup, so nothing here
