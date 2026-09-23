@@ -151,6 +151,35 @@ pub fn addSteps(
 
     // --------------------------------------------------------- //
 
+    // The durable-slice acceptance suite. Kept out of `test-all` on purpose: it runs against a real
+    // PostgreSQL (`ZIX_TASKS_DSN`, or `DATABASE_URL`), because its scenarios are about the SQL the slice
+    // runs — a unique index, a rollback, a `SKIP LOCKED` lease — and a wire-protocol fake cannot fail them
+    // the way a database does.
+    {
+        const durable_tasks_mod = b.createModule(.{
+            .root_source_file = b.path("examples/durable/tasks.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        durable_tasks_mod.addImport("zix", zix);
+
+        const durable_options = b.addOptions();
+        durable_options.addOption([]const u8, "dsn", b.option([]const u8, "durable-dsn", "PostgreSQL DSN the durable acceptance suite runs against") orelse
+            "postgres://zix:zix@127.0.0.1:5432/zix_durable_test");
+
+        const durable_mod = b.createModule(.{
+            .root_source_file = b.path("tests/integration/durable/tasks_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        durable_mod.addImport("zix", zix);
+        durable_mod.addImport("durable_tasks", durable_tasks_mod);
+        durable_mod.addOptions("durable_options", durable_options);
+
+        const durable_step = b.step("test-durable", "Run the durable CreateTask acceptance suite (needs PostgreSQL)");
+        durable_step.dependOn(testRunStep(b, b.addTest(.{ .root_module = durable_mod }), foreign_target, "tests/integration/durable/tasks_test.zig"));
+    }
+
     const behaviour_test_step = b.step("behaviour-test", "Run behaviour tests");
 
     const behaviour_tests = .{

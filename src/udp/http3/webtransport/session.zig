@@ -179,22 +179,35 @@ pub const SendSide = struct {
     }
 
     /// Note that the peer acknowledged `[offset, offset + len)`: drop every outstanding range the
-    /// acknowledgement covers and return how many bytes are now free at the front of the buffer.
+    /// acknowledgement covers, trim the head of one it only partly covers, and return how many bytes are
+    /// now free at the front of the buffer.
     ///
     /// Note:
-    /// - A range only partly covered by the acknowledgement stays outstanding, which can only postpone a
-    ///   free, never free a byte the peer has not confirmed.
+    /// - Ranges merge on send (`noteSent` folds a contiguous send into the previous entry), while an
+    ///   acknowledgement arrives per packet, so a merged range is almost never covered whole: without the
+    ///   head trim below a stream whose bytes are all acknowledged would still report nothing freed, fill
+    ///   its buffer, and stall with data the peer confirmed long ago.
+    /// - An acknowledgement of a range's middle leaves it outstanding, which can only postpone a free,
+    ///   never free a byte the peer has not confirmed.
     pub fn noteAcked(self: *SendSide, offset: u64, len: u64) u64 {
         const end = offset + len;
         var index: u8 = 0;
         while (index < self.outstanding_len) {
-            const range = self.outstanding[index];
-            if (range.offset >= offset and range.offset + range.len <= end) {
+            const range = &self.outstanding[index];
+            const range_end = range.offset + range.len;
+
+            if (range.offset >= offset and range_end <= end) {
                 var move = index;
                 while (move + 1 < self.outstanding_len) : (move += 1) self.outstanding[move] = self.outstanding[move + 1];
                 self.outstanding_len -= 1;
                 self.outstanding[self.outstanding_len] = .{};
                 continue;
+            }
+
+            // The acknowledgement reaches into this range from the front: keep only the unconfirmed tail.
+            if (range.offset < end and range_end > end) {
+                range.len = range_end - end;
+                range.offset = end;
             }
 
             index += 1;
@@ -1042,6 +1055,26 @@ test "zix webtransport: 5.6.2 the incoming stream count is limited per kind" {
     // The two kinds have separate limits: an exhausted bidirectional limit says nothing about unidirectional.
     try std.testing.expectEqual(@as(u64, 2), flow.streams_bidi_received);
     try std.testing.expectEqual(@as(u64, 1), flow.streams_uni_received);
+}
+
+test "zix webtransport: 4.1 a merged send range frees its prefix from per-packet acknowledgements" {
+    var send = SendSide{ .open = true, .queued = 3000, .sent = 3000, .high_water = 3000, .limit = 1 << 20 };
+
+    // Three sends that are contiguous merge into one outstanding range, which is what a steady stream does.
+    send.noteSent(0, 1000);
+    send.noteSent(1000, 1000);
+    send.noteSent(2000, 1000);
+    try std.testing.expectEqual(@as(u8, 1), send.outstanding_len);
+
+    // The peer acknowledges one packet at a time: each one frees its own bytes, so the buffer drains as the
+    // stream advances instead of waiting for an acknowledgement that covers the whole merged range.
+    try std.testing.expectEqual(@as(u64, 1000), send.noteAcked(0, 1000));
+    try std.testing.expectEqual(@as(u64, 1000), send.noteAcked(1000, 1000));
+    try std.testing.expectEqual(@as(u64, 1000), send.noteAcked(2000, 1000));
+
+    try std.testing.expectEqual(@as(u64, 3000), send.acked);
+    try std.testing.expectEqual(@as(u64, 0), send.queued);
+    try std.testing.expectEqual(@as(u8, 0), send.outstanding_len);
 }
 
 test "zix webtransport: 5.3 opening streams respects the peer limit" {

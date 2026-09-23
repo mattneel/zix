@@ -71,6 +71,7 @@ pub fn addSteps(
         .{ "example-http3_static", "examples/tls/http3_static.zig", "http3" },
         .{ "example-http3_webtransport", "examples/tls/http3_webtransport.zig", "http3" },
         .{ "example-webtransport_live", "examples/tls/webtransport_live.zig", "http3" },
+        .{ "example-webtransport_tasks", "examples/tls/webtransport_tasks.zig", "http3" },
         .{ "example-webrtc_datachannel_echo", "examples/webrtc/webrtc_datachannel_echo.zig", "webrtc" },
         .{ "example-webrtc_native_pair", "examples/webrtc/webrtc_native_pair.zig", "webrtc" },
         .{ "example-webrtc_signaling", "examples/webrtc/webrtc_signaling.zig", "webrtc" },
@@ -142,6 +143,16 @@ pub fn addSteps(
     examples_step.dependOn(group_http3);
     examples_step.dependOn(group_webrtc);
 
+    // The durable CreateTask slice the tasks example and its acceptance suite both build on. It is a
+    // module of its own rather than a library export: it is an application-shaped slice over
+    // `zix.Driver.postgrez`, not part of the network backend's surface.
+    const durable_tasks_mod = b.createModule(.{
+        .root_source_file = b.path("examples/durable/tasks.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    durable_tasks_mod.addImport("zix", zix);
+
     inline for (examples) |pair| {
         const exe_mod = b.createModule(.{
             .root_source_file = b.path(pair[1]),
@@ -149,6 +160,7 @@ pub fn addSteps(
             .optimize = optimize,
         });
         exe_mod.addImport("zix", zix);
+        exe_mod.addImport("durable_tasks", durable_tasks_mod);
 
         const exe = b.addExecutable(.{
             .name = b.fmt("zix-{s}-{s}-{s}", .{ pair[0], triple, mode }),

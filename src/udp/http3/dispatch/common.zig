@@ -195,7 +195,17 @@ pub fn processDatagram(table: *ConnTable, data: []const u8, cid_len: usize, max_
                 // carrying the alert code and the client's own description. It is worth surfacing,
                 // because the connection otherwise just goes quiet.
                 if (close.parseConnectionClose(opened.payload)) |cc| {
-                    return .{ .handshake_close = cc };
+                    // The parsed reason points into `hbuf`, which dies with this call, and the event's
+                    // reader is the caller that logs it: keep the reason on the connection instead.
+                    conn.close_reason_len = @min(cc.reason.len, conn.close_reason.len);
+                    @memcpy(conn.close_reason[0..conn.close_reason_len], cc.reason[0..conn.close_reason_len]);
+
+                    return .{ .handshake_close = .{
+                        .is_application = cc.is_application,
+                        .error_code = cc.error_code,
+                        .frame_type = cc.frame_type,
+                        .reason = conn.close_reason[0..conn.close_reason_len],
+                    } };
                 } else |_| {}
 
                 feedHandshakeFrames(conn, opened.payload);
@@ -1086,7 +1096,7 @@ fn sendHandshakeConfirmationFD(table: *ConnTable, data: []const u8, tx: *datagra
     conn.last_activity_us = recovery.nowUs();
 
     var pbuf: [COALESCE_PAYLOAD_MAX]u8 = undefined;
-    const plen = buildConnectionPrologue(&pbuf, config);
+    const plen = buildConnectionPrologue(&pbuf, config, conn.takeServerStreamId(.uni));
     conn.first_response_sent = true;
 
     sealAndQueue(conn, tx, fd, peer, pbuf[0..plen], null);
@@ -1450,7 +1460,7 @@ fn pumpStream(conn: *Connection, stream: *SendStream, tx: *datagram.SendBatch, f
         var pos: usize = 0;
 
         if (!conn.first_response_sent) {
-            pos += buildConnectionPrologue(payload[pos..], config);
+            pos += buildConnectionPrologue(payload[pos..], config, conn.takeServerStreamId(.uni));
             conn.first_response_sent = true;
         }
 
@@ -1542,13 +1552,14 @@ pub fn openWebtransportPool(config: Http3ServerConfig) ?wt_pool.Pool {
 }
 
 /// Write the connection's one-time prologue into `out`: HANDSHAKE_DONE, then the server control stream
-/// (stream 3) opening with its SETTINGS frame. Returns the bytes written.
+/// (the id `takeServerStreamId(.uni)` hands out first) opening with its SETTINGS frame. Returns the bytes
+/// written.
 ///
 /// Note:
 /// - The SETTINGS frame is where a WebTransport-capable server advertises support, so this is the one
 ///   place the feature becomes visible to the peer. The buffer it is built into is sized for the widest
 ///   settings set (eight entries), which is why the caller passes one big enough.
-fn buildConnectionPrologue(out: []u8, config: Http3ServerConfig) usize {
+fn buildConnectionPrologue(out: []u8, config: Http3ServerConfig, control_stream_id: u64) usize {
     var pos: usize = 0;
     out[pos] = 0x1e; // HANDSHAKE_DONE
     pos += 1;
@@ -1561,12 +1572,12 @@ fn buildConnectionPrologue(out: []u8, config: Http3ServerConfig) usize {
         control_buf[1] = 0x04;
         control_buf[2] = 0x00;
 
-        if (!response.writeStreamFrame(out, &pos, 3, false, control_buf[0..3])) return pos;
+        if (!response.writeStreamFrame(out, &pos, control_stream_id, false, control_buf[0..3])) return pos;
 
         return pos;
     };
 
-    _ = response.writeStreamFrame(out, &pos, 3, false, control_buf[0..control_len]);
+    _ = response.writeStreamFrame(out, &pos, control_stream_id, false, control_buf[0..control_len]);
 
     return pos;
 }
@@ -1675,7 +1686,10 @@ const WtCall = struct {
         };
 
         live.* = .{
-            .id = call.conn.wt.takeStreamId(kind),
+            .id = call.conn.takeServerStreamId(switch (kind) {
+                .bidi => .bidi,
+                .uni => .uni,
+            }),
             .session_id = session.id,
             .kind = kind,
             .initiator = .server,
@@ -2816,6 +2830,8 @@ fn pumpWtStream(conn: *Connection, live: *wt.Stream, tx: *datagram.SendBatch, fd
     }
 
     limit = @min(limit, live.send.limit);
+
+
     if (limit <= live.send.sent) return;
 
     const dgram: usize = @intCast(conn.sendDatagramSize(config.max_datagram_size, max_send_datagram_size));
@@ -2952,7 +2968,7 @@ fn sendResponseFD(handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.
     // repeat them. If this datagram carried no request, the prologue alone is the bare-ACK packet.
     if (conn.ack.have_largest) plen += response.buildAckRanges(pbuf[plen..], conn.ack.largest_pn, conn.ack.received_mask);
     if (!conn.first_response_sent) {
-        plen += buildConnectionPrologue(pbuf[plen..], config);
+        plen += buildConnectionPrologue(pbuf[plen..], config, conn.takeServerStreamId(.uni));
         conn.first_response_sent = true;
     }
     if (maxStreamsTake(&max_streams_pending)) |granted| plen += response.buildMaxStreams(pbuf[plen..], granted);

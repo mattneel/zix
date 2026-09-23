@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zix · durable tasks</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem 2rem; min-height: 100vh;
+    background: #0f1117; color: #d7dce5;
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; color: #9ad0ff; }
+  p.sub { margin: 0 0 1.25rem; color: #8b93a3; }
+  h2 { font-size: .9rem; color: #8b93a3; margin: 1.25rem 0 .5rem; font-weight: 600; }
+  button {
+    font: inherit; padding: .45rem .8rem; margin: 0 .4rem .4rem 0;
+    background: #1b2130; color: #d7dce5; border: 1px solid #2d3648; border-radius: 6px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #232b3d; border-color: #3b465e; }
+  button:disabled { opacity: .4; cursor: default; }
+  input, select {
+    font: inherit; padding: .4rem .55rem; margin: 0 .4rem .4rem 0;
+    background: #141a25; color: #d7dce5; border: 1px solid #2d3648; border-radius: 6px;
+  }
+  input#title { width: 22rem; }
+  section.grid { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 1.5rem; align-items: start; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .3rem 1rem; margin: 0; }
+  dt { color: #8b93a3; }
+  dd { margin: 0; color: #e6ebf5; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid #1b2130; }
+  th { color: #8b93a3; font-weight: 600; }
+  td.id { color: #8b93a3; }
+  .state { padding: 0 .35rem; border-radius: 4px; }
+  .state.queued { background: #2b2f1b; color: #ffd479; }
+  .state.running { background: #1b2b3a; color: #79b8ff; }
+  .state.completed { background: #1b2f22; color: #7ee787; }
+  .state.rejected { background: #33201f; color: #ff9a8a; }
+  ol#events { list-style: none; margin: 0; padding: 0; max-height: 40vh; overflow: auto; }
+  ol#events li { padding: .25rem .5rem; border-bottom: 1px solid #1b2130; white-space: pre-wrap; word-break: break-word; }
+  .ch { display: inline-block; min-width: 6.5rem; margin-right: .5rem; color: #7f8ea8; }
+  .ch.stream { color: #7ee787; }
+  .ch.datagram { color: #f0a35e; }
+  .ch.session { color: #79b8ff; }
+  .ch.uni { color: #c792ea; }
+  .hint { color: #8b93a3; }
+  .badge { display: inline-block; padding: 0 .35rem; border-radius: 4px; background: #1b2130; color: #8b93a3; }
+  .ok { color: #7ee787; }
+  .bad { color: #ff9a8a; }
+</style>
+</head>
+<body>
+<h1>zix · durable tasks</h1>
+<p class="sub">typed event → validated + authorized → one transaction (task + job) → worker lease → completion transaction + outbox → dispatcher → revisioned patch</p>
+
+<section id="controls">
+  <button id="open">1 · open session</button>
+  <button id="subscribe" disabled>2 · subscribe (authorized view)</button>
+  <select id="principal" disabled>
+    <option value="alice@acme">alice@acme</option>
+    <option value="bob@globex">bob@globex</option>
+    <option value="mallory@nowhere">mallory@nowhere</option>
+  </select>
+  <select id="tenant" disabled>
+    <option value="acme">acme</option>
+    <option value="globex">globex</option>
+  </select>
+  <input id="title" value="ship the durable slice" disabled>
+  <button id="create" disabled>3 · create task</button>
+  <button id="resubmit" disabled>4 · resubmit same key</button>
+</section>
+
+<section class="grid">
+  <div>
+    <h2>view state</h2>
+    <dl>
+      <dt>session</dt><dd id="status">closed</dd>
+      <dt>principal</dt><dd id="whoami">—</dd>
+      <dt>revision</dt><dd id="revision">—</dd>
+      <dt>tasks</dt><dd id="task-count">0</dd>
+      <dt>worker</dt><dd id="worker">—</dd>
+      <dt>patches</dt><dd id="patches">0</dd>
+      <dt>duplicates</dt><dd id="duplicates">0</dd>
+      <dt>sessions</dt><dd id="sessions">0</dd>
+      <dt>last key</dt><dd id="last-key" class="hint">—</dd>
+      <dt>transient</dt><dd id="transient" class="hint">—</dd>
+    </dl>
+    <h2>last result</h2>
+    <dl><dt>submit</dt><dd id="result">—</dd></dl>
+  </div>
+  <div>
+    <h2>tasks <span class="badge" id="applied">0 applied</span></h2>
+    <table>
+      <thead><tr><th>id</th><th>title</th><th>state</th><th>attempts</th><th>result</th></tr></thead>
+      <tbody id="tasks"></tbody>
+    </table>
+    <h2>events <span class="badge" id="event-count">0</span></h2>
+    <ol id="events"></ol>
+  </div>
+</section>
+
+<script>
+"use strict";
+
+const ENDPOINT = new URL("/tasks", location.href);
+const state = { sessions: 0, patches: 0, duplicates: 0, events: 0, revision: 0, lastKey: null };
+
+const ui = {};
+for (const id of ["status", "whoami", "revision", "task-count", "worker", "patches", "duplicates", "sessions",
+                  "last-key", "transient", "result", "applied", "event-count", "events", "tasks",
+                  "principal", "tenant", "title", "create", "resubmit", "subscribe", "open"]) {
+  ui[id] = document.getElementById(id);
+}
+
+const CONTROLS = ["subscribe", "principal", "tenant", "title", "create", "resubmit"];
+
+function log(channel, text) {
+  const li = document.createElement("li");
+  const tag = document.createElement("span");
+  tag.className = "ch " + (channel.split(" ")[0] || "");
+  tag.textContent = channel;
+  li.append(tag, document.createTextNode(text));
+  ui.events.prepend(li);
+  ui["event-count"].textContent = String(++state.events);
+}
+
+/// One revisioned patch. The server never sends a revision the view has already applied, and the view
+/// drops one if it arrives anyway: delivery is at least once, so the view has to be idempotent on its
+/// own too (a duplicate replay must not move the state backwards or double-count).
+function apply(event, channel) {
+  const rev = Number(event.rev ?? 0);
+  if (rev !== 0 && rev <= state.revision) {
+    state.duplicates++;
+    ui.duplicates.textContent = String(state.duplicates);
+    log(channel, "duplicate revision " + rev + " ignored");
+    return;
+  }
+  if (rev !== 0) {
+    state.revision = rev;
+    ui.revision.textContent = String(rev);
+  }
+  state.patches++;
+  ui.patches.textContent = String(state.patches);
+  ui.applied.textContent = String(state.patches) + " applied";
+
+  switch (event.kind) {
+    case "snapshot":
+      state.revision = rev;
+      ui.revision.textContent = String(rev);
+      ui.worker.textContent = event.worker || "—";
+      renderTasks(event.tasks || []);
+      break;
+    case "task_created":
+    case "task_running":
+    case "task_completed":
+      upsertTask(event.task);
+      break;
+    case "rejected":
+      ui.result.textContent = "rejected: " + (event.reason || "refused");
+      ui.result.className = "bad";
+      break;
+    case "accepted":
+      ui.result.textContent = "task " + event.task_id + (event.duplicate ? " (idempotent replay)" : "");
+      ui.result.className = "ok";
+      break;
+    default:
+      break;
+  }
+
+  log(channel, JSON.stringify(event));
+}
+
+function renderTasks(tasks) {
+  ui.tasks.replaceChildren();
+  for (const task of tasks) upsertTask(task);
+  ui["task-count"].textContent = String(tasks.length);
+}
+
+function upsertTask(task) {
+  if (!task) return;
+  let row = document.getElementById("task-" + task.id);
+  if (!row) {
+    row = document.createElement("tr");
+    row.id = "task-" + task.id;
+    for (const cls of ["id", "title", "state", "attempts", "result"]) {
+      const cell = document.createElement("td");
+      cell.className = cls;
+      row.append(cell);
+    }
+    ui.tasks.append(row);
+    ui["task-count"].textContent = String(ui.tasks.children.length);
+  }
+  const cells = row.children;
+  cells[0].textContent = "#" + task.id;
+  cells[1].textContent = task.title;
+  cells[2].innerHTML = '<span class="state ' + task.state + '">' + task.state + "</span>";
+  cells[3].textContent = String(task.attempts);
+  cells[4].textContent = task.result || "—";
+}
+
+async function readEvents(reader, channel) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, end).trim();
+        buffer = buffer.slice(end + 1);
+        if (!line) continue;
+        try { apply(JSON.parse(line), channel); } catch (err) { log(channel, "unparsed: " + line); }
+      }
+      if (done) return;
+    }
+  } catch (err) {
+    log(channel, "stream ended: " + err);
+  }
+}
+
+let session = null;
+let feedWriter = null;
+let datagramWriter = null;
+
+function command(object) {
+  return feedWriter.write(new TextEncoder().encode(JSON.stringify(object) + "\n"));
+}
+
+async function readTransient() {
+  try {
+    for await (const datagram of session.datagrams.readable) {
+      ui.transient.textContent = new TextDecoder().decode(datagram);
+    }
+  } catch (err) {
+    // The readable rejects when the session closes; that is the end of the channel.
+  }
+}
+
+async function readServerStreams() {
+  try {
+    for await (const stream of session.incomingUnidirectionalStreams) {
+      const text = await new Response(stream).text();
+      log("uni", "server-opened stream: " + text.trim());
+    }
+  } catch (err) {
+    // Same as the datagram channel: a close ends the loop.
+  }
+}
+
+async function openSession() {
+  session = new WebTransport(ENDPOINT);
+  ui.status.textContent = "connecting";
+  log("session", "dialing " + ENDPOINT.href);
+  await session.ready;
+  ui.status.textContent = "open";
+  state.sessions++;
+  ui.sessions.textContent = String(state.sessions);
+  log("session", "ready (HTTP/3, " + ENDPOINT.host + ")");
+
+  session.closed.then(() => { ui.status.textContent = "closed"; log("session", "closed"); })
+                 .catch((err) => { ui.status.textContent = "failed"; log("session", "closed with " + err); });
+
+  datagramWriter = session.datagrams.writable.getWriter();
+  void readTransient();
+  void readServerStreams();
+  toggle(true);
+}
+
+/// The view's subscription: one reliable bidirectional stream, the identity it claims, and the resync
+/// that follows every (re)connect. The server answers with the committed state as a revisioned snapshot.
+let pollTimer = null;
+
+async function subscribe() {
+  const stream = await session.createBidirectionalStream();
+  feedWriter = stream.writable.getWriter();
+  void readEvents(stream.readable.getReader(), "stream view");
+  await command({ kind: "subscribe", principal: ui.principal.value, tenant: ui.tenant.value });
+  ui.whoami.textContent = ui.principal.value + " @ " + ui.tenant.value;
+  log("stream view", "subscribed as " + ui.principal.value + " for " + ui.tenant.value);
+
+  // The patch pump is a poll, and that is deliberate: a stream handle on the server is only writable from
+  // the callback that delivered it, so a worker thread cannot push into this session. It publishes into
+  // the outbox feed and the session drains it here, which also keeps the durable path's latency visible.
+  if (pollTimer !== null) clearInterval(pollTimer);
+  pollTimer = setInterval(() => { if (feedWriter) command({ kind: "poll" }).catch(() => {}); }, 100);
+}
+
+/// The typed form event. The key is generated once per submission intent and reused by "resubmit": a
+/// retry or a double click must not create a second task, and the server enforces that, not the button.
+async function create(forceKey) {
+  if (!forceKey || !state.lastKey) {
+    state.lastKey = "k-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    ui["last-key"].textContent = state.lastKey;
+  } else {
+    state.lastKey = forceKey;
+  }
+  await command({
+    kind: "create_task",
+    idempotency_key: state.lastKey,
+    title: ui.title.value,
+    principal: ui.principal.value,
+    tenant: ui.tenant.value,
+  });
+  await command({ kind: "poll" });
+  await datagramWriter.write(new TextEncoder().encode("typing: " + ui.title.value.slice(0, 32)));
+}
+
+function toggle(enabled) {
+  for (const id of CONTROLS) ui[id].disabled = !enabled;
+}
+
+ui.open.addEventListener("click", () => openSession().catch((err) => log("session", "open failed: " + err)));
+ui.subscribe.addEventListener("click", () => subscribe().catch((err) => log("session", err)));
+ui.create.addEventListener("click", () => create(null).catch((err) => log("session", err)));
+ui.resubmit.addEventListener("click", () => create(state.lastKey).catch((err) => log("session", err)));
+
+// The same surface the buttons drive, for a test harness reading the patched state back.
+window.tasks = { openSession, subscribe, create, state, ui };
+</script>
+</body>
+</html>

@@ -346,6 +346,30 @@ Each with a reason, so nobody re-derives the question:
 | :- | :- | :- |
 | `http3_webtransport` | 9089 | sessions on `/echo`: every data stream chunk echoed back (with a FIN once the whole chunk went out), every datagram echoed, one unidirectional stream per session writing a banner then a FIN, and the session lifecycle printed on stderr |
 | `webtransport_live` | 9443 (TCP and UDP) | a live view a browser renders: the page over HTTPS/1.1 on TCP and the session over HTTP/3 on UDP, one port and one origin. A tick on a bidirectional stream becomes an increment event and a DOM patch, a datagram carries a note and returns its patch, a second stream uploads 64 KiB with progress while the ticks keep flowing, and reconnecting resynchronizes from the snapshot. |
+| `webtransport_tasks` | 9444 (TCP and UDP) | a durable action end to end: the page submits a typed form event with an idempotency key over a reliable stream, the server validates and authorizes it, one transaction writes the task and its job, a worker leases and runs the job, one completion transaction writes the task update, the job completion and an outbox row, a dispatcher publishes it, and the authorized view patches itself from committed state. `examples/durable/tasks.zig` holds the slice; `zig build test-durable` runs its seven acceptance scenarios against a real PostgreSQL, and `scripts/bench_durable_tasks.py` measures it. |
+
+### Durable actions
+
+`webtransport_tasks` is the shape a mutation takes when it has to survive a crash, and it is worth reading
+as the reference for one:
+
+- **The database decides idempotency.** `(tenant_id, idempotency_key)` is unique, so a retried submission
+  returns the task it already created instead of a second one, and the retry inserts no second job.
+- **One transaction per step.** Create commits `{task, job, outbox row}` together; complete commits
+  `{task, job, outbox row}` together. There is no window where a task exists without its job.
+- **A lease, not a lock.** A worker holds a job by writing `lease_until`; a worker that dies mid-job
+  leaves a row whose lease expires, and the next poll takes it again with `attempts` bumped, so a crash
+  loop is visible in the view rather than silent.
+- **At least once, made harmless by revisions.** Every state change allocates the tenant's next revision
+  in the same transaction and the outbox row carries it; the dispatcher marks a row published only after
+  the feed took it, so a crash in between replays the event, and a view that already applied revision N
+  drops anything ≤ N.
+- **The view rebuilds from the database.** A subscription answers with a revisioned snapshot, which is
+  also what a reconnect, a reload, a restarted server, or a cursor that fell behind the feed's ring all
+  use to resynchronize.
+
+Durable mutations ride reliable bidirectional streams. Datagrams stay what they are good for — replaceable
+transient state — which the page uses for its typing hint and nothing else.
 
 ### Driving the browser demo
 

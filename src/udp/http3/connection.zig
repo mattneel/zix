@@ -196,6 +196,9 @@ pub const wt_uni_stream_types_cap: usize = 8;
 /// and is the only thing the engine reads off the control stream.
 pub const wt_control_stream_bytes: usize = 256;
 
+/// Which stream id space a server-initiated stream comes from (RFC 9000 2.1).
+pub const ServerStreamKind = enum { bidi, uni };
+
 /// How many WebTransport CONNECT streams this connection holds while it waits for the client's SETTINGS.
 /// A client sends its SETTINGS and its CONNECT in the same flight, so one or two are enough; past this
 /// many the excess is refused rather than held.
@@ -236,16 +239,6 @@ pub const WebTransportState = struct {
     sessions: [wt_api.connection_session_cap]?*wt.Session = @splat(null),
     /// Live data streams across every session of this connection (the pool owns the storage).
     streams: [wt_api.connection_stream_cap]?*wt.Stream = @splat(null),
-    /// The next server-initiated bidirectional stream id (RFC 9000 2.1: 1 mod 4) and unidirectional id
-    /// (3 mod 4). A data stream takes an id only when the application opens one.
-    ///
-    /// Note:
-    /// - The unidirectional counter starts at 7, not 3: stream 3 is the server control stream, which
-    ///   `buildConnectionPrologue` opens with SETTINGS on every connection (RFC 9114 6.2.1), so a
-    ///   WebTransport unidirectional stream handed out as 3 would append data stream bytes to the
-    ///   control stream and break it for the peer.
-    next_bidi_stream: u64 = 1,
-    next_uni_stream: u64 = 7,
     /// Datagrams that arrived for a session this connection does not have, and were dropped (4.6).
     dropped_datagrams: u64 = 0,
     /// The type of each client unidirectional stream this connection classified (RFC 9114 6.2).
@@ -332,24 +325,6 @@ pub const WebTransportState = struct {
         for (&self.streams) |*entry| {
             if (entry.* == live) entry.* = null;
         }
-    }
-
-    /// Take the next server-initiated stream id of `kind`, advancing the counter.
-    pub fn takeStreamId(self: *WebTransportState, kind: stream_header.Kind) u64 {
-        return switch (kind) {
-            .bidi => blk: {
-                const id = self.next_bidi_stream;
-                self.next_bidi_stream += 4;
-
-                break :blk id;
-            },
-            .uni => blk: {
-                const id = self.next_uni_stream;
-                self.next_uni_stream += 4;
-
-                break :blk id;
-            },
-        };
     }
 
     /// The type of a client unidirectional stream, from the first bytes of the stream. The type is a
@@ -535,6 +510,25 @@ pub const Connection = struct {
     close_state: close.CloseState = .open,
     control: h3.ControlStream = .{},
     crypto_initial: tls.CryptoStream = .{},
+
+    // Server-initiated stream ids (RFC 9000 2.1: bidirectional 1 mod 4, unidirectional 3 mod 4). One
+    // allocator per connection, shared by everything the server opens: the HTTP/3 control stream takes
+    // the first unidirectional id, the QPACK encoder and decoder streams the next two if this engine
+    // opens them, and every WebTransport data stream comes after that.
+    //
+    // Note:
+    // - Sharing the counter is the invariant, not a convenience. A private counter per feature is how two
+    //   owners hand out the same id: the WebTransport binding used to start its own unidirectional
+    //   counter at 3, which is the control stream, so a session's first stream appended its bytes to the
+    //   control stream and broke it for the peer.
+    next_server_bidi: u64 = 1,
+    next_server_uni: u64 = 3,
+
+    /// The reason a client gave in a CONNECTION_CLOSE, copied out of the decrypted packet because the
+    /// packet's buffer does not outlive the call that decrypted it.
+    close_reason: [256]u8 = @splat(0),
+    close_reason_len: usize = 0,
+
     /// The client's Handshake-level CRYPTO bytes: its Finished. Verifying it against the transcript
     /// through the server Finished is what completes the TLS handshake on the server side (RFC 8446
     /// 4.4.4), and completing it is what lets the server confirm the handshake to the client.
@@ -973,6 +967,25 @@ pub const Connection = struct {
     ///
     /// Return:
     /// - ?u64 (the new cumulative MAX_DATA value to advertise, or null when the grant still has room)
+    /// Take the next server-initiated stream id of `kind`, advancing this connection's counter for that
+    /// id space. Every server-initiated stream takes its id here, so no two of them can collide.
+    pub fn takeServerStreamId(self: *Connection, kind: ServerStreamKind) u64 {
+        return switch (kind) {
+            .bidi => blk: {
+                const id = self.next_server_bidi;
+                self.next_server_bidi += 4;
+
+                break :blk id;
+            },
+            .uni => blk: {
+                const id = self.next_server_uni;
+                self.next_server_uni += 4;
+
+                break :blk id;
+            },
+        };
+    }
+
     pub fn replenishMaxData(self: *Connection, bytes_received: u64, window: u64) ?u64 {
         self.data_consumed += bytes_received;
 
@@ -1010,17 +1023,41 @@ test "zix http3: sendDatagramSize clamps to the smallest of config, client limit
     try std.testing.expectEqual(@as(u64, 16 * 1024), conn.sendDatagramSize(65527, 16 * 1024));
 }
 
-test "zix http3: a server's WebTransport stream ids skip the control stream (RFC 9114 6.2.1)" {
-    var state = WebTransportState{};
+test "zix http3: every server-initiated stream id is unique, control stream included" {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    var conn = Connection.init(&dcid, 1200, 10);
 
-    // Stream 3 is the server control stream: the connection prologue opens it with SETTINGS on every
-    // connection, so the first unidirectional id a session may use is 7, and the second is 11.
-    try std.testing.expectEqual(@as(u64, 7), state.takeStreamId(.uni));
-    try std.testing.expectEqual(@as(u64, 11), state.takeStreamId(.uni));
+    // The control stream is the first unidirectional stream a server opens (RFC 9114 6.2.1), and it takes
+    // its id from the same counter every other server-initiated stream uses.
+    const control = conn.takeServerStreamId(.uni);
+    try std.testing.expectEqual(@as(u64, 3), control);
 
-    // Bidirectional ids are the server's own from the start (1 mod 4), with nothing to skip.
-    try std.testing.expectEqual(@as(u64, 1), state.takeStreamId(.bidi));
-    try std.testing.expectEqual(@as(u64, 5), state.takeStreamId(.bidi));
+    // WebTransport data streams follow it: 7 and 11 unidirectional, 1 and 5 bidirectional. Handing a
+    // session stream the control stream's id is the bug this covers (the bytes would land on the control
+    // stream and break it for the peer).
+    const uni_a = conn.takeServerStreamId(.uni);
+    const uni_b = conn.takeServerStreamId(.uni);
+    const bidi_a = conn.takeServerStreamId(.bidi);
+    const bidi_b = conn.takeServerStreamId(.bidi);
+    try std.testing.expectEqual(@as(u64, 7), uni_a);
+    try std.testing.expectEqual(@as(u64, 11), uni_b);
+    try std.testing.expectEqual(@as(u64, 1), bidi_a);
+    try std.testing.expectEqual(@as(u64, 5), bidi_b);
+
+    // The id spaces stay disjoint even under interleaved allocation, and every id is server-initiated:
+    // unidirectional ids are 3 mod 4, bidirectional ids 1 mod 4.
+    var taken: [16]u64 = undefined;
+    var count: usize = 0;
+    taken[count] = control;
+    count += 1;
+    for ([_]u64{ uni_a, uni_b, bidi_a, bidi_b }) |id| {
+        taken[count] = id;
+        count += 1;
+    }
+    for (taken[0..count], 0..) |id, i| {
+        try std.testing.expect(id % 4 == 1 or id % 4 == 3);
+        for (taken[i + 1 .. count]) |other| try std.testing.expect(id != other);
+    }
 }
 
 test "zix http3: Connection init derives Initial keys from DCID (RFC 9001 A.1)" {

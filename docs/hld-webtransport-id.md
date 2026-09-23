@@ -347,6 +347,31 @@ Masing-masing dengan alasannya, supaya tidak ada yang menurunkan ulang pertanyaa
 | :- | :- | :- |
 | `http3_webtransport` | 9089 | session di `/echo`: setiap chunk stream data dipantulkan kembali (dengan FIN setelah seluruh chunk keluar), setiap datagram dipantulkan, satu stream unidirectional per session yang menulis banner lalu FIN, dan lifecycle session dicetak ke stderr |
 | `webtransport_live` | 9443 (TCP dan UDP) | live view yang dirender browser: halaman lewat HTTPS/1.1 di TCP dan session lewat HTTP/3 di UDP, satu port dan satu origin. Satu tick pada stream bidirectional menjadi increment event dan patch DOM, sebuah datagram membawa note dan mengembalikan patch-nya, stream kedua mengunggah 64 KiB dengan progress sementara tick tetap mengalir, dan reconnect menyinkronkan ulang dari snapshot. |
+| `webtransport_tasks` | 9444 (TCP dan UDP) | satu aksi durable dari ujung ke ujung: halaman mengirim typed form event dengan idempotency key lewat stream reliabel, server memvalidasi dan mengotorisasi, satu transaksi menulis task dan job-nya, worker me-lease dan menjalankan job, satu transaksi completion menulis update task, penyelesaian job, dan baris outbox, dispatcher mempublikasikannya, dan view yang terotorisasi mem-patch dirinya dari state yang sudah commit. `examples/durable/tasks.zig` memuat slice-nya; `zig build test-durable` menjalankan tujuh skenario acceptance terhadap PostgreSQL nyata, dan `scripts/bench_durable_tasks.py` mengukurnya. |
+
+### Aksi durable
+
+`webtransport_tasks` adalah bentuk sebuah mutasi ketika harus selamat dari crash, dan layak dibaca sebagai
+rujukan untuk satu aksi:
+
+- **Database yang menentukan idempotensi.** `(tenant_id, idempotency_key)` unik, jadi submission yang
+  diulang mengembalikan task yang sudah dibuat alih-alih task kedua, dan pengulangan itu tidak menyisipkan
+  job kedua.
+- **Satu transaksi per langkah.** Create men-commit `{task, job, baris outbox}` bersama; complete men-commit
+  `{task, job, baris outbox}` bersama. Tidak ada jendela di mana task ada tanpa job-nya.
+- **Lease, bukan lock.** Worker memegang job dengan menulis `lease_until`; worker yang mati di tengah job
+  meninggalkan baris yang lease-nya kedaluwarsa, dan poll berikutnya mengambilnya lagi dengan `attempts`
+  bertambah, jadi crash berulang terlihat di view alih-alih senyap.
+- **At-least-once, dinetralkan revisi.** Setiap perubahan state mengambil revisi berikutnya milik tenant di
+  transaksi yang sama dan baris outbox membawanya; dispatcher menandai baris terpublikasi hanya setelah
+  feed menerimanya, jadi crash di antaranya memutar ulang event, dan view yang sudah menerapkan revisi N
+  mengabaikan apa pun ≤ N.
+- **View membangun ulang dari database.** Sebuah subscription dijawab snapshot berevisi, yang juga dipakai
+  reconnect, reload, server yang restart, atau cursor yang tertinggal dari ring feed untuk menyinkronkan
+  ulang.
+
+Mutasi durable menumpang stream bidirectional yang reliabel. Datagram tetap untuk apa yang memang cocok:
+state transient yang boleh hilang — halaman memakainya hanya untuk typing hint.
 
 ### Menjalankan demo browser
 
