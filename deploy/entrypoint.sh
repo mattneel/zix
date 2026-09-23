@@ -48,16 +48,16 @@ if [ -n "$DOMAIN" ]; then
             done
         ) &
 
-        # The chain, not the leaf: an end-entity certificate served alone leaves a client unable to build a
-        # path to the authority, which is what "unable to get local issuer certificate" reports. lego's .crt is
-        # the chain; only the key needs converting, since lego writes PKCS#8 and the server reads SEC1.
-        # Only reachable with the certificate in hand, so a failure here means a broken volume rather than a
+        # A single certificate: zix's PEM reader takes one block, so a chain (leaf plus intermediate) fails
+        # with ZixInvalidPem and the process exits. The intermediate is therefore not served, which leaves a
+        # strict client unable to build a path to the authority - the limit is in the server, not the
+        # deployment, and serving a chain is the fix on that side.
         # missing challenge, and the machine should still come up on the development certificate.
         if openssl x509 -in "$STATE/.lego/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem" 2>&1; then
             openssl ec -in "$STATE/.lego/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
                 || cp "$STATE/.lego/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
 
-            export ZIX_CERT="$STATE/.lego/certificates/$DOMAIN.crt"
+            export ZIX_CERT="$STATE/serving-cert.pem"
             export ZIX_KEY="$STATE/serving-key.pem"
         else
             echo "[entrypoint] WARNING: the issued certificate could not be read; serving the development one"
