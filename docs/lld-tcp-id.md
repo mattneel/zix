@@ -22,8 +22,8 @@ fn TcpServerImpl(comptime handler: HandlerFn) type        // .init(config) -> er
 fn TcpFramedServerImpl(comptime frame_fn: FrameFn) type   // .init(config); .deinit(); .run() -> ring di .URING, selain itu fallback frameAdapter
 
 // Worker dispatch bebas (handler disimpan sebagai nilai runtime, bentuk sama seperti zix.Http1):
-fn serveDispatch(cfg: TcpServerConfig, io: std.Io, handler: HandlerFn) !void  // switch ASYNC/EPOLL, menolak model khusus Linux di luar Linux
-fn runEpoll(cfg: TcpServerConfig, io: std.Io, handler: HandlerFn, cpu: usize) !void
+fn serveDispatch(cfg: TcpServerConfig, handler: HandlerFn) !void  // switch ASYNC/EPOLL, menolak model khusus Linux di luar Linux
+fn runEpoll(cfg: TcpServerConfig, handler: HandlerFn) !void
 ```
 
 Handler (atau callback per-frame) diketahui comptime di batas tipe, tetapi fungsi worker internal menerimanya sebagai nilai runtime, sehingga `serveDispatch` / `runEpoll` dibagi lintas setiap spesialisasi tanpa code bloat per-handler (ADR-038). Default echo bawaan adalah `zix.Tcp.echoHandler` publik, dilewatkan secara eksplisit ke `init`.
@@ -104,27 +104,6 @@ Half-duplex per koneksi: `armRecv` menyala lagi hanya setelah `send` dari balasa
 
 Fallback ke `.EPOLL` (`frameAdapter` blocking yang membungkus `frame_fn` jadi `HandlerFn`, lihat `common.zig`) ketika `uringUnavailableReason()` non-null saat startup (seccomp/sandbox, `RLIMIT_MEMLOCK` terlalu rendah untuk ukuran ring, atau kernel pre-io_uring), diputuskan sekali di `server.zig` sebelum worker fleet di-spawn.
 
-### ConnQueue
-
-```zig
-const ConnQueue = struct {
-    mutex:  std.Io.Mutex                              = .init,
-    ready:  std.Io.Condition                          = .init,
-    items:  std.ArrayListUnmanaged(std.Io.net.Stream) = .empty,
-    closed: bool                                      = false,
-
-    fn push(self, stream, io) void   // lock -> append -> unlock -> signal
-    fn pop(self, io) ?Stream         // lock -> wait while empty -> orderedRemove(0) -> unlock
-    fn close(self, io) void          // lock -> closed=true -> unlock -> broadcast
-    fn deinit(self) void             // items.deinit(smp_allocator)
-};
-```
-
-- `push` menggunakan `smp_allocator` secara langsung, tidak ada arena per koneksi.
-- Jika OOM terjadi di `push`, stream ditutup dan koneksi dibuang.
-- `pop` mengembalikan `null` hanya setelah `close()` dipanggil dan antrian sudah sepenuhnya terkuras.
-- `orderedRemove(0)` menjaga urutan kedatangan (FIFO).
-
 ### ConnTask
 
 ```zig
@@ -132,10 +111,12 @@ const ConnTask = struct {
     stream:  std.Io.net.Stream,
     io:      std.Io,
     handler: HandlerFn,
+    logger:  ?*Logger,
 };
 
 fn dispatchConn(task: ConnTask) void {
     task.handler(task.stream, task.io);
+    if (task.logger) |lg| lg.conn(peer, elapsed_ms, null);
 }
 ```
 

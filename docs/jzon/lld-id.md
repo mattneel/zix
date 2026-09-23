@@ -26,8 +26,8 @@ Itulah kenapa kedua jalur tulis meninggalkan hal berbeda saat gagal. std emitter
 
 Dua kegagalan, dan pemisahannya penting:
 
-- `Truncated` berarti dokumennya berakhir lebih awal.
-- `Unexpected` berarti byte yang ada di sana tidak bisa mengawali apa yang diminta.
+- `JzonTruncated` berarti dokumennya berakhir lebih awal.
+- `JzonUnexpected` berarti byte yang ada di sana tidak bisa mengawali apa yang diminta.
 
 | Panggilan | Yang dilakukan |
 | :- | :- |
@@ -100,7 +100,7 @@ Keduanya mengonversi dua digit per iterasi dari `std.fmt.digits2`. Yang memisahk
 
 `appendTable` menangani dua kasus tajam. `@abs` pada nilai bertanda menghasilkan tipe unsigned selebar itu, jadi nilai paling negatif terkonversi tanpa overflow. Nilai berjalannya dipegang di 8 bit atau lebih apa pun `T`-nya, jadi tipe field yang sempit tetap bisa dibandingkan dengan 100 dan 10 yang dibutuhkan loop-nya.
 
-Membaca integer kembali menegakkan rentang tipe sasarannya. Nilai yang tidak muat di field itu melaporkan `BadNumber`, sama seperti digit yang rusak: teksnya bukan angka yang diterima field ini.
+Membaca integer kembali menegakkan rentang tipe sasarannya. Nilai yang tidak muat di field itu melaporkan `JzonBadNumber`, sama seperti digit yang rusak: teksnya bukan angka yang diterima field ini.
 
 ## Float
 
@@ -148,7 +148,7 @@ flowchart TB
     def -- tidak --> mf[error.JzonMissingField]
 ```
 
-Key yang sama dua kali adalah `Unexpected`, bukan diam-diam yang terakhir menang.
+Key yang sama dua kali adalah `JzonUnexpected`, bukan diam-diam yang terakhir menang.
 
 ## String di sisi baca
 
@@ -171,7 +171,7 @@ Di bawah `.BORROW` dokumennya harus hidup lebih lama dari nilainya. Di sebuah se
 
 Jalannya memvalidasi, bukan sekadar membatasi. Nilai yang rusak gagal entah parse-nya menginginkannya atau tidak, jadi dokumen yang ditolak jalur berbasis std ditolak di sini juga.
 
-Sebuah dokumen tidak tepercaya, jadi kedalaman bersarang yang diikuti dibatasi di `MAX_DEPTH = 256`. Apa pun yang lebih dalam adalah `Unexpected` alih-alih dibiarkan menumbuhkan stack.
+Sebuah dokumen tidak tepercaya, jadi kedalaman bersarang yang diikuti dibatasi di `MAX_DEPTH = 256`. Apa pun yang lebih dalam adalah `JzonUnexpected` alih-alih dibiarkan menumbuhkan stack.
 
 ## Generated emitter
 
@@ -217,7 +217,7 @@ Mengeja sebuah field `?T` menyatakan apa yang bisa dimuatnya, bukan bahwa dokume
 ```zig
 const Owed = struct {
     id: u8,
-    note: ?[]const u8,        // masih terutang, penghilangan adalah MissingField
+    note: ?[]const u8,        // masih terutang, penghilangan adalah JzonMissingField
 };
 
 const Optional = struct {

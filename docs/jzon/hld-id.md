@@ -163,7 +163,7 @@ String ber-escape didekode ke allocator mode mana pun yang diminta, karena byte 
 
 Satu set error per arah, dipakai bersama oleh setiap jalur.
 
-Sisi tulis punya satu kegagalan, karena tidak ada yang dialokasi dan buffer-nya tetap. Sisi baca punya delapan, dan jalur yang tidak bisa membedakan dua di antaranya tetap melapor lewat set yang sama: `.STD` melaporkan escape rusak sebagai syntax error alih-alih `BadEscape`, karena std tidak memisahkan keduanya. Pemanggil menulis satu `catch` dan tidak perlu menengoknya lagi setelah mengganti strategy.
+Sisi tulis punya satu kegagalan, karena tidak ada yang dialokasi dan buffer-nya tetap. Sisi baca punya delapan, dan jalur yang tidak bisa membedakan dua di antaranya tetap melapor lewat set yang sama: `.STD` melaporkan escape rusak sebagai syntax error alih-alih `JzonBadEscape`, karena std tidak memisahkan keduanya. Pemanggil menulis satu `catch` dan tidak perlu menengoknya lagi setelah mengganti strategy.
 
 ## Kenapa strategy-nya ada
 

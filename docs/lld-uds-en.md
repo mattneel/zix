@@ -1,6 +1,6 @@
 # LLD: zix.Uds
 
-Internal implementation details. For design rationale see [`docs/hld-uds.md`](hld-uds.md) and ADR-010.
+Internal implementation details. For design rationale see [`docs/hld-uds-en.md`](hld-uds-en.md) and ADR-010.
 
 ---
 

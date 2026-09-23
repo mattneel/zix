@@ -143,13 +143,13 @@ A parse reports one set whichever path ran:
 
 | Error | What it means |
 | :- | :- |
-| `UnknownField` | the document carries a key the type does not declare, under `unknown = .REJECT` |
-| `MissingField` | the document left out a field that declares no default |
-| `UnknownEnumValue` | a string the enum has no tag for |
-| `Truncated` | the document ended early |
-| `Unexpected` | what is there is not what the type wants: a syntax error, a value of the wrong shape, or the same key twice |
-| `BadNumber` | number text the grammar does not allow, or a value the target integer type cannot hold |
-| `BadEscape` | an escape sequence the rules do not spell |
+| `JzonUnknownField` | the document carries a key the type does not declare, under `unknown = .REJECT` |
+| `JzonMissingField` | the document left out a field that declares no default |
+| `JzonUnknownEnumValue` | a string the enum has no tag for |
+| `JzonTruncated` | the document ended early |
+| `JzonUnexpected` | what is there is not what the type wants: a syntax error, a value of the wrong shape, or the same key twice |
+| `JzonBadNumber` | number text the grammar does not allow, or a value the target integer type cannot hold |
+| `JzonBadEscape` | an escape sequence the rules do not spell |
 | `OutOfMemory` | the allocator ran out |
 
 Swapping a strategy never changes what a caller has to handle. `lld-en.md` lists the three places a path built from the type answers differently from `.STD`.
@@ -182,11 +182,11 @@ A seventh example is a server, so it lives with the engine examples rather than 
 
 ## Testing
 
-Three tiers, 432 tests, none of them needing anything installed:
+Three tiers, 440 tests, none of them needing anything installed:
 
 ```
-zig build test-unit          # 108, the in-file tests under src/
-zig build test-behaviour     # 141, what each piece does when handed what it wants
+zig build test-unit          # 113, the in-file tests under src/
+zig build test-behaviour     # 144, what each piece does when handed what it wants
 zig build test-edge          # 183, what each piece does when handed what it does not
 zig build test-all           # all three
 ```

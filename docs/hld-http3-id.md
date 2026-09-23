@@ -66,7 +66,7 @@ graph TD
 
     static --> static_cache["utils/static_cache.zig\ncache snapshot bersama"]
 
-    server --> dispatch["dispatch/\ncommon + async / pool /\nmixed / epoll / uring"]
+    server --> dispatch["dispatch/\ncommon + async /\nepoll / uring"]
     dispatch --> datagram["../datagram.zig\nraw-fd socket\nrecvmmsg / sendmmsg"]
     dispatch --> connection["connection.zig\nper-connection state"]
     dispatch --> demux["demux.zig\nCID table (open addressing)"]
@@ -146,15 +146,18 @@ pub const Http3ServerConfig = struct {
     max_pending_request_streams: usize = 16,   // request yang dirakit satu worker sekaligus, 0 tidak menahan
     max_request_stream_bytes:    usize = 8192, // request terbesar yang bisa diberikan utuh ke handler
 
+    handler_timeout_ms: u32 = 0, // deadline handler global, ditanam ke Context.deadline_ns
+
     public_dir:                   []const u8 = "",  // root file static, "" menonaktifkan penyajian static
     public_dir_cache_ttl_ms:      u32 = 0,          // 0 juga mematikan penyajian static di sini, lihat bawah
     public_dir_cache_max_entries: u32 = 256,        // slot cache static, satu per file plus sibling-nya
 
     logger: ?*Logger = null, // event lifecycle via logger.system() saat diset
+    webtransport: Webtransport.Config = .{}, // WebTransport di atas HTTP/3, mati secara default
 };
 ```
 
-`io`, `allocator`, `ip`, `port`, dan `dispatch_model` wajib (tanpa default). `tls` default `null` tetapi ditolak di `init`: server QUIC harus menyajikan sertifikat TLS 1.3. `DispatchModel` dipakai ulang dari config TCP, bukan didefinisikan di sini.
+`io`, `allocator`, `ip`, `port`, dan `dispatch_model` wajib (tanpa default). `tls` default `null` tetapi ditolak di `run`: server QUIC harus menyajikan sertifikat TLS 1.3. `DispatchModel` dipakai ulang dari config TCP, bukan didefinisikan di sini.
 
 `reuseport_cbpf` (ADR-061) tetap tersedia di sini tetapi biarkan `false`: steering CPU per-paket merusak flow affinity QUIC (paket sebuah koneksi mendarat di worker tanpa state-nya), terukur sebagai penurunan throughput berat dengan nol request gagal. Engine TCP adalah kasus nilai untuk field ini, bukan `zix.Http3`.
 

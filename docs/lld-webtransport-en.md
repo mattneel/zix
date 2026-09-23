@@ -37,10 +37,10 @@ graph TD
 | `webtransport/capsule.zig` | RFC 9297 capsule framing, the six capsules this binding uses, the streaming reader | 10 |
 | `webtransport/datagram.zig` | the QUIC DATAGRAM frame and the HTTP/3 datagram that carries a WebTransport payload | 6 |
 | `webtransport/stream_header.zig` | the bytes that open a data stream, and the rules that make them trustworthy | 5 |
-| `webtransport/session.zig` | session and stream state, the send and receive halves, session-level flow control | 14 |
+| `webtransport/session.zig` | session and stream state, the send and receive halves, session-level flow control | 15 |
 | `webtransport/pool.zig` | the worker's sessions, data streams, send buffers, and pre-session stream buffers | 6 |
 
-Those are the 52 in-file unit tests of the binding (`grep -c '^test "'` over the seven files); every one is named `zix webtransport: <claim>`, and they run with `zig build unit-test` through `std.testing.refAllDecls` from `src/lib.zig`.
+Those are the 53 in-file unit tests of the binding (`grep -c '^test "'` over the seven files); every one is named `zix webtransport: <claim>`, and they run with `zig build unit-test` through `std.testing.refAllDecls` from `src/lib.zig`.
 
 ---
 
@@ -422,7 +422,7 @@ A client is free to open streams and send datagrams before it sees the 2xx respo
 
 ## The in-file tests
 
-Every module's proofs run with `zig build unit-test` (52 tests across the seven files, all named `zix webtransport: <claim>`).
+Every module's proofs run with `zig build unit-test` (53 tests across the seven files, all named `zix webtransport: <claim>`).
 
 | File | What its tests pin |
 | :- | :- |

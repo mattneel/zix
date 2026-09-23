@@ -4,7 +4,7 @@
 
 1. **Set `dispatch_model` explicitly** in every server config (no default)
 2. **Update `Server.init` calls**:
-   - `zix.Http.Server.init(4096, &routes, cfg)` -> `zix.Http.Server.init(&routes, cfg)`
+   - `zix.Http.Server.init(4096, &routes, cfg)` -> `zix.Http.Server.init(zix.Http.Router(&routes).dispatch, cfg)`
    - `const S = zix.Http3.Http3(handler); try S.init(cfg)` -> `zix.Http3.Server.init(handler, cfg)`
    - Remove `try` from `zix.Http2`/`zix.Grpc`/`zix.Http` init (validation moved to `run()`)
 3. **Update `HandlerFn` signatures** to `fn(req: *Request, res: *Response, ctx: *Context) anyerror!void`

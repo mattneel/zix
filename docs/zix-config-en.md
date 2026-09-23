@@ -2,7 +2,7 @@
 
 What every adjustable zix configuration field means, and how changing it affects a running process. Covers the server engines and the TLS context, plus shared components (the Logger) that any engine attaches by pointer. One section per config. Each field lists its default, what it controls, and the tuning trade-offs.
 
-This is the user-facing companion to the internal `magic-number-in-src.md`: same columns, but indexed by config field instead of source location, and without the internal classification.
+It is indexed by config field: one section per config struct, each field with its default and what the source enforces.
 
 Note: a server attaches a Logger through its `logger` field (a pointer). The Logger's own sizing knobs live once on the Logger config (see the Logger section), not on each server config.
 

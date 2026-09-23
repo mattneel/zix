@@ -301,7 +301,7 @@ a Channel. The Channel itself is independent of which dispatch model is in use.
 | Works with OS threads | yes: each thread needs its own `std.Io` from `std.Io.Threaded` |
 | Replaces dispatch model | no (orthogonal) |
 
-Status: Implemented. See ADR-017 and [`docs/hld-channel.md`](hld-channel.md).
+Status: Implemented. See ADR-017 and [`docs/hld-channel-en.md`](hld-channel-en.md).
 
 ---
 

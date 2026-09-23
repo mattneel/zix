@@ -2,7 +2,7 @@
 
 Arti dari setiap field konfigurasi zix yang dapat diatur, dan bagaimana mengubahnya memengaruhi proses yang berjalan. Mencakup engine server dan TLS context, plus komponen bersama (Logger) yang dilampirkan engine mana pun lewat pointer. Satu bagian per config. Setiap field mencantumkan default, apa yang diatur, dan trade-off penyetelannya.
 
-Ini adalah pendamping versi pengguna dari `magic-number-in-src.md` yang bersifat internal: kolom yang sama, tetapi diindeks berdasarkan field konfigurasi alih-alih lokasi sumber, dan tanpa klasifikasi internal.
+Dokumen ini diindeks berdasarkan field konfigurasi: satu bagian per struct config, setiap field dengan default-nya dan apa yang ditegakkan sumbernya.
 
 Catatan: server melampirkan Logger lewat field `logger` (pointer). Knob sizing milik Logger berada sekali di config Logger (lihat bagian Logger), bukan di setiap config server.
 

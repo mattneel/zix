@@ -153,7 +153,7 @@ Sebuah perubahan performa belum selesai sampai diukur terhadap gate, dan gate-ny
 
 > Ukur setiap perubahan biaya terhadap gate dua-sisi sebelum menyebutnya selesai. Laporkan apa yang dibatasi atau dibuang sebuah perubahan. Klaim sub-1% butuh sinyal yang benar-benar bisa meresolusi sub-1%, bukan noise run-to-run dari mesin development.
 
-Simpan tiap hasil di bawah `docs/benchmark/` dengan environment tempat ia diambil (model CPU, RAM, OS, versi kernel) dicatat sebagai reference, karena perubahan yang sama terbaca berbeda di development box N-core dibanding target 64-core. Prefix nama file `HttpArena-` menandai hasil yang ditangkap di ujung harness HttpArena (misal `docs/benchmark/HttpArena-result-zix-uring-1.md`), bukan box lokal, sehingga kedua sumber tetap bisa dibedakan saat dibandingkan.
+Simpan tiap hasil di bawah `docs/benchmark/` dengan environment tempat ia diambil (model CPU, RAM, OS, versi kernel) dicatat sebagai reference, karena perubahan yang sama terbaca berbeda di development box N-core dibanding target 64-core. Prefix nama file `HttpArena-` menandai hasil yang ditangkap di ujung harness HttpArena (misal `docs/benchmark/HttpArena-result-zix_http1-uring-1.md`), bukan box lokal, sehingga kedua sumber tetap bisa dibedakan saat dibandingkan.
 
 ---
 
@@ -172,7 +172,7 @@ Gate dua-sisi hanya sejujur measurement di belakangnya. Toolset kecil yang spesi
 | Conformance protokol dan inspeksi handshake | `curl -v`, dan `curl --http3-only -v` untuk QUIC | live behavioral oracle: `-v` menarasikan tiap langkah, jadi untuk HTTP/3 ia menunjukkan tiap tahap handshake (Initial, ServerHello, certificate, 1-RTT, request) saat sebuah langkah regresi. butuh curl yang dibangun dengan backend HTTP/3 (ngtcp2 / nghttp3), cek dengan `curl --version` |
 | Correctness dan leak | `zig build`, lalu `test-all` / `examples` / `test-runner-all`, dan `std.testing.allocator` | gate discovery dan leak yang dilewati setiap perubahan sebelum klaim perf apa pun |
 
-Runner siap-pakai ada di repo supaya metode-nya reproducible, bukan dadakan: `perf-localize-http1.sh` (atribusi simbol, hand-run), `perf-per-request-cell.sh` dan `perf-per-request-matrix.sh` (tabel `perf stat` per-request), `perf-http-epoll.sh` dan `perf-http-uring.sh` (per-engine).
+Runner siap-pakai ada di repo supaya metode-nya reproducible, bukan dadakan: set localbench (`scripts/localbench-build.sh`, `localbench-isolate.sh`, `localbench-run.sh`, `localbench-validate.sh`, dengan helper bersama di `scripts/lib/`) dan pasangan HttpArena (`scripts/httparena-benchmark-isolate.sh`, `httparena-validate.sh`); `scripts/build_profile.py` dan `scripts/dev_loop_bench.py` mencakup axis build dan dev-loop.
 
 > Pilih tool berdasarkan axis yang digerakkan perubahan. Turunkan metrik per-request sebagai counter / RPS dengan window perf di dalam beban `wrk` yang steady. `perf stat` jalan in-sandbox pada paranoid=2, `perf record` hand-run dengan sudo. Lewati gate correctness dan leak sebelum membuat klaim perf apa pun, dan quiesce sebelum mempercayai angka sub-1%.
 

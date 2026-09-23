@@ -119,7 +119,7 @@ sequenceDiagram
     E->>C: writeAppData(response) + close_notify
 ```
 
-`serverHandshake` bersifat sans-I/O: mengembalikan byte untuk dikirim plus sebuah `Connection`. HelloRetryRequest (saat curve pilihan client tidak punya key_share) adalah varian dua-ronde via `serverHelloRetry` lalu `serverHandshakeAfterRetry`. Client 1.2-only muncul sebagai `UnsupportedTlsVersion`, yang dirutekan jalur serve ke track 1.2 (tunduk pada version policy).
+`serverHandshake` bersifat sans-I/O: mengembalikan byte untuk dikirim plus sebuah `Connection`. HelloRetryRequest (saat curve pilihan client tidak punya key_share) adalah varian dua-ronde via `serverHelloRetry` lalu `serverHandshakeAfterRetry`. Client 1.2-only muncul sebagai `ZixUnsupportedTlsVersion`, yang dirutekan jalur serve ke track 1.2 (tunduk pada version policy).
 
 ## Engine Integration (ADR-046)
 
@@ -149,7 +149,7 @@ Di jalur https Http1, Host request (port di-strip) dicocokkan dengan identitas c
 ## Memory Model
 
 - Tidak ada allocator per-request yang diekspos. Handshake bekerja di buffer fixed yang disediakan caller, dan jalur aplikasi memakai ulang buffer engine yang ada.
-- `Tls.Context` memiliki satu alokasi heap: DER certificate yang diduplikasi, dibebaskan oleh `deinit`. Signing key dan slice policy tervalidasi adalah value atau slice pinjaman.
+- `Tls.Context` memiliki buffer heap-nya sendiri: DER certificate yang diduplikasi, certificate chain dan daftar entry-nya (semuanya dibebaskan oleh `deinit`). Signing key dan slice policy tervalidasi adalah value atau slice pinjaman.
 - Transcript handshake dan key schedule berukuran fixed (`Secret = [32]u8`, SHA-256 sepanjang jalur).
 
 ## References

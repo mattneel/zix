@@ -346,7 +346,7 @@ Each with a reason, so nobody re-derives the question:
 | :- | :- | :- |
 | `http3_webtransport` | 9089 | sessions on `/echo`: every data stream chunk echoed back (with a FIN once the whole chunk went out), every datagram echoed, one unidirectional stream per session writing a banner then a FIN, and the session lifecycle printed on stderr |
 | `webtransport_live` | 9443 (TCP and UDP) | a live view a browser renders: the page over HTTPS/1.1 on TCP and the session over HTTP/3 on UDP, one port and one origin. A tick on a bidirectional stream becomes an increment event and a DOM patch, a datagram carries a note and returns its patch, a second stream uploads 64 KiB with progress while the ticks keep flowing, and reconnecting resynchronizes from the snapshot. |
-| `webtransport_tasks` | 9444 QUIC · 9445 TCP | a durable action end to end: the page submits a typed form event with an idempotency key over a reliable stream, the server validates and authorizes it, one transaction writes the task and its job, a worker leases and runs the job, one completion transaction writes the task update, the job completion and an outbox row, a dispatcher publishes it, and the authorized view patches itself from committed state. `examples/durable/tasks.zig` holds the slice and `examples/durable/acceptance.zig` the acceptance: `zig build test-durable` runs its seven scenarios against a real PostgreSQL (point `-Ddsn=` at a database you are willing to truncate), and `scripts/bench_durable_tasks.py` measures it. |
+| `webtransport_tasks` | 9444 QUIC · 9444 TCP | a durable action end to end: the page submits a typed form event with an idempotency key over a reliable stream, the server validates and authorizes it, one transaction writes the task and its job, a worker leases and runs the job, one completion transaction writes the task update, the job completion and an outbox row, a dispatcher publishes it, and the authorized view patches itself from committed state. `examples/durable/tasks.zig` holds the slice and `examples/durable/acceptance.zig` the acceptance: `zig build test-durable` runs its seven scenarios against a real PostgreSQL (point `-Ddsn=` at a database you are willing to truncate), and `scripts/bench_durable_tasks.py` measures it. |
 
 ### Durable actions
 
@@ -379,7 +379,7 @@ deployment needs. Both are framework work around this path, not part of the path
 :  one transaction per step, a lease with a token, idempotency by unique key, and an outbox with revisions : 
 do not depend on either.
 
-The demo serves its page over TCP on 9445 and the session over QUIC on 9444, which is not the same shape as
+The demo serves its page over TCP and the session over QUIC on the same port number — 9444 by default, TCP for the page and UDP for the session — which is not the same shape as
 the other examples on purpose. A browser told to force QUIC for an origin: what a self-signed certificate
 needs: sends *every* request to that origin over QUIC, and a page served there cannot reload while the
 server is being rebuilt: its reload, and the version poll that triggers it, fail with the handshake. Serving

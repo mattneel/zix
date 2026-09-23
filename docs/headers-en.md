@@ -21,7 +21,7 @@ The backing buffer is arena-allocated per request to exactly the configured cap:
 Set it once in `HttpServerConfig`:
 
 ```zig
-var server = zix.Http.Server.init(.{
+var server = zix.Http.Server.init(handler, .{
     // ...
     .max_response_headers = .LARGE,              // 64 headers
     // .max_response_headers = .{ .CUSTOM = 48 }, // explicit cap

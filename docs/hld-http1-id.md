@@ -77,7 +77,7 @@ flowchart TD
 - Setiap worker memiliki listener pribadi, instance epoll pribadi, dan connection table pribadi. Kernel menyeimbangkan koneksi baru di antara listener per-worker (`SO_REUSEPORT`), sehingga tidak ada accept thread, tidak ada queue bersama, dan tidak ada perpindahan fd antar thread.
 - Request pipelined yang tiba dalam satu readable event semuanya di-parse dan di-dispatch dalam satu pass, dan response-nya digabung menjadi satu `write()` melalui response sink per-event.
 - Di luar Linux, `run()` mengembalikan `error.ZixDispatchModelUnsupported` setelah mencatat model mana yang ditolak: pakai `.ASYNC` di sana.
-- Ini satu-satunya model yang menghormati promosi WebSocket milik engine (lihat bagian WebSocket).
+- Promosi WebSocket milik engine dihormati di sini seperti pada setiap model (lihat bagian WebSocket): loop mengonsumsi handoff yang dicatat handler dan memompa frame dengan `serveEpollWs`.
 
 ### .URING: Event Loop io_uring Shared-Nothing (khusus Linux)
 
@@ -94,7 +94,7 @@ graph TD
     zix["src/lib.zig\npublic API root"] --> Http1["tcp/http1/Http1.zig\nzix.Http1 namespace"]
 
     Http1 --> core["core.zig\nparseHead + serveConn\nwrite helpers + RespSink"]
-    Http1 --> server["server.zig\nServer + 5 dispatch models\nEPOLL + URING engines"]
+    Http1 --> server["server.zig\nServer + 3 dispatch models\nEPOLL + URING engines"]
     Http1 --> config["config.zig\nHttp1ServerConfig"]
     Http1 --> router["router.zig\ncomptime Router + pathParam"]
     Http1 --> websocket["websocket.zig\nRFC 6455 codec + pump"]

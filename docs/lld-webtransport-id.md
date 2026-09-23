@@ -37,10 +37,10 @@ graph TD
 | `webtransport/capsule.zig` | framing capsule RFC 9297, keenam capsule yang dipakai binding ini, streaming reader | 10 |
 | `webtransport/datagram.zig` | QUIC DATAGRAM frame dan HTTP/3 datagram yang membawa payload WebTransport | 6 |
 | `webtransport/stream_header.zig` | byte yang membuka stream data, dan aturan yang membuatnya dapat dipercaya | 5 |
-| `webtransport/session.zig` | state session dan stream, send half dan receive half, flow control level session | 14 |
+| `webtransport/session.zig` | state session dan stream, send half dan receive half, flow control level session | 15 |
 | `webtransport/pool.zig` | session, stream data, send buffer, dan buffer stream pra-session milik worker | 6 |
 
-Itulah 52 unit test in-file milik binding (`grep -c '^test "'` atas ketujuh file); semuanya dinamai `zix webtransport: <claim>`, dan berjalan dengan `zig build unit-test` melalui `std.testing.refAllDecls` dari `src/lib.zig`.
+Itulah 53 unit test in-file milik binding (`grep -c '^test "'` atas ketujuh file); semuanya dinamai `zix webtransport: <claim>`, dan berjalan dengan `zig build unit-test` melalui `std.testing.refAllDecls` dari `src/lib.zig`.
 
 ---
 
@@ -422,7 +422,7 @@ Client bebas membuka stream dan mengirim datagram sebelum melihat respons 2xx ya
 
 ## Test in-file
 
-Pembuktian setiap modul berjalan dengan `zig build unit-test` (52 test di ketujuh file, semuanya dinamai `zix webtransport: <claim>`).
+Pembuktian setiap modul berjalan dengan `zig build unit-test` (53 test di ketujuh file, semuanya dinamai `zix webtransport: <claim>`).
 
 | File | Yang dipin test-nya |
 | :- | :- |

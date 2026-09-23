@@ -21,7 +21,7 @@ Backing buffer dialokasikan via arena per request dengan ukuran tepat sesuai cap
 Atur sekali saja di `HttpServerConfig`:
 
 ```zig
-var server = zix.Http.Server.init(.{
+var server = zix.Http.Server.init(handler, .{
     // ...
     .max_response_headers = .LARGE,              // 64 headers
     // .max_response_headers = .{ .CUSTOM = 48 }, // cap eksplisit

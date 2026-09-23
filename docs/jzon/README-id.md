@@ -143,13 +143,13 @@ Proses parse melaporkan satu set yang sama, jalur mana pun yang berjalan:
 
 | Error | Artinya |
 | :- | :- |
-| `UnknownField` | dokumen membawa key yang tidak dideklarasikan tipenya, di bawah `unknown = .REJECT` |
-| `MissingField` | dokumen meninggalkan field yang tidak mendeklarasikan default |
-| `UnknownEnumValue` | string yang tidak punya tag di enum-nya |
-| `Truncated` | dokumen berakhir lebih awal |
-| `Unexpected` | yang ada di sana bukan yang diminta tipenya: syntax error, nilai dengan bentuk salah, atau key yang sama dua kali |
-| `BadNumber` | teks angka yang tidak diizinkan grammar, atau nilai yang tidak muat di tipe integer sasaran |
-| `BadEscape` | escape sequence yang tidak dieja aturannya |
+| `JzonUnknownField` | dokumen membawa key yang tidak dideklarasikan tipenya, di bawah `unknown = .REJECT` |
+| `JzonMissingField` | dokumen meninggalkan field yang tidak mendeklarasikan default |
+| `JzonUnknownEnumValue` | string yang tidak punya tag di enum-nya |
+| `JzonTruncated` | dokumen berakhir lebih awal |
+| `JzonUnexpected` | yang ada di sana bukan yang diminta tipenya: syntax error, nilai dengan bentuk salah, atau key yang sama dua kali |
+| `JzonBadNumber` | teks angka yang tidak diizinkan grammar, atau nilai yang tidak muat di tipe integer sasaran |
+| `JzonBadEscape` | escape sequence yang tidak dieja aturannya |
 | `OutOfMemory` | allocator kehabisan |
 
 Menukar strategy tidak pernah mengubah apa yang harus ditangani pemanggil. `lld-id.md` menyebut tiga tempat jalur yang dibangun dari tipenya menjawab berbeda dari `.STD`.
@@ -182,11 +182,11 @@ Contoh ketujuh berupa server, jadi ia tinggal bersama contoh engine, bukan di pa
 
 ## Testing
 
-Tiga tier, 432 test, tidak ada yang butuh instalasi apa pun:
+Tiga tier, 440 test, tidak ada yang butuh instalasi apa pun:
 
 ```
-zig build test-unit          # 108, test in-file di bawah src/
-zig build test-behaviour     # 141, apa yang dilakukan tiap bagian saat diberi yang diminta
+zig build test-unit          # 113, test in-file di bawah src/
+zig build test-behaviour     # 144, apa yang dilakukan tiap bagian saat diberi yang diminta
 zig build test-edge          # 183, apa yang dilakukan tiap bagian saat diberi yang tidak diminta
 zig build test-all           # ketiganya
 ```

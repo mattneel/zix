@@ -100,7 +100,7 @@ graph TD
     Http2 --> server["server.zig\nServer + dispatch_model switch"]
     Http2 --> static["static.zig\nfallback public_dir\nHEADERS + frame DATA yang dibatasi"]
 
-    server --> dispatch["dispatch/\nasync pool mixed epoll uring + common"]
+    server --> dispatch["dispatch/\nasync epoll uring + common"]
     server --> tls_serve["tls_serve.zig\nthread-per-conn TLS terminator"]
     server --> tls_mux["tls_mux.zig\nmultiplexed per-core TLS terminator"]
 
@@ -143,7 +143,7 @@ Diakses melalui `const zix = @import("zix");`
 | `zix.Http2.HpackEncoder` / `HpackDecoder` / `HpackEntry` | type | Tipe codec HPACK |
 | `zix.Http2.huffEncode` / `huffDecode` | fn | Codec Huffman HPACK |
 | `zix.Http2.respHeaderBlock` | fn | Meng-encode blok `[:status, content-type, content-encoding, content-length]` yang di-cache |
-| `zix.Http2.FrameHeader` + `parseFrameHeader` / `writeFrameHeader` / `encodeFrameHeader` / `readFrameHeader` | type / fn | Codec frame-header untuk framing kustom |
+| `zix.Http2.FrameHeader` + `parseFrameHeader` / `writeFrameHeaderFD` / `encodeFrameHeader` / `readFrameHeader` | type / fn | Codec frame-header untuk framing kustom |
 | `zix.Http2.sendSettingsFD` / `sendSettingsAckFD` / `sendPingAckFD` / `sendGoawayFD` / `sendRstStreamFD` / `sendWindowUpdateFD` | fn | Pengirim control-frame |
 | `zix.Http2.FRAME_TYPE_*` / `FLAG_*` / `ERR_*` / `SETTINGS_*` | const | Konstanta frame, flag, error, dan settings RFC 7540 |
 | `zix.Http2.PREFACE` / `HPACK_STATIC` | const | String connection preface, static table HPACK |
@@ -161,7 +161,6 @@ pub const Http2ServerConfig = struct {
     port:           u16,           // harus non-zero
     dispatch_model: DispatchModel, // wajib, tidak ada default
     kernel_backlog: u31   = 1024,
-    workers:        usize = 0,     // 0 = cpu_count accept thread, diabaikan .ASYNC
     workers:        usize = 0,     // .EPOLL/.URING: 0 = cpu_count mux worker. Diabaikan oleh .ASYNC
     worker_stack_size_bytes: usize = 512 * 1024,
     busy_poll_us:   u32   = 0,     // window spin SO_BUSY_POLL (.EPOLL/.URING), 0 = tidak diset

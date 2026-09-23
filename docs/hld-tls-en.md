@@ -119,7 +119,7 @@ sequenceDiagram
     E->>C: writeAppData(response) + close_notify
 ```
 
-`serverHandshake` is sans-I/O: it returns the bytes to send plus a `Connection`. A HelloRetryRequest (when the client's chosen curve has no key_share) is a two-round variant via `serverHelloRetry` then `serverHandshakeAfterRetry`. A 1.2-only client surfaces as `UnsupportedTlsVersion`, which the serve path routes to the 1.2 track (subject to the version policy).
+`serverHandshake` is sans-I/O: it returns the bytes to send plus a `Connection`. A HelloRetryRequest (when the client's chosen curve has no key_share) is a two-round variant via `serverHelloRetry` then `serverHandshakeAfterRetry`. A 1.2-only client surfaces as `ZixUnsupportedTlsVersion`, which the serve path routes to the 1.2 track (subject to the version policy).
 
 ## Engine Integration (ADR-046)
 
@@ -149,7 +149,7 @@ On the Http1 https path, the request Host (port stripped) is matched against the
 ## Memory Model
 
 - No per-request allocator is exposed. The handshake works in caller-provided fixed buffers, and the application path reuses the engine's existing buffers.
-- `Tls.Context` owns one heap allocation: the duplicated DER certificate, freed by `deinit`. The signing key and the validated policy slices are values or borrowed slices.
+- `Tls.Context` owns its heap buffers: the duplicated DER certificate, the certificate chain and its entry list (all freed by `deinit`). The signing key and the validated policy slices are values or borrowed slices.
 - The handshake transcript and key schedule are fixed-size (`Secret = [32]u8`, SHA-256 throughout).
 
 ## References

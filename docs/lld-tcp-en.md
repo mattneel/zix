@@ -22,8 +22,8 @@ fn TcpServerImpl(comptime handler: HandlerFn) type        // .init(config) -> er
 fn TcpFramedServerImpl(comptime frame_fn: FrameFn) type   // .init(config); .deinit(); .run() -> ring on .URING, else frameAdapter fallback
 
 // Free dispatch workers (handler kept as a runtime value, same shape as zix.Http1):
-fn serveDispatch(cfg: TcpServerConfig, io: std.Io, handler: HandlerFn) !void  // ASYNC/EPOLL switch, rejects a Linux-only model off Linux
-fn runEpoll(cfg: TcpServerConfig, io: std.Io, handler: HandlerFn, cpu: usize) !void
+fn serveDispatch(cfg: TcpServerConfig, handler: HandlerFn) !void  // ASYNC/EPOLL switch, rejects a Linux-only model off Linux
+fn runEpoll(cfg: TcpServerConfig, handler: HandlerFn) !void
 ```
 
 The handler (or per-frame callback) is comptime-known at the type boundary, but the internal worker functions take it as a runtime value, so `serveDispatch` / `runEpoll` are shared across every specialization with no per-handler code bloat (ADR-038). The built-in echo default is the public `zix.Tcp.echoHandler`, passed explicitly to `init`.
@@ -104,27 +104,6 @@ Half-duplex per connection: `armRecv` fires again only once any staged reply's `
 
 Falls back to `.EPOLL` (the blocking `frameAdapter` wrapping `frame_fn` in a `HandlerFn`, see `common.zig`) when `uringUnavailableReason()` is non-null at startup (seccomp/sandbox, `RLIMIT_MEMLOCK` too low for the ring size, or a pre-io_uring kernel), decided once in `server.zig` before the worker fleet spawns.
 
-### ConnQueue
-
-```zig
-const ConnQueue = struct {
-    mutex:  std.Io.Mutex                              = .init,
-    ready:  std.Io.Condition                          = .init,
-    items:  std.ArrayListUnmanaged(std.Io.net.Stream) = .empty,
-    closed: bool                                      = false,
-
-    fn push(self, stream, io) void   // lock -> append -> unlock -> signal
-    fn pop(self, io) ?Stream         // lock -> wait while empty -> orderedRemove(0) -> unlock
-    fn close(self, io) void          // lock -> closed=true -> unlock -> broadcast
-    fn deinit(self) void             // items.deinit(smp_allocator)
-};
-```
-
-- `push` uses `smp_allocator` directly, no per-connection arena.
-- On OOM in `push`, the stream is closed and the connection dropped.
-- `pop` returns `null` only after `close()` has been called and the queue is fully drained.
-- `orderedRemove(0)` preserves arrival order (FIFO).
-
 ### ConnTask
 
 ```zig
@@ -132,10 +111,12 @@ const ConnTask = struct {
     stream:  std.Io.net.Stream,
     io:      std.Io,
     handler: HandlerFn,
+    logger:  ?*Logger,
 };
 
 fn dispatchConn(task: ConnTask) void {
     task.handler(task.stream, task.io);
+    if (task.logger) |lg| lg.conn(peer, elapsed_ms, null);
 }
 ```
 

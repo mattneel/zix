@@ -342,7 +342,7 @@ A buffer-owning type frees in `deinit`. Anything caller-provided (`io`, `logger`
 
 ## 11. Tests
 
-Tests live at the bottom of the file they cover (Zig discovers them through `refAllDecls`). The name carries the domain prefix of the surface under test: `test "zix <domain>: <subject>, <case>"` (`zix tcp:`, `zix http1:`, `zix grpc:`, `zix tls:`, `zix channel:`), and driver tests use the driver name (`postgrez auth:`, `rediz resp:`):
+Tests live at the bottom of the file they cover (Zig discovers them through `refAllDecls`). The name carries the domain prefix of the surface under test: `test "zix <domain>: <subject>, <case>"` (`zix tcp:`, `zix http1:`, `zix grpc:`, `zix tls:`, `zix channel:`), and driver tests use the driver name (`postgrez auth:`, `rediz protocol:`):
 
 ```zig
 test "zix tcp: TcpServerConfig, default field values" {

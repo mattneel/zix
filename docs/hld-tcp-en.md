@@ -26,7 +26,7 @@ Implemented. See ADR-022 for design rationale.
 ```
 src/tcp/
     config.zig    // TcpServerConfig, TcpClientConfig, DispatchModel
-    server.zig    // Server (comptime factory), HandlerFn, FrameFn, echoHandler, ConnQueue
+    server.zig    // Server (comptime factory), HandlerFn, FrameFn, echoHandler
     client.zig    // TcpClient
     Tcp.zig       // namespace aggregator (also re-exports Http)
 ```
@@ -46,7 +46,7 @@ pub const Tcp = @import("tcp/Tcp.zig");
 | `zix.Tcp.Server` | namespace | `init(handler, config)` / `initArgs(handler, config, args)` (per-connection), `initFramed(frame_fn, config)` / `initFramedArgs(frame_fn, config, args)` (per-frame ring), each returns a server with `run()` / `deinit()` |
 | `zix.Tcp.Client` | struct | `connect(config, io)` / `connectArgs(config, io, args)` / `sendMsg(io, msg)` / `recvMsg(io, buf)` / `deinit(io)` |
 | `zix.Tcp.ServerConfig` | struct | `io`, `ip`, `port`, `dispatch_model` (.ASYNC), `kernel_backlog` (4096), `max_recv_buf` (4096), `workers` (0), `worker_stack_size_bytes` (512 KiB), `reuseport_cbpf` (false), `uring_send_buf_size` (64 KiB), `uring_max_conns_per_worker` (65536), `recv_timeout_ms` (0), `send_timeout_ms` (0), `logger` (null) |
-| `zix.Tcp.ClientConfig` | struct | `ip`, `port`, `max_recv_buf` (4096) |
+| `zix.Tcp.ClientConfig` | struct | `ip`, `port`, `max_recv_buf` (4096), `recv_timeout_ms` (0), `send_timeout_ms` (0) |
 | `zix.Tcp.DispatchModel` | enum(u8) | `ASYNC=0`, `EPOLL=1`, `URING=2`. Per-connection handler: ASYNC and EPOLL native, URING folds to EPOLL. Framed path: URING native. |
 | `zix.Tcp.HandlerFn` | type | `*const fn(stream: std.Io.net.Stream, io: std.Io) void` (per-connection, owns the stream) |
 | `zix.Tcp.FrameFn` | type | `*const fn(payload: []const u8, fd: std.posix.fd_t) void` (per-frame, engine owns the connection, never blocks, runs on the `.URING` ring) |

@@ -175,7 +175,7 @@ pub const HpackDecoder = struct {
 
 Frame codec, control-frame senders, and the constants (`FRAME_TYPE_*`, `FLAG_*`, `ERR_*`, `SETTINGS_*`, `PREFACE`, `FRAME_HEADER_LEN` 9, `FRAME_PAYLOAD_SLACK` 256, `DEFAULT_MAX_FRAME_SIZE` 16384, `MAX_HEADERS` 64).
 
-`FrameHeader` is `{ length: u24, frame_type: u8, flags: u8, stream_id: u31 }`. `parseFrameHeader` / `encodeFrameHeader` do no I/O (for buffered or staged writes), `writeFrameHeader` and `readFrameHeader` add the fd I/O.
+`FrameHeader` is `{ length: u24, frame_type: u8, flags: u8, stream_id: u31 }`. `parseFrameHeader` / `encodeFrameHeader` do no I/O (for buffered or staged writes), `writeFrameHeaderFD` and `readFrameHeader` add the fd I/O.
 
 `writeAllFD` checks a threadlocal `write_hook`: when set (the TLS seal path, or the coalescing sink) it hands the plaintext to the hook, otherwise it calls `writeAllRawFD`, the blocking write-all that polls on `POLL.OUT` for a non-blocking socket's EAGAIN and retries on INTR. `writeAllRawFD` is also the hook's own flush path, so a coalescing flush does not re-enter the hook.
 

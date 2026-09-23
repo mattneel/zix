@@ -156,7 +156,7 @@ The SOH prefix guards against false positives where `10=` appears inside a field
 
 | Model | Entry function | Connection dispatch |
 | :- | :- | :- |
-| `.ASYNC` | `asyncWorkerEntry` | Single accept, `io.async(dispatchConn)` |
+| `.ASYNC` | `runAsync` | Single accept, `io.async(dispatchConn)` |
 | `.EPOLL` | `epollWorkerEntry` (`dispatch/epoll.zig`, `runEpoll`) | Shared-nothing: one SO_REUSEPORT listener plus one epoll instance per worker (Linux-only, rejected off Linux with `error.ZixDispatchModelUnsupported`) |
 | `.URING` | `uringFixWorker` (`dispatch/uring.zig`, `runUring`) | Shared-nothing io_uring workers running the resumable `core.processFixRing` per readable batch (Linux-only, rejected off Linux the same way) |
 

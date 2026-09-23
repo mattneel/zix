@@ -66,7 +66,7 @@ graph TD
 
     static --> static_cache["utils/static_cache.zig\nshared snapshot cache"]
 
-    server --> dispatch["dispatch/\ncommon + async / pool /\nmixed / epoll / uring"]
+    server --> dispatch["dispatch/\ncommon + async /\nepoll / uring"]
     dispatch --> datagram["../datagram.zig\nraw-fd socket\nrecvmmsg / sendmmsg"]
     dispatch --> connection["connection.zig\nper-connection state"]
     dispatch --> demux["demux.zig\nCID table (open addressing)"]
@@ -146,15 +146,18 @@ pub const Http3ServerConfig = struct {
     max_pending_request_streams: usize = 16,   // requests one worker assembles at once, 0 holds none
     max_request_stream_bytes:    usize = 8192, // largest request a handler can be given whole
 
+    handler_timeout_ms: u32 = 0, // global handler deadline, seeded onto Context.deadline_ns
+
     public_dir:                   []const u8 = "",  // static file root, "" disables static serving
     public_dir_cache_ttl_ms:      u32 = 0,          // 0 also disables static serving here, see below
     public_dir_cache_max_entries: u32 = 256,        // static cache slots, one per file plus its siblings
 
     logger: ?*Logger = null, // lifecycle events via logger.system() when set
+    webtransport: Webtransport.Config = .{}, // WebTransport over HTTP/3, off by default
 };
 ```
 
-`io`, `allocator`, `ip`, `port`, and `dispatch_model` are required (no defaults). `tls` defaults to `null` but is rejected at `init`: a QUIC server must present a TLS 1.3 certificate. `DispatchModel` is re-used from the TCP config, not defined here.
+`io`, `allocator`, `ip`, `port`, and `dispatch_model` are required (no defaults). `tls` defaults to `null` but is rejected at `run`: a QUIC server must present a TLS 1.3 certificate. `DispatchModel` is re-used from the TCP config, not defined here.
 
 `reuseport_cbpf` (ADR-061) stays available here but keep it `false`: per-packet CPU steering breaks QUIC flow affinity (a connection's packets land on workers without its state), measured as a heavy throughput drop with zero failed requests. The TCP engines are the value case for this field, not `zix.Http3`.
 

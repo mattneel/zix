@@ -90,7 +90,7 @@ Same thread-per-core, shared-nothing topology as `.EPOLL` (one `SO_REUSEPORT` li
 - When io_uring itself is unavailable on the host (old kernel, low `RLIMIT_MEMLOCK`, sandbox) the engine folds to the `.EPOLL` loop with a logged notice.
 - Off Linux, `run()` returns `error.ZixDispatchModelUnsupported`: pick `.ASYNC` there.
 
-`zix.Http.Server` receives an opaque `std.Io` value and does not own or deinit the backend. See [`docs/concurrency.md`](concurrency.md) for thread count details and model comparison.
+`zix.Http.Server` receives an opaque `std.Io` value and does not own or deinit the backend. See [`docs/concurrency-en.md`](concurrency-en.md) for thread count details and model comparison.
 
 ---
 
@@ -109,7 +109,7 @@ graph TD
     zix --> utils["utils/file.zig\nzix.utils.file"]
     Tcp -.->|re-exports| Http
 
-    Http --> server["server.zig\nServer + ConnQueue"]
+    Http --> server["server.zig\nServer"]
     Http --> config["config.zig\nHttpServerConfig"]
     Http --> client["client.zig\nHttpClient + ClientResponse"]
     Http --> client_config["client_config.zig\nHttpClientConfig"]
@@ -186,7 +186,7 @@ Access via `const zix = @import("zix");`
 | `zix.Http.Header` | struct | `{ name: []const u8, value: []const u8 }` |
 | `zix.Tcp.DispatchModel` | enum(u8) | Dispatch model: `.ASYNC`(0, portable) `.EPOLL`(1, Linux-only) `.URING`(2, Linux-only io_uring). Off Linux `run()` returns `error.ZixDispatchModelUnsupported` for the last two |
 | `zix.Http.RequestHeaderSize` | union(enum) | Request header cap: `.MINIMAL`(16) `.COMMON`(32) `.LARGE`(64) `.{ .CUSTOM = N }` |
-| `zix.Http.default_user_agent` | `[]const u8` | Client user agent string from `build.zig.zon` (e.g. `"zix/0.1.0"`) |
+| `zix.Http.default_user_agent` | `[]const u8` | Client user agent string from `build.zig.zon` (e.g. `"zix/0.5.0"`) |
 | `zix.Http.HeaderSize` | union(enum) | Response header cap: `.MINIMAL`(16) `.COMMON`(32) `.LARGE`(64) `.EXTRA_LARGE`(128) `.{ .CUSTOM = N }` |
 | `zix.Http.ContentType` | enum | Type-safe MIME representation |
 | `zix.Http.Content` | namespace | `typeFromExtension(ext)`, `fromExtension(ext)` |
@@ -217,8 +217,8 @@ pub const HttpServerConfig = struct {
     ip:                   []const u8,
     port:                 u16,
     dispatch_model:       DispatchModel,    // required: ASYNC, EPOLL, or URING (EPOLL/URING Linux-only)
-    kernel_backlog:   usize             = 1024 * 4,  // TCP listen() backlog
-    max_recv_buf:   usize             = 1024 * 4,  // read buffer per connection
+    kernel_backlog:   u31               = 1024,     // TCP listen() backlog
+    max_recv_buf:   usize             = 6 * 1024,  // read buffer per connection
     large_body_rcvbuf:    usize             = 0,          // SO_RCVBUF on the large-body/upload path, 0 = kernel default
     max_request_body:     usize             = 8 * 1024 * 1024, // request body cap, body() refuses past it with 413 (0 = no check on Content-Length)
     compress:             bool              = false,      // gzip / deflate / brotli negotiation, opt-in via resp.sendNegotiated (every model)
@@ -244,7 +244,7 @@ The listing above is abbreviated: the full field reference (compression, respons
 
 The caller owns `io`: `zix.Http.Server` does not call `deinit` on it. The route table is passed as a comptime argument to `Server.init`: no runtime allocation for routing.
 
-For header cap selection and security guidance see [`docs/headers.md`](headers.md).
+For header cap selection and security guidance see [`docs/headers-en.md`](headers-en.md).
 
 ---
 
@@ -255,26 +255,26 @@ For header cap selection and security guidance see [`docs/headers.md`](headers.m
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Accept as Accept thread
-    participant Queue as ConnQueue
-    participant Pool as Pool thread
+    participant Accept as Accept loop
+    participant Sched as io Threaded pool
+    participant Task as connection task
     participant Router
     participant Handler as HandlerFn
     participant Static as static.serve()
 
     Client->>Accept: TCP connect
-    Accept->>Queue: queue.push(stream)
-    Queue->>Pool: queue.pop() unblocks
+    Accept->>Sched: io.async(connEntry, ...)
     Note over Accept: immediately back to accept()
 
-    Pool->>Pool: alloc read_buf
-    Pool->>Pool: ArenaAllocator init
+    Sched->>Task: schedule the connection
+    Task->>Task: alloc read_buf
+    Task->>Task: ArenaAllocator init
 
     loop keep-alive
-        Client->>Pool: HTTP request
-        Pool->>Pool: recv until the header terminator
-        Pool->>Pool: build Request + Response + Context
-        Pool->>Router: dispatch(req, res, ctx)
+        Client->>Task: HTTP request
+        Task->>Task: recv until the header terminator
+        Task->>Task: build Request + Response + Context
+        Task->>Router: dispatch(req, res, ctx)
 
         alt route matched
             Router->>Handler: handler(req, res, ctx)
@@ -288,12 +288,11 @@ sequenceDiagram
             end
         end
 
-        Pool->>Pool: arena.reset()
+        Task->>Task: arena.reset()
     end
 
-    Client->>Pool: connection close
-    Pool->>Pool: free read_buf + write_buf, arena.deinit()
-    Pool->>Queue: queue.pop() (next connection)
+    Client->>Task: connection close
+    Task->>Task: free read_buf + write_buf, arena.deinit()
 ```
 
 ---
@@ -793,7 +792,7 @@ pub const HttpClientConfig = struct {
     follow_redirects:    bool = true,
     max_redirects:       u8   = 3,
     h2_max_read_rounds:  usize = 4096,                       // HTTP/2 client read-loop bound, max frame-read rounds
-    user_agent:          []const u8 = zon_options.user_agent, // library version string (e.g. "zix/0.1.0"); "" omits
+    user_agent:          []const u8 = zon_options.user_agent, // library version string (e.g. "zix/0.5.0"); "" omits
     version:             Version = .HTTP_1,                  // .HTTP_1 (std client) or .HTTP_2 (h2 over TLS 1.3, https only)
     tls_ca_path:         ?[]const u8 = null,                 // extra CA PEM for https. null = system roots
     tls_verify:          bool = true,                        // verify server cert chain + hostname on https
@@ -873,7 +872,7 @@ Call `resp.deinit()` to release both. After `deinit()`, all slices returned by `
 
 TLS for this server (native https, opt-in via `config.tls`, dual listener via `config.tls_port`) is implemented, see [`docs/hld-tls-en.md`](hld-tls-en.md).
 
-For UDP design see [`docs/hld-udp.md`](hld-udp.md). For UDS see [`docs/hld-uds.md`](hld-uds.md).
+For UDP design see [`docs/hld-udp-en.md`](hld-udp-en.md). For UDS see [`docs/hld-uds-en.md`](hld-uds-en.md).
 
 ---
 

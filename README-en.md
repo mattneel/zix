@@ -2561,7 +2561,7 @@ A field type a generated path has no JSON form for is a compile error naming the
 
 The two bench examples want `-Doptimize=ReleaseFast`. A Debug build measures the safety checks rather than the paths, and the rows collapse onto each other.
 
-A fifth example is a server, so it lives with the engine examples rather than in the package and is built from the repo root with `zig build example-http1_jzon`.
+A seventh example is a server, so it lives with the engine examples rather than in the package and is built from the repo root with `zig build example-http1_jzon`.
 
 | Example | What it shows |
 | :- | :- |

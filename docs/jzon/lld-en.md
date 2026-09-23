@@ -26,8 +26,8 @@ That is why the two write paths leave different things behind on failure. The st
 
 Two failures, and the split matters:
 
-- `Truncated` means the document ended early.
-- `Unexpected` means the byte that is there cannot start what was asked for.
+- `JzonTruncated` means the document ended early.
+- `JzonUnexpected` means the byte that is there cannot start what was asked for.
 
 | Call | What it does |
 | :- | :- |
@@ -100,7 +100,7 @@ Both convert two digits per iteration out of `std.fmt.digits2`. What separates t
 
 `appendTable` handles two sharp cases. `@abs` on a signed value yields the unsigned type of the same width, so the most negative value converts without overflowing. The running value is held at 8 bits or wider whatever `T` is, so a narrow field type still compares against the 100 and 10 the loop needs.
 
-Reading an integer back enforces the target type's range. A value the field cannot hold reports `BadNumber`, the same way malformed digits do: the text is not a number this field takes.
+Reading an integer back enforces the target type's range. A value the field cannot hold reports `JzonBadNumber`, the same way malformed digits do: the text is not a number this field takes.
 
 ## Floats
 
@@ -148,7 +148,7 @@ flowchart TB
     def -- no --> mf[error.JzonMissingField]
 ```
 
-The same key twice is `Unexpected`, not a silent last-one-wins.
+The same key twice is `JzonUnexpected`, not a silent last-one-wins.
 
 ## Strings on the read side
 
@@ -171,7 +171,7 @@ Under `.BORROW` the document has to outlive the value. On a server that is free,
 
 The walk validates rather than merely bounds. A malformed value fails whether the parse wanted it or not, so a document the std-backed path refuses is refused here too.
 
-A document is untrusted, so the nesting a walk follows is capped at `MAX_DEPTH = 256`. Anything deeper is `Unexpected` rather than being allowed to grow the stack.
+A document is untrusted, so the nesting a walk follows is capped at `MAX_DEPTH = 256`. Anything deeper is `JzonUnexpected` rather than being allowed to grow the stack.
 
 ## The generated emitter
 
@@ -217,7 +217,7 @@ Spelling a field `?T` says what it can hold, not that a document may leave it ou
 ```zig
 const Owed = struct {
     id: u8,
-    note: ?[]const u8,        // still owed, an omission is MissingField
+    note: ?[]const u8,        // still owed, an omission is JzonMissingField
 };
 
 const Optional = struct {

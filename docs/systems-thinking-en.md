@@ -153,7 +153,7 @@ A performance change is not done until it is measured against the gate, and the 
 
 > Measure every cost change against the two-sided gate before calling it done. Report what a change bounds or drops. A sub-1% claim needs a signal that can actually resolve sub-1%, not run-to-run noise on a development machine.
 
-Store each result under `docs/benchmark/` with the environment it was taken on (CPU model, RAM, OS, kernel version) recorded as a reference, since the same change reads differently on an N-core development box than on the 64-core target. A `HttpArena-` filename prefix marks a result captured on the HttpArena harness end (for example `docs/benchmark/HttpArena-result-zix-uring-1.md`), not the local box, so the two sources stay distinguishable when compared.
+Store each result under `docs/benchmark/` with the environment it was taken on (CPU model, RAM, OS, kernel version) recorded as a reference, since the same change reads differently on an N-core development box than on the 64-core target. A `HttpArena-` filename prefix marks a result captured on the HttpArena harness end (for example `docs/benchmark/HttpArena-result-zix_http1-uring-1.md`), not the local box, so the two sources stay distinguishable when compared.
 
 ---
 
@@ -172,7 +172,7 @@ The two-sided gate is only as honest as the measurement behind it. A small, spec
 | Protocol conformance and handshake inspection | `curl -v`, and `curl --http3-only -v` for QUIC | the live behavioral oracle: `-v` narrates each step, so for HTTP/3 it pinpoints each handshake stage (Initial, ServerHello, certificate, 1-RTT, request) when a step regresses. needs curl built with an HTTP/3 backend (ngtcp2 / nghttp3), confirm with `curl --version` |
 | Correctness and leaks | `zig build`, then `test-all` / `examples` / `test-runner-all`, and `std.testing.allocator` | the discovery and leak gate every change clears before any perf claim |
 
-Ready-made runners live in the repo so the method is reproducible, not improvised: `perf-localize-http1.sh` (symbol attribution, hand-run), `perf-per-request-cell.sh` and `perf-per-request-matrix.sh` (per-request `perf stat` tables), `perf-http-epoll.sh` and `perf-http-uring.sh` (per-engine).
+Ready-made runners live in the repo so the method is reproducible, not improvised: the localbench set (`scripts/localbench-build.sh`, `localbench-isolate.sh`, `localbench-run.sh`, `localbench-validate.sh`, with the shared helpers under `scripts/lib/`) and the HttpArena pair (`scripts/httparena-benchmark-isolate.sh`, `httparena-validate.sh`); `scripts/build_profile.py` and `scripts/dev_loop_bench.py` cover the build and dev-loop axes.
 
 > Pick the tool by the axis the change moves. Derive a per-request metric as counter / RPS with the perf window inside a steady `wrk` load. `perf stat` runs in-sandbox at paranoid=2, `perf record` is hand-run with sudo. Clear the correctness and leak gate before making any perf claim, and quiesce before trusting a sub-1% number.
 

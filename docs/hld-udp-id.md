@@ -86,7 +86,7 @@ graph TD
     Udp --> core["core.zig\nHandlerFn, Sink (raw)"]
     Udp --> datagram["datagram.zig\nsocket raw-fd\nrecvmmsg / sendmmsg"]
     Udp --> raw["raw.zig\nfacade Raw(handler)\nrun() switch"]
-    raw --> dispatch["dispatch/\ncommon + async / pool /\nmixed / epoll / uring"]
+    raw --> dispatch["dispatch/\ncommon + async /\nepoll / uring"]
 ```
 
 ---

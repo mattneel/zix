@@ -175,7 +175,7 @@ pub const HpackDecoder = struct {
 
 Codec frame, pengirim control-frame, dan konstanta (`FRAME_TYPE_*`, `FLAG_*`, `ERR_*`, `SETTINGS_*`, `PREFACE`, `FRAME_HEADER_LEN` 9, `FRAME_PAYLOAD_SLACK` 256, `DEFAULT_MAX_FRAME_SIZE` 16384, `MAX_HEADERS` 64).
 
-`FrameHeader` adalah `{ length: u24, frame_type: u8, flags: u8, stream_id: u31 }`. `parseFrameHeader` / `encodeFrameHeader` tidak melakukan I/O (untuk write ter-buffer atau ter-stage), `writeFrameHeader` dan `readFrameHeader` menambahkan I/O fd.
+`FrameHeader` adalah `{ length: u24, frame_type: u8, flags: u8, stream_id: u31 }`. `parseFrameHeader` / `encodeFrameHeader` tidak melakukan I/O (untuk write ter-buffer atau ter-stage), `writeFrameHeaderFD` dan `readFrameHeader` menambahkan I/O fd.
 
 `writeAllFD` memeriksa `write_hook` threadlocal: saat diset (jalur seal TLS, atau sink coalescing) ia menyerahkan plaintext ke hook, selain itu ia memanggil `writeAllRawFD`, write-all blocking yang poll pada `POLL.OUT` untuk EAGAIN socket non-blocking dan retry saat INTR. `writeAllRawFD` juga jalur flush milik hook itu sendiri, jadi flush coalescing tidak masuk ulang ke hook.
 

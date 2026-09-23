@@ -91,11 +91,11 @@ Memegang application key + client-handshake key dan tiga sequence number (`serve
 
 ## context.zig
 
-`Version = enum(u8) { TLS_1_2 = 0x12, TLS_1_3 = 0x13 }` (terurut untuk min <= max). `Context.init` memanggil `validate(config)` yang I/O-free, membaca PEM cert / key, `pemToDer`, menduplikasi DER ke slice milik sendiri, lalu mendeteksi tipe key dari `cert.pub_key_algo` (`.X9_62_id_ecPublicKey` -> ECDSA via `ecdsaScalarFromSec1`, `.curveEd25519` -> Ed25519 via `ed25519SeedFromPkcs8`, `.rsaEncryption` -> RSA via `rsa.PrivateKey.fromDer`, menolak di bawah RSA-2048 dengan `RsaKeyTooSmall`). Buffer DER key berukuran untuk key PKCS#8 RSA, lebih besar dari key EC. `handshakeOptions(ephemeral, random, pss_salt)` mengisi `HandshakeOptions` dari context plus random per-koneksi (salt hanya dikonsumsi oleh CertificateVerify RSA). `allowsTls13` / `allowsTls12` membaca version range.
+`Version = enum(u8) { TLS_1_2 = 0x12, TLS_1_3 = 0x13 }` (terurut untuk min <= max). `Context.init` memanggil `validate(config)` yang I/O-free, membaca PEM cert / key, `pemToDer`, menduplikasi DER ke slice milik sendiri, lalu mendeteksi tipe key dari `cert.pub_key_algo` (`.X9_62_id_ecPublicKey` -> ECDSA via `ecdsaScalarFromSec1`, `.curveEd25519` -> Ed25519 via `ed25519SeedFromPkcs8`, `.rsaEncryption` -> RSA via `rsa.PrivateKey.fromDer`, menolak di bawah RSA-2048 dengan `ZixRsaKeyTooSmall`). Buffer DER key berukuran untuk key PKCS#8 RSA, lebih besar dari key EC. `handshakeOptions(ephemeral, random, pss_salt)` mengisi `HandshakeOptions` dari context plus random per-koneksi (salt hanya dikonsumsi oleh CertificateVerify RSA). `allowsTls13` / `allowsTls12` membaca version range.
 
 ### validate (honesty boundary)
 
-Menolak list curve / cipher kosong, curve di luar {X25519, SECP256R1}, cipher di luar {AES_128_GCM_SHA256, ECDHE_ECDSA_AES128_GCM_SHA256}, version range terbalik, ceiling 1.3 tanpa AES_128_GCM_SHA256, dan floor 1.2 tanpa suite 1.2 atau secp256r1. Error: `TlsUnsupportedCurve`, `TlsUnsupportedCipher`, `TlsInvalidVersionRange`, `TlsMissingCipherForVersion`, `TlsMissingCurveForTls12`, `TlsNoCurves`, `TlsNoCiphers`.
+Menolak list curve / cipher kosong, curve di luar {X25519, SECP256R1}, cipher di luar {AES_128_GCM_SHA256, ECDHE_ECDSA_AES128_GCM_SHA256}, version range terbalik, ceiling 1.3 tanpa AES_128_GCM_SHA256, dan floor 1.2 tanpa suite 1.2 atau secp256r1. Error: `ZixTlsUnsupportedCurve`, `ZixTlsUnsupportedCipher`, `ZixTlsInvalidVersionRange`, `ZixTlsMissingCipherForVersion`, `ZixTlsMissingCurveForTls12`, `ZixTlsNoCurves`, `ZixTlsNoCiphers`.
 
 ## pem.zig
 
@@ -114,8 +114,8 @@ Signer RSA (ADR-048), sisi server saja. `PrivateKey.fromDer(der, is_pkcs8)` mem-
 `runTls` membaca `config.tls.?` (context) dan menjalankan accept loop. `serveConnTls(fd, handler, ctx)`:
 
 1. baca record ClientHello, generate `ephemeral_secret` + `server_random` + `pss_salt` (getrandom), bangun `opts = ctx.handshakeOptions(...)`.
-2. version policy: jika `!ctx.allowsTls13()`, langsung ke jalur 1.2 (ECDSA saja, jika tidak `Tls12RequiresEcdsa`).
-3. ronde HelloRetryRequest jika `serverHelloRetry` mengembalikan satu, jika tidak `serverHandshake`. Saat `UnsupportedTlsVersion`: jika `!ctx.allowsTls12()` kirim alert `protocol_version`, jika tidak ambil jalur 1.2.
+2. version policy: jika `!ctx.allowsTls13()`, langsung ke jalur 1.2 (ECDSA saja, jika tidak `ZixTls12RequiresEcdsa`).
+3. ronde HelloRetryRequest jika `serverHelloRetry` mengembalikan satu, jika tidak `serverHandshake`. Saat `ZixUnsupportedTlsVersion`: jika `!ctx.allowsTls12()` kirim alert `protocol_version`, jika tidak ambil jalur 1.2.
 4. baca (ChangeCipherSpec) + client Finished, lalu satu record aplikasi -> `readAppData` -> `core.parseHead`.
 5. Host vs identitas cert (`verifyCertIdentity`) -> 421 saat mismatch, jika tidak jalankan handler dengan capture sink in-memory (`runHandlerToBuffer`) dan `writeAppData` response, lalu `closeNotify`.
 
@@ -131,7 +131,7 @@ WebSocket dibangun di atas stream sink yang sama untuk write half dan menambah r
 
 ## tcp/tls/h2_terminator.zig (terminator h2-over-TLS bersama)
 
-`serveConnTls(fd, ctx, driver)` adalah terminator engine-agnostic yang dipakai jalur `.ASYNC` dari Http2 dan Grpc. Ia menjalankan handshake (version policy + fallback 1.2 ke `serveConnTls12`, yang menerima `driver` yang sama), memastikan ALPN memilih h2 (`AlpnNotH2` jika tidak), memverifikasi client Finished, lalu memanggil `driver.drive(fd, &conn, &record_buf)`. Driver memiliki koneksi sampai close: ia menjalankan mux h2 resumable langsung di atas record terdekripsi dan menyegel frame engine kembali ke record TLS lewat write hook thread-local. Tanpa socketpair, tanpa thread kedua.
+`serveConnTls(fd, ctx, driver)` adalah terminator engine-agnostic yang dipakai jalur `.ASYNC` dari Http2 dan Grpc. Ia menjalankan handshake (version policy + fallback 1.2 ke `serveConnTls12`, yang menerima `driver` yang sama), memastikan ALPN memilih h2 (`ZixAlpnNotH2` jika tidak), memverifikasi client Finished, lalu memanggil `driver.drive(fd, &conn, &record_buf)`. Driver memiliki koneksi sampai close: ia menjalankan mux h2 resumable langsung di atas record terdekripsi dan menyegel frame engine kembali ke record TLS lewat write hook thread-local. Tanpa socketpair, tanpa thread kedua.
 
 ## tcp/http2/tls_serve.zig dan tcp/http2/grpc/tls_serve.zig
 

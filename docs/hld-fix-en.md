@@ -29,7 +29,7 @@ src/tcp/fix/
     core.zig     // parsing, building, checksum, serveConn, MsgType, FixRequest, FixResponse, FixContext, HandlerFn, FixRoute
     config.zig   // FixServerConfig, FixClientConfig
     server.zig   // FixServer: thin run() switch over dispatch/ (ASYNC, EPOLL, URING)
-    dispatch/    // per-model files: async.zig, pool.zig, mixed.zig, epoll.zig, uring.zig, common.zig
+    dispatch/    // per-model files: async.zig, epoll.zig, uring.zig, common.zig
     router.zig   // comptime FixRouter
     client.zig   // FixClient
 ```
@@ -48,7 +48,7 @@ pub const Fix = @import("tcp/fix/Fix.zig");
 | :- | :- | :- |
 | `zix.Fix.Server` | struct | `init(handler, config)` / `deinit()` / `run()` (ADR-063: `handler: ?HandlerFn`, built via `Router(&routes).dispatch`; `null` keeps echo mode) |
 | `zix.Fix.ServerConfig` | struct | See Server Config Fields below |
-| `zix.Fix.ServeOpts` | struct | `{ logger, heartbeat_timeout_ms, conn_timeout_ms, handler_timeout_ms, handler }`: options for `serveConn` |
+| `zix.Fix.ServeOpts` | struct | `{ logger, default_heartbeat_secs, heartbeat_timeout_ms, conn_timeout_ms, handler_timeout_ms, handler }`: options for `serveConn` |
 | `zix.Fix.Client` | struct | `connect(config, io)` / `deinit(io)` / `logon(io, heart_bt_int)` / `logout(io)` / `sendMessage(io, msg_type, extra)` / `recvMessage(io)` |
 | `zix.Fix.ClientConfig` | struct | See Client Config Fields below |
 | `zix.Fix.DispatchModel` | enum(u8) | Re-export of `zix.Tcp.DispatchModel` |
@@ -85,7 +85,7 @@ pub const Fix = @import("tcp/fix/Fix.zig");
 | `ip` | required | Bind address |
 | `port` | required | Bind port. Must be non-zero |
 | `comp_id` | required | Server SenderCompID (tag 49) |
-| `dispatch_model` | `.ASYNC` | ASYNC, EPOLL, or URING (EPOLL and URING are Linux-only: native epoll / io_uring, rejected off Linux with error.ZixDispatchModelUnsupported) |
+| `dispatch_model` | required, no default | ASYNC, EPOLL, or URING (EPOLL and URING are Linux-only: native epoll / io_uring, rejected off Linux with error.ZixDispatchModelUnsupported) |
 | `kernel_backlog` | 1024 | TCP listen backlog |
 | `workers` | 0 (cpu_count) | Accept thread count. Ignored by ASYNC |
 | `worker_stack_size_bytes` | 512 KiB | Worker thread stack for EPOLL / URING handler threads. Demand-paged, costs little until the depth is used |
@@ -144,7 +144,7 @@ pub const Tag = enum(u16) {
     TargetCompID = 56,
     MsgSeqNum    = 34,
     HeartBtInt   = 108,
-    // ... 54 tags total
+    // ... 55 tags total
     _,  // catch-all: any u16 is a valid Tag value
 };
 ```
@@ -223,7 +223,7 @@ Bad checksum closes the connection without a response.
 
 ## MsgType Constants
 
-FIX MsgType values (tag 35) are ASCII strings, not integers. `zix.Fix.MsgType` is a namespace struct of 47 compile-time string constants covering FIX 4.0-4.4. Use these instead of raw string literals to avoid typos and aid readability.
+FIX MsgType values (tag 35) are ASCII strings, not integers. `zix.Fix.MsgType` is a namespace struct of 44 compile-time string constants covering FIX 4.0-4.4. Use these instead of raw string literals to avoid typos and aid readability.
 
 ```zig
 // Session

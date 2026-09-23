@@ -933,14 +933,6 @@ pub fn main(process: std.process.Init) !void {
     });
 ```
 
-```zig
-var server = zix.Http.Server.init(zix.Http.Router(&[_]zix.Http.Route{
-    .{ .path = "/", .handler = homeHandler },
-}).dispatch, .{
-    .io             = process.io,
-    .dispatch_model = .ASYNC,
-});
-```
 
 **`.EPOLL` (shared-nothing epoll worker, khusus Linux):**
 
@@ -2569,7 +2561,7 @@ Tipe field yang tidak punya bentuk JSON di jalur generated adalah compile error 
 
 Dua contoh bench ini butuh `-Doptimize=ReleaseFast`. Build Debug mengukur safety check, bukan jalurnya, dan barisnya jadi saling menempel.
 
-Contoh kelima berupa server, jadi ia tinggal bersama contoh engine, bukan di dalam package, dan dibangun dari root repo dengan `zig build example-http1_jzon`.
+Contoh ketujuh berupa server, jadi ia tinggal bersama contoh engine, bukan di dalam package, dan dibangun dari root repo dengan `zig build example-http1_jzon`.
 
 | Contoh | Yang ditunjukkan |
 | :- | :- |
@@ -2586,7 +2578,7 @@ Contoh kelima berupa server, jadi ia tinggal bersama contoh engine, bukan di dal
 
 <br>
 
-## Driver
+## Drivers
 
 Driver database dan metrics, ditulis murni dengan Zig di atas standard library seperti para engine. Masing-masing tinggal di `src/driver/<name>/` dengan build, contoh, dan suite test berbasis container miliknya sendiri, dan bisa init dari string URL atau struct config.
 

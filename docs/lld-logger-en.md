@@ -58,7 +58,7 @@ All formatting happens before the lock is acquired. Lock hold time is proportion
 Direct POSIX `write` syscall in a retry loop until all bytes are sent or an error is returned:
 
 ```zig
-fn rawWrite(fd: std.posix.fd_t, data: []const u8) void {
+fn rawWrite(fd: std.posix.fd_t, data: []const u8) ?std.posix.E {
     var rem = data;
     while (rem.len > 0) {
         const rc = std.posix.system.write(fd, rem.ptr, rem.len);

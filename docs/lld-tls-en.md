@@ -91,11 +91,11 @@ Holds the application + client-handshake keys and three sequence numbers (`serve
 
 ## context.zig
 
-`Version = enum(u8) { TLS_1_2 = 0x12, TLS_1_3 = 0x13 }` (ordered for min <= max). `Context.init` calls the I/O-free `validate(config)`, reads the cert / key PEM, `pemToDer`, duplicates the DER into an owned slice, then detects the key type from `cert.pub_key_algo` (`.X9_62_id_ecPublicKey` -> ECDSA via `ecdsaScalarFromSec1`, `.curveEd25519` -> Ed25519 via `ed25519SeedFromPkcs8`, `.rsaEncryption` -> RSA via `rsa.PrivateKey.fromDer`, rejecting below RSA-2048 with `RsaKeyTooSmall`). The key DER buffer is sized for an RSA PKCS#8 key, larger than an EC key. `handshakeOptions(ephemeral, random, pss_salt)` fills a `HandshakeOptions` from the context plus the per-connection randoms (the salt is consumed only by an RSA CertificateVerify). `allowsTls13` / `allowsTls12` read the version range.
+`Version = enum(u8) { TLS_1_2 = 0x12, TLS_1_3 = 0x13 }` (ordered for min <= max). `Context.init` calls the I/O-free `validate(config)`, reads the cert / key PEM, `pemToDer`, duplicates the DER into an owned slice, then detects the key type from `cert.pub_key_algo` (`.X9_62_id_ecPublicKey` -> ECDSA via `ecdsaScalarFromSec1`, `.curveEd25519` -> Ed25519 via `ed25519SeedFromPkcs8`, `.rsaEncryption` -> RSA via `rsa.PrivateKey.fromDer`, rejecting below RSA-2048 with `ZixRsaKeyTooSmall`). The key DER buffer is sized for an RSA PKCS#8 key, larger than an EC key. `handshakeOptions(ephemeral, random, pss_salt)` fills a `HandshakeOptions` from the context plus the per-connection randoms (the salt is consumed only by an RSA CertificateVerify). `allowsTls13` / `allowsTls12` read the version range.
 
 ### validate (the honesty boundary)
 
-Rejects empty curve / cipher lists, any curve outside {X25519, SECP256R1}, any cipher outside {AES_128_GCM_SHA256, ECDHE_ECDSA_AES128_GCM_SHA256}, an inverted version range, a 1.3 ceiling missing AES_128_GCM_SHA256, and a 1.2 floor missing the 1.2 suite or secp256r1. Errors: `TlsUnsupportedCurve`, `TlsUnsupportedCipher`, `TlsInvalidVersionRange`, `TlsMissingCipherForVersion`, `TlsMissingCurveForTls12`, `TlsNoCurves`, `TlsNoCiphers`.
+Rejects empty curve / cipher lists, any curve outside {X25519, SECP256R1}, any cipher outside {AES_128_GCM_SHA256, ECDHE_ECDSA_AES128_GCM_SHA256}, an inverted version range, a 1.3 ceiling missing AES_128_GCM_SHA256, and a 1.2 floor missing the 1.2 suite or secp256r1. Errors: `ZixTlsUnsupportedCurve`, `ZixTlsUnsupportedCipher`, `ZixTlsInvalidVersionRange`, `ZixTlsMissingCipherForVersion`, `ZixTlsMissingCurveForTls12`, `ZixTlsNoCurves`, `ZixTlsNoCiphers`.
 
 ## pem.zig
 
@@ -114,8 +114,8 @@ The RSA signer (ADR-048), server-side only. `PrivateKey.fromDer(der, is_pkcs8)` 
 `runTls` reads `config.tls.?` (the context) and runs the accept loop. `serveConnTls(fd, handler, ctx)`:
 
 1. read the ClientHello record, generate `ephemeral_secret` + `server_random` + `pss_salt` (getrandom), build `opts = ctx.handshakeOptions(...)`.
-2. version policy: if `!ctx.allowsTls13()`, go straight to the 1.2 path (ECDSA only, else `Tls12RequiresEcdsa`).
-3. HelloRetryRequest round if `serverHelloRetry` returns one, else `serverHandshake`. On `UnsupportedTlsVersion`: if `!ctx.allowsTls12()` send a `protocol_version` alert, else take the 1.2 path.
+2. version policy: if `!ctx.allowsTls13()`, go straight to the 1.2 path (ECDSA only, else `ZixTls12RequiresEcdsa`).
+3. HelloRetryRequest round if `serverHelloRetry` returns one, else `serverHandshake`. On `ZixUnsupportedTlsVersion`: if `!ctx.allowsTls12()` send a `protocol_version` alert, else take the 1.2 path.
 4. read (ChangeCipherSpec) + client Finished, then one application record -> `readAppData` -> `core.parseHead`.
 5. Host vs cert identity (`verifyCertIdentity`) -> 421 on mismatch, else run the handler with the in-memory capture sink (`runHandlerToBuffer`) and `writeAppData` the response, then `closeNotify`.
 
@@ -131,7 +131,7 @@ WebSocket builds on the same stream sink for the write half and adds the read ha
 
 ## tcp/tls/h2_terminator.zig (shared h2-over-TLS terminator)
 
-`serveConnTls(fd, ctx, driver)` is the engine-agnostic terminator used by the `.ASYNC` path of both Http2 and Grpc. It runs the handshake (version policy + 1.2 fallback to `serveConnTls12`, which takes the same `driver`), asserts ALPN selected h2 (`AlpnNotH2` otherwise), verifies the client Finished, then calls `driver.drive(fd, &conn, &record_buf)`. The driver owns the connection until close: it runs the resumable h2 mux inline over the decrypted records and seals the engine's frames back into TLS records through a thread-local write hook. No socketpair, no second thread.
+`serveConnTls(fd, ctx, driver)` is the engine-agnostic terminator used by the `.ASYNC` path of both Http2 and Grpc. It runs the handshake (version policy + 1.2 fallback to `serveConnTls12`, which takes the same `driver`), asserts ALPN selected h2 (`ZixAlpnNotH2` otherwise), verifies the client Finished, then calls `driver.drive(fd, &conn, &record_buf)`. The driver owns the connection until close: it runs the resumable h2 mux inline over the decrypted records and seals the engine's frames back into TLS records through a thread-local write hook. No socketpair, no second thread.
 
 ## tcp/http2/tls_serve.zig and tcp/http2/grpc/tls_serve.zig
 

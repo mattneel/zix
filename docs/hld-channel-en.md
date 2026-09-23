@@ -108,7 +108,7 @@ Integration example: `uds_http.zig` wires a UDS fetcher task into SSE handlers v
                                                       \ [/data handler]
 ```
 
-See [`docs/concurrency.md`](concurrency.md) for the Channel entry in the Protocol Applicability table.
+See [`docs/concurrency-en.md`](concurrency-en.md) for the Channel entry in the Protocol Applicability table.
 
 ---
 

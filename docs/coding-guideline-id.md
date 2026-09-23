@@ -342,7 +342,7 @@ Type yang memiliki buffer membebaskan di `deinit`. Apa pun yang disediakan calle
 
 ## 11. Test
 
-Test berada di bawah file yang dicakupnya (Zig menemukannya lewat `refAllDecls`). Nama test membawa prefix domain dari surface yang diuji: `test "zix <domain>: <subject>, <case>"` (`zix tcp:`, `zix http1:`, `zix grpc:`, `zix tls:`, `zix channel:`), dan test driver memakai nama driver-nya (`postgrez auth:`, `rediz resp:`):
+Test berada di bawah file yang dicakupnya (Zig menemukannya lewat `refAllDecls`). Nama test membawa prefix domain dari surface yang diuji: `test "zix <domain>: <subject>, <case>"` (`zix tcp:`, `zix http1:`, `zix grpc:`, `zix tls:`, `zix channel:`), dan test driver memakai nama driver-nya (`postgrez auth:`, `rediz protocol:`):
 
 ```zig
 test "zix tcp: TcpServerConfig, default field values" {

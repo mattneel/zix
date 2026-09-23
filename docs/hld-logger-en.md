@@ -26,6 +26,9 @@ Implemented. See ADR-023 for design rationale.
 ```
 src/logger/
     logger.zig   // Logger struct with nested Config, Level, ConsoleMode, Dir
+    sink.zig     // Sink: the lock-free buffer indirection a write lands in
+    flush.zig    // Flusher: the background thread that drains sinks to disk
+    windows_file.zig // the Windows file-open path
 ```
 
 Export from `src/lib.zig`:

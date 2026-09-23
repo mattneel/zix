@@ -117,7 +117,7 @@ Source: `src/lib.zig`. Each module is exercised via `std.testing.refAllDecls`, w
 
 | Module | Coverage |
 | :- | :- |
-| `tcp/http2/frame.zig` | `refAllDecls` + behavioral: `FRAME_TYPE_HEADERS=0x01`, `FLAG_END_STREAM=0x01`, `ERR_NO_ERROR=0`, `writeFrameHeader`/`readFrameHeader` roundtrip via pipe, PREFACE starts with `PRI`, `sendSettings` writes a valid 9-byte SETTINGS frame via pipe |
+| `tcp/http2/frame.zig` | `refAllDecls` + behavioral: `FRAME_TYPE_HEADERS=0x01`, `FLAG_END_STREAM=0x01`, `ERR_NO_ERROR=0`, `writeFrameHeaderFD`/`readFrameHeader` roundtrip via pipe, PREFACE starts with `PRI`, `sendSettings` writes a valid 9-byte SETTINGS frame via pipe |
 | `tcp/http2/hpack.zig` | `refAllDecls` + behavioral: Huffman encode/decode roundtrip, `HpackEncoder.writeHeader` produces indexed entry from static table, `HpackDecoder.decode` decodes indexed `:method GET`, dynamic table eviction respects max_size, `HPACK_STATIC` index 8 is `:status 200` |
 | `tcp/http2/core.zig` | `refAllDecls` + behavioral: `ServeOpts` struct defaults, `HandlerFn` is a function pointer type |
 | `tcp/http2/config.zig` | `refAllDecls` + behavioral: `Http2ServerConfig` required fields compile, dispatch_model required (set explicitly), workers defaults to 0, max_streams=128 and max_frame_size=16384 |
@@ -1051,7 +1051,7 @@ Port: 18100.
 | client sends GOAWAY and server connection loop exits | GOAWAY frame -> server exits the frame loop without error |
 | `Http2Server.init` rejects port zero | returns `error.ZixPortNotConfigured` |
 | `HpackDecoder` decode of empty block returns zero headers | `decode(&.{}, ...)` returns 0 headers without error |
-| `writeFrameHeader` stream_id high bit is cleared on read | `stream_id = 0x7FFF_FFFF` roundtrips correctly via pipe |
+| `writeFrameHeaderFD` stream_id high bit is cleared on read | `stream_id = 0x7FFF_FFFF` roundtrips correctly via pipe |
 
 ### tests/edge/http3/
 

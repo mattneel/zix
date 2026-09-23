@@ -1,6 +1,6 @@
 # LLD: zix.Udp
 
-Internal implementation details for the UDP layer. For design rationale see [`docs/hld-udp.md`](hld-udp.md).
+Internal implementation details for the UDP layer. For design rationale see [`docs/hld-udp-en.md`](hld-udp-en.md).
 
 ---
 

@@ -45,7 +45,7 @@ pub const Uds = @import("uds/Uds.zig");
 | `zix.Uds.Client` | struct | `connect(config, io)` / `sendMsg(io, msg)` / `recvMsg(io, buf)` / `deinit(io)` |
 | `zix.Uds.ServerConfig` | struct | `io`, `path`, `allocator`, `kernel_backlog` (128), `max_recv_buf` (4096), `recv_timeout_ms` (0), `send_timeout_ms` (0), `logger` (null) |
 | `zix.Uds.ClientConfig` | struct | `path`, `recv_timeout_ms` (0), `send_timeout_ms` (0) |
-| `zix.Uds.HandlerFn` | type | `*const fn(stream: std.Io.net.Stream, io: std.Io) void` |
+| `zix.Uds.HandlerFn` | type | `fn(stream: std.Io.net.Stream, io: std.Io) void` (a bare function type, unlike `zix.Tcp.HandlerFn`) |
 | `zix.Uds.echoHandler` | fn | Default echo handler: reads length-prefixed frames and echoes each back |
 
 ---
@@ -150,7 +150,7 @@ sequenceDiagram
 ## Logger Integration
 
 `UdsServerConfig.logger: ?*Logger = null`. When non-null:
-- `system(.INFO, "uds", ...)` on bind, accepted connection, and shutdown.
+- `system(.INFO, "uds", ...)` on bind ("listening on {s}") and per accepted connection ("connection accepted"); there is no shutdown line.
 
 The server does not call `frame()` automatically: `frame()` is available for manual use inside `HandlerFn` implementations that want per-frame logging:
 
@@ -181,7 +181,7 @@ See `docs/hld-logger-en.md` for log line format and config details.
 
 ## Platform Support
 
-UDS stream sockets require `std.Io.net.has_unix_sockets == true`. This is true on Linux, macOS, and Windows 10 RS4+. WASI is not supported. Both `Server.init()` and `Client.connect()` emit `@compileError` on unsupported platforms.
+UDS stream sockets require `std.Io.net.has_unix_sockets == true`. This is true on Linux, macOS, and Windows 10 RS4+. WASI is not supported. Both `Server.init()` and `Client.connect()` return `error.ZixUdsNotSupported` on unsupported platforms (a comptime-guarded runtime error, not a `@compileError`).
 
 ---
 

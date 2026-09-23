@@ -4,7 +4,7 @@
 
 1. **Atur `dispatch_model` secara eksplisit** di setiap konfigurasi server (tanpa nilai default)
 2. **Perbarui pemanggilan `Server.init`**:
-   - `zix.Http.Server.init(4096, &routes, cfg)` -> `zix.Http.Server.init(&routes, cfg)`
+   - `zix.Http.Server.init(4096, &routes, cfg)` -> `zix.Http.Server.init(zix.Http.Router(&routes).dispatch, cfg)`
    - `const S = zix.Http3.Http3(handler); try S.init(cfg)` -> `zix.Http3.Server.init(handler, cfg)`
    - Hapus `try` dari inisialisasi `zix.Http2`/`zix.Grpc`/`zix.Http` (validasi dipindahkan ke `run()`)
 3. **Perbarui tanda tangan `HandlerFn`** menjadi `fn(req: *Request, res: *Response, ctx: *Context) anyerror!void`

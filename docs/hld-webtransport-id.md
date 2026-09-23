@@ -347,7 +347,7 @@ Masing-masing dengan alasannya, supaya tidak ada yang menurunkan ulang pertanyaa
 | :- | :- | :- |
 | `http3_webtransport` | 9089 | session di `/echo`: setiap chunk stream data dipantulkan kembali (dengan FIN setelah seluruh chunk keluar), setiap datagram dipantulkan, satu stream unidirectional per session yang menulis banner lalu FIN, dan lifecycle session dicetak ke stderr |
 | `webtransport_live` | 9443 (TCP dan UDP) | live view yang dirender browser: halaman lewat HTTPS/1.1 di TCP dan session lewat HTTP/3 di UDP, satu port dan satu origin. Satu tick pada stream bidirectional menjadi increment event dan patch DOM, sebuah datagram membawa note dan mengembalikan patch-nya, stream kedua mengunggah 64 KiB dengan progress sementara tick tetap mengalir, dan reconnect menyinkronkan ulang dari snapshot. |
-| `webtransport_tasks` | 9444 QUIC · 9445 TCP | satu aksi durable dari ujung ke ujung: halaman mengirim typed form event dengan idempotency key lewat stream reliabel, server memvalidasi dan mengotorisasi, satu transaksi menulis task dan job-nya, worker me-lease dan menjalankan job, satu transaksi completion menulis update task, penyelesaian job, dan baris outbox, dispatcher mempublikasikannya, dan view yang terotorisasi mem-patch dirinya dari state yang sudah commit. `examples/durable/tasks.zig` memuat slice-nya; `zig build test-durable` menjalankan tujuh skenario acceptance terhadap PostgreSQL nyata, dan `scripts/bench_durable_tasks.py` mengukurnya. |
+| `webtransport_tasks` | 9444 QUIC · 9444 TCP | satu aksi durable dari ujung ke ujung: halaman mengirim typed form event dengan idempotency key lewat stream reliabel, server memvalidasi dan mengotorisasi, satu transaksi menulis task dan job-nya, worker me-lease dan menjalankan job, satu transaksi completion menulis update task, penyelesaian job, dan baris outbox, dispatcher mempublikasikannya, dan view yang terotorisasi mem-patch dirinya dari state yang sudah commit. `examples/durable/tasks.zig` memuat slice-nya; `zig build test-durable` menjalankan tujuh skenario acceptance terhadap PostgreSQL nyata, dan `scripts/bench_durable_tasks.py` mengukurnya. |
 
 ### Aksi durable
 
@@ -381,7 +381,7 @@ riwayat yang dibutuhkan deployment nyata. Keduanya adalah pekerjaan framework di
 bagian dari jalur itu: invarian slice-nya sendiri: satu transaksi per langkah, lease dengan token,
 idempotensi lewat unique key, dan outbox dengan revisi: tidak bergantung pada keduanya.
 
-Demo ini menyajikan halamannya lewat TCP di 9445 dan session lewat QUIC di 9444, dan bentuk itu berbeda dari
+Demo ini menyajikan halamannya lewat TCP dan session lewat QUIC pada nomor port yang sama — default 9444, TCP untuk halaman dan UDP untuk session — dan bentuk itu berbeda dari
 contoh lain dengan sengaja. Browser yang diminta memaksa QUIC untuk sebuah origin: yang dibutuhkan sertifikat
 self-signed: mengirim *setiap* request ke origin itu lewat QUIC, dan halaman yang dilayani di sana tidak bisa
 reload saat server sedang dibangun ulang: reload-nya, dan poll versi yang memicunya, gagal dengan handshake.

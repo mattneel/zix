@@ -29,7 +29,7 @@ src/tcp/fix/
     core.zig     // parsing, building, checksum, serveConn, MsgType, FixRequest, FixResponse, FixContext, HandlerFn, FixRoute
     config.zig   // FixServerConfig, FixClientConfig
     server.zig   // FixServer: run() switch tipis di atas dispatch/ (ASYNC, EPOLL, URING)
-    dispatch/    // berkas per-model: async.zig, pool.zig, mixed.zig, epoll.zig, uring.zig, common.zig
+    dispatch/    // berkas per-model: async.zig, epoll.zig, uring.zig, common.zig
     router.zig   // comptime FixRouter
     client.zig   // FixClient
 ```
@@ -48,7 +48,7 @@ pub const Fix = @import("tcp/fix/Fix.zig");
 | :- | :- | :- |
 | `zix.Fix.Server` | struct | `init(handler, config)` / `deinit()` / `run()` (ADR-063: `handler: ?HandlerFn`, dibangun via `Router(&routes).dispatch`; `null` mempertahankan mode echo) |
 | `zix.Fix.ServerConfig` | struct | Lihat Field Konfigurasi Server di bawah |
-| `zix.Fix.ServeOpts` | struct | `{ logger, heartbeat_timeout_ms, conn_timeout_ms, handler_timeout_ms, handler }`: opsi untuk `serveConn` |
+| `zix.Fix.ServeOpts` | struct | `{ logger, default_heartbeat_secs, heartbeat_timeout_ms, conn_timeout_ms, handler_timeout_ms, handler }`: opsi untuk `serveConn` |
 | `zix.Fix.Client` | struct | `connect(config, io)` / `deinit(io)` / `logon(io, heart_bt_int)` / `logout(io)` / `sendMessage(io, msg_type, extra)` / `recvMessage(io)` |
 | `zix.Fix.ClientConfig` | struct | Lihat Field Konfigurasi Client di bawah |
 | `zix.Fix.DispatchModel` | enum(u8) | Re-export dari `zix.Tcp.DispatchModel` |
@@ -85,7 +85,7 @@ pub const Fix = @import("tcp/fix/Fix.zig");
 | `ip` | wajib | Alamat bind |
 | `port` | wajib | Port bind. Harus bukan nol |
 | `comp_id` | wajib | SenderCompID server (tag 49) |
-| `dispatch_model` | `.ASYNC` | ASYNC, EPOLL, atau URING (EPOLL dan URING Linux-only: epoll native / io_uring, ditolak di luar Linux dengan error.ZixDispatchModelUnsupported) |
+| `dispatch_model` | wajib, tanpa default | ASYNC, EPOLL, atau URING (EPOLL dan URING Linux-only: epoll native / io_uring, ditolak di luar Linux dengan error.ZixDispatchModelUnsupported) |
 | `kernel_backlog` | 1024 | TCP listen backlog |
 | `workers` | 0 (cpu_count) | Jumlah accept thread. Diabaikan oleh ASYNC |
 | `worker_stack_size_bytes` | 512 KiB | Stack worker thread untuk handler EPOLL / URING. Demand-paged, biaya kecil sampai kedalamannya terpakai |
@@ -144,7 +144,7 @@ pub const Tag = enum(u16) {
     TargetCompID = 56,
     MsgSeqNum    = 34,
     HeartBtInt   = 108,
-    // ... 54 tags total
+    // ... 55 tags total
     _,  // catch-all: any u16 is a valid Tag value
 };
 ```
@@ -223,7 +223,7 @@ Checksum yang salah menutup koneksi tanpa memberikan respons.
 
 ## Konstanta MsgType
 
-Nilai MsgType FIX (tag 35) adalah string ASCII, bukan integer. `zix.Fix.MsgType` adalah namespace struct berisi 47 konstanta string compile-time yang mencakup FIX 4.0-4.4. Gunakan konstanta ini sebagai pengganti string literal mentah untuk menghindari kesalahan ketik.
+Nilai MsgType FIX (tag 35) adalah string ASCII, bukan integer. `zix.Fix.MsgType` adalah namespace struct berisi 44 konstanta string compile-time yang mencakup FIX 4.0-4.4. Gunakan konstanta ini sebagai pengganti string literal mentah untuk menghindari kesalahan ketik.
 
 ```zig
 // Sesi

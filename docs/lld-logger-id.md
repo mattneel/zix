@@ -58,7 +58,7 @@ Semua pemformatan terjadi sebelum lock diperoleh. Waktu tahan lock sebanding den
 Syscall POSIX `write` langsung dalam retry loop hingga semua byte terkirim atau error dikembalikan:
 
 ```zig
-fn rawWrite(fd: std.posix.fd_t, data: []const u8) void {
+fn rawWrite(fd: std.posix.fd_t, data: []const u8) ?std.posix.E {
     var rem = data;
     while (rem.len > 0) {
         const rc = std.posix.system.write(fd, rem.ptr, rem.len);

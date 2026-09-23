@@ -108,7 +108,7 @@ graph TD
     zix --> utils["utils/file.zig\nzix.utils.file"]
     Tcp -.->|re-exports| Http
 
-    Http --> server["server.zig\nServer + ConnQueue"]
+    Http --> server["server.zig\nServer"]
     Http --> config["config.zig\nHttpServerConfig"]
     Http --> client["client.zig\nHttpClient + ClientResponse"]
     Http --> client_config["client_config.zig\nHttpClientConfig"]
@@ -185,7 +185,7 @@ Diakses melalui `const zix = @import("zix");`
 | `zix.Http.Header` | struct | `{ name: []const u8, value: []const u8 }` |
 | `zix.Tcp.DispatchModel` | enum(u8) | Model dispatch: `.ASYNC`(0, portabel) `.EPOLL`(1, Linux saja) `.URING`(2, io_uring Linux saja). Di luar Linux `run()` mengembalikan `error.ZixDispatchModelUnsupported` untuk dua yang terakhir |
 | `zix.Http.RequestHeaderSize` | union(enum) | Batas header request: `.MINIMAL`(16) `.COMMON`(32) `.LARGE`(64) `.{ .CUSTOM = N }` |
-| `zix.Http.default_user_agent` | `[]const u8` | String user agent client dari `build.zig.zon` (contoh: `"zix/0.1.0"`) |
+| `zix.Http.default_user_agent` | `[]const u8` | String user agent client dari `build.zig.zon` (contoh: `"zix/0.5.0"`) |
 | `zix.Http.HeaderSize` | union(enum) | Batas header response: `.MINIMAL`(16) `.COMMON`(32) `.LARGE`(64) `.EXTRA_LARGE`(128) `.{ .CUSTOM = N }` |
 | `zix.Http.ContentType` | enum | Representasi MIME bertipe aman |
 | `zix.Http.Content` | namespace | `typeFromExtension(ext)`, `fromExtension(ext)` |
@@ -216,8 +216,8 @@ pub const HttpServerConfig = struct {
     ip:                   []const u8,
     port:                 u16,
     dispatch_model:       DispatchModel,    // required: ASYNC, EPOLL, or URING (EPOLL/URING Linux-only)
-    kernel_backlog:   usize             = 1024 * 4,  // TCP listen() backlog
-    max_recv_buf:   usize             = 1024 * 4,  // read buffer per connection
+    kernel_backlog:   u31               = 1024,     // TCP listen() backlog
+    max_recv_buf:   usize             = 6 * 1024,  // read buffer per connection
     large_body_rcvbuf:    usize             = 0,          // SO_RCVBUF pada jalur large-body/upload, 0 = default kernel
     max_request_body:     usize             = 8 * 1024 * 1024, // batas body request, body() menolak melewatinya dengan 413 (0 = tanpa cek Content-Length)
     compress:             bool              = false,      // negosiasi gzip / deflate / brotli, opt-in via resp.sendNegotiated (semua model)
@@ -243,7 +243,7 @@ Listing di atas diringkas: referensi field lengkap (compression, response cache,
 
 Pemanggil memiliki `io`: `zix.Http.Server` tidak memanggil `deinit` padanya. Tabel route dioper sebagai argumen comptime ke `Server.init` sehingga tidak ada alokasi runtime untuk routing.
 
-Untuk panduan pemilihan batas header dan keamanan, lihat [`docs/headers.md`](headers.md).
+Untuk panduan pemilihan batas header dan keamanan, lihat [`docs/headers-id.md`](headers-id.md).
 
 ---
 
@@ -254,26 +254,26 @@ Untuk panduan pemilihan batas header dan keamanan, lihat [`docs/headers.md`](hea
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Accept as Accept thread
-    participant Queue as ConnQueue
-    participant Pool as Pool thread
+    participant Accept as Accept loop
+    participant Sched as io Threaded pool
+    participant Task as connection task
     participant Router
     participant Handler as HandlerFn
     participant Static as static.serve()
 
     Client->>Accept: TCP connect
-    Accept->>Queue: queue.push(stream)
-    Queue->>Pool: queue.pop() unblocks
+    Accept->>Sched: io.async(connEntry, ...)
     Note over Accept: immediately back to accept()
 
-    Pool->>Pool: alloc read_buf
-    Pool->>Pool: ArenaAllocator init
+    Sched->>Task: schedule the connection
+    Task->>Task: alloc read_buf
+    Task->>Task: ArenaAllocator init
 
     loop keep-alive
-        Client->>Pool: HTTP request
-        Pool->>Pool: recv sampai terminator header
-        Pool->>Pool: build Request + Response + Context
-        Pool->>Router: dispatch(req, res, ctx)
+        Client->>Task: HTTP request
+        Task->>Task: recv sampai terminator header
+        Task->>Task: build Request + Response + Context
+        Task->>Router: dispatch(req, res, ctx)
 
         alt route matched
             Router->>Handler: handler(req, res, ctx)
@@ -287,12 +287,11 @@ sequenceDiagram
             end
         end
 
-        Pool->>Pool: arena.reset()
+        Task->>Task: arena.reset()
     end
 
-    Client->>Pool: connection close
-    Pool->>Pool: free read_buf + write_buf, arena.deinit()
-    Pool->>Queue: queue.pop() (next connection)
+    Client->>Task: connection close
+    Task->>Task: free read_buf + write_buf, arena.deinit()
 ```
 
 ---
@@ -792,7 +791,7 @@ pub const HttpClientConfig = struct {
     follow_redirects:    bool = true,
     max_redirects:       u8   = 3,
     h2_max_read_rounds:  usize = 4096,                       // bound read-loop client HTTP/2, max frame-read rounds
-    user_agent:          []const u8 = zon_options.user_agent, // library version string (e.g. "zix/0.1.0"); "" omits
+    user_agent:          []const u8 = zon_options.user_agent, // library version string (e.g. "zix/0.5.0"); "" omits
     version:             Version = .HTTP_1,                  // .HTTP_1 (std client) atau .HTTP_2 (h2 over TLS 1.3, https saja)
     tls_ca_path:         ?[]const u8 = null,                 // CA PEM tambahan untuk https. null = system roots
     tls_verify:          bool = true,                        // verifikasi chain cert server + hostname pada https

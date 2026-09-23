@@ -26,7 +26,7 @@ Binary-nya jatuh di `zig-out/bin/zixer-<triplet>-<optimize>`, mis. `zixer-x86_64
 
 ```bash
 $ zixer version
-zixer 0.5.0-rc3 (zig 0.16.0, x86_64-linux)
+zixer 0.5.0 (zig 0.17.0, x86_64-linux)
 ```
 
 zixer tidak punya versi sendiri. Ia ikut bersama engine dan melaporkan versi package, jadi baris itu menyebut persis build mana yang sedang berjalan.

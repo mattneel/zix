@@ -1,6 +1,6 @@
 # LLD: zix.Channel
 
-Internal implementation details. For design rationale see [`docs/hld-channel.md`](hld-channel.md) and ADR-017.
+Internal implementation details. For design rationale see [`docs/hld-channel-en.md`](hld-channel-en.md) and ADR-017.
 
 ---
 

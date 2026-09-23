@@ -117,7 +117,7 @@ Sumber: `src/lib.zig`. Setiap modul diuji melalui `std.testing.refAllDecls`, yan
 
 | Modul | Cakupan |
 | :- | :- |
-| `tcp/http2/frame.zig` | `refAllDecls` + perilaku: `FRAME_TYPE_HEADERS=0x01`, `FLAG_END_STREAM=0x01`, `ERR_NO_ERROR=0`, round-trip `writeFrameHeader`/`readFrameHeader` melalui pipe, PREFACE dimulai dengan `PRI`, `sendSettings` menulis frame SETTINGS 9-byte valid melalui pipe |
+| `tcp/http2/frame.zig` | `refAllDecls` + perilaku: `FRAME_TYPE_HEADERS=0x01`, `FLAG_END_STREAM=0x01`, `ERR_NO_ERROR=0`, round-trip `writeFrameHeaderFD`/`readFrameHeader` melalui pipe, PREFACE dimulai dengan `PRI`, `sendSettings` menulis frame SETTINGS 9-byte valid melalui pipe |
 | `tcp/http2/hpack.zig` | `refAllDecls` + perilaku: round-trip encode/decode Huffman, `HpackEncoder.writeHeader` menghasilkan entri terindeks dari static table, `HpackDecoder.decode` mendekode `:method GET` terindeks, eviksi dynamic table menghormati max_size, indeks `HPACK_STATIC` ke-8 adalah `:status 200` |
 | `tcp/http2/core.zig` | `refAllDecls` + perilaku: default struct `ServeOpts`, `HandlerFn` adalah tipe function pointer |
 | `tcp/http2/config.zig` | `refAllDecls` + perilaku: field wajib `Http2ServerConfig` berhasil dikompilasi, dispatch_model wajib (disetel eksplisit), workers default 0, max_streams=128 dan max_frame_size=16384 |
@@ -1051,7 +1051,7 @@ Port: 18100.
 | Client mengirim GOAWAY dan loop koneksi server keluar | frame GOAWAY -> server keluar dari frame loop tanpa error |
 | `Http2Server.init` menolak port nol | menghasilkan `error.ZixPortNotConfigured` |
 | Dekode `HpackDecoder` dari blok kosong menghasilkan nol header | `decode(&.{}, ...)` menghasilkan 0 header tanpa error |
-| `writeFrameHeader` bit tinggi stream_id dihapus saat dibaca | `stream_id = 0x7FFF_FFFF` di-roundtrip dengan benar melalui pipe |
+| `writeFrameHeaderFD` bit tinggi stream_id dihapus saat dibaca | `stream_id = 0x7FFF_FFFF` di-roundtrip dengan benar melalui pipe |
 
 ### tests/edge/http3/
 

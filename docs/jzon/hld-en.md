@@ -163,7 +163,7 @@ An escaped string is decoded into the allocator whichever mode was asked for, be
 
 One error set per direction, shared by every path.
 
-The write side has one failure, because nothing is allocated and the buffer is fixed. The read side has eight, and a path that cannot tell two of them apart still reports through the same set: `.STD` reports a broken escape as a syntax error rather than as `BadEscape`, because std does not separate the two. A caller writes one `catch` and never revisits it after changing a strategy.
+The write side has one failure, because nothing is allocated and the buffer is fixed. The read side has eight, and a path that cannot tell two of them apart still reports through the same set: `.STD` reports a broken escape as a syntax error rather than as `JzonBadEscape`, because std does not separate the two. A caller writes one `catch` and never revisits it after changing a strategy.
 
 ## Why the strategies exist
 

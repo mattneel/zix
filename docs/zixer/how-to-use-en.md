@@ -18,7 +18,7 @@ The binary lands in `zig-out/bin/zixer-<triplet>-<optimize>`, i.e. `zixer-x86_64
 
 ```bash
 $ zixer version
-zixer 0.5.0-rc3 (zig 0.16.0, x86_64-linux)
+zixer 0.5.0 (zig 0.17.0, x86_64-linux)
 ```
 
 zixer has no version of its own: it ships with the engines and reports the package version, so the line above names exactly which build is running.

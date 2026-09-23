@@ -30,7 +30,7 @@ graph LR
 | `src/tcp/http2/grpc/core.zig` | `GrpcContext`, `GrpcRequest`, `GrpcResponse`, `HandlerFn`, `Router`, `serveGrpcConn` (blocking models), `GrpcMuxConn` + `grpcMuxOnReadable` (multiplexed `.EPOLL`), `parsePath`, `detectContentType`, `wallClockNs`, `computeDeadline`, `peerStr` |
 | `src/tcp/http2/grpc/config.zig` | `GrpcServerConfig`, `GrpcClientConfig` |
 | `src/tcp/http2/grpc/server.zig` | `GrpcServer`: thin `run()` switch that dispatches to the per-model files under `dispatch/` (and to the TLS serve paths when `cfg.tls != null`) |
-| `src/tcp/http2/grpc/dispatch/` | per-model dispatch files: `async.zig`, `pool.zig`, `mixed.zig`, `epoll.zig` (multiplexed `epollMuxWorkerFn` + `GrpcConnTable`), `uring.zig` (`.URING`), `common.zig` (shared helpers) |
+| `src/tcp/http2/grpc/dispatch/` | per-model dispatch files: `async.zig`, `epoll.zig` (multiplexed `epollMuxWorkerFn` + `GrpcConnTable`), `uring.zig` (`.URING`), `common.zig` (shared helpers) |
 | `src/tcp/http2/grpc/tls_serve.zig` | `runTls`: blocking TLS handler path (per-connection) |
 | `src/tcp/http2/grpc/tls_mux.zig` | `runTlsMux`: multiplexed TLS dispatch path |
 | `src/tcp/http2/grpc/client.zig` | `GrpcClient`: openStream, sendMessage, endStream, recvResponse, unary |
@@ -79,7 +79,7 @@ graph LR
 | `io` | required | caller-provided `std.Io` backend |
 | `ip` | required | bind address |
 | `port` | required | listen port, 0 -> `error.ZixPortNotConfigured` |
-| `dispatch_model` | `.ASYNC` | `.ASYNC`, `.EPOLL`, or `.URING` (the last two Linux-only, native, rejected off Linux with error.ZixDispatchModelUnsupported) |
+| `dispatch_model` | required, no default | `.ASYNC`, `.EPOLL`, or `.URING` (the last two Linux-only, native, rejected off Linux with error.ZixDispatchModelUnsupported) |
 | `kernel_backlog` | 1024 | `listen()` backlog |
 | `workers` | 0 | 0 -> cpu_count multiplexing workers for EPOLL and URING. Ignored by ASYNC |
 | `max_streams` | 128 | max concurrent HTTP/2 streams per connection (advertised SETTINGS_MAX_CONCURRENT_STREAMS) |

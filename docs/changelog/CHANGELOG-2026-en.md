@@ -64,7 +64,7 @@ WebTransport over HTTP/3 as a feature of `zix.Http3` (ADR-069), served on the QU
 - **Docs:** [`docs/hld-webtransport-en.md`](docs/hld-webtransport-en.md) / [`docs/hld-webtransport-id.md`](docs/hld-webtransport-id.md) and [`docs/lld-webtransport-en.md`](docs/lld-webtransport-en.md) / [`docs/lld-webtransport-id.md`](docs/lld-webtransport-id.md), plus ADR-069.
 - **Example (browser):** [examples/tls/webtransport_live.zig](examples/tls/webtransport_live.zig) on 127.0.0.1:9443, built as `zig build example-webtransport_live`: one process, one port number, two transports: the page over HTTPS/1.1 on TCP and the session over HTTP/3 on UDP, served on the same route, so the page and the session share one origin. It is a live view of server-owned state: ticks on a bidirectional stream become typed increment events rendered as DOM patches, a datagram carries an unreliable note and returns its patch, a second stream uploads 64 KiB with progress events while the ticks keep flowing, and reconnecting opens a new session that resynchronizes from the snapshot. Driven end to end in Chromium (session open, the server-opened unidirectional stream, 5 ticks, a datagram note, a 64 KiB upload with 5 ticks interleaved mid-upload, and a reconnect that resynchronized at the revision the events were missed at). See the HLD's "Driving the browser demo" for the two Chromium flags a self-signed certificate needs.
 - **Interop harness:** [scripts/webtransport_interop.py](scripts/webtransport_interop.py) drives the `http3_webtransport` example with aioquic and reports PASS/FAIL for the handshake, the extended CONNECT, the bidirectional stream echo, the datagram echo, and the server-opened unidirectional stream. It is the scripted independent client; the browser demo is the visual one.
-- **Example (durable action):** [examples/tls/webtransport_tasks.zig](examples/tls/webtransport_tasks.zig): page over HTTPS/1.1 on TCP at 127.0.0.1:9445, session over HTTP/3 on QUIC at 127.0.0.1:9444: built as `zig build example-webtransport_tasks`: the page submits a typed form event with an idempotency key over a reliable stream, the server validates and authorizes it, one transaction writes the task and its job, a worker leases and runs the job, one completion transaction writes the task update, the job completion and an outbox row, a dispatcher publishes it, and the authorized view sends a revisioned patch. Datagrams carry only the page's typing hint, never a mutation.
+- **Example (durable action):** [examples/tls/webtransport_tasks.zig](examples/tls/webtransport_tasks.zig): page over HTTPS/1.1 on TCP at 127.0.0.1:9444, session over HTTP/3 on QUIC at 127.0.0.1:9444: built as `zig build example-webtransport_tasks`: the page submits a typed form event with an idempotency key over a reliable stream, the server validates and authorizes it, one transaction writes the task and its job, a worker leases and runs the job, one completion transaction writes the task update, the job completion and an outbox row, a dispatcher publishes it, and the authorized view sends a revisioned patch. Datagrams carry only the page's typing hint, never a mutation.
 - **Durable slice module:** [examples/durable/tasks.zig](examples/durable/tasks.zig) holds it in one place: schema, store, in-process tenant feed, worker and dispatcher: with the invariants the milestone is made of: one transaction per step, a lease rather than a lock, `(tenant_id, idempotency_key)` for idempotency, a per-tenant revision allocated inside the transaction that changes the state, and an outbox row marked published only after the feed took it (so a crash in between replays the event and a view that already applied revision N drops anything ≤ N).
 - **Acceptance suite:** `zig build test-durable` runs the seven scenarios against a real PostgreSQL (`-Ddurable-dsn=`, separate database on purpose: the worker leases the oldest ready job of any tenant, so a live server sharing the tables would complete the suite's jobs). Invalid or unauthorized submission persists nothing; a transaction that never commits persists neither insert; a duplicate submission yields one task and one job; a crashed worker's job is recovered after its lease expires with `attempts` bumped; a crash after the commit but before publication is still delivered; a replayed event leaves the view where it was; and a restarted view reconstructs the state, and the revision, from the database.
   The per-kind distribution is now measured. **Steady state: 3.3 s**: build ~2.0 s, server restart ~82 ms, and the browser's own verification ~1.21 s, which held at 1209-1214 ms for every kind that ran cleanly. With a fully cached build the loop is **1.5 s** (build 220 ms), below the 2-3 s bar this was measured against. Three of nine iterations showed a ~16.0 s verification instead of 1.2 s; the cause is not known yet, and the harness now keeps the server log of any iteration slower than 5 s so the next run can say why. The flags and the mode are stated with the numbers: `--fresh-browser` starts a browser per iteration, and browser startup is inside the total.
@@ -133,7 +133,7 @@ __**Update:**__
 
 <br>
 
-## 0.5.0 (2026-08-26)
+## 0.5.0 (2026-08-17)
 
 ### __**New Features:**__
 
@@ -590,7 +590,7 @@ A WebRTC server built from RFCs 7983, 8445, 8489, 6347, 9260, 8831, and 8832. Se
 - **`docs/driver/prometheuz/`**: README, HLD, LLD, config ref (EN + ID).
 - **`docs/hld-http3-en.md`**, **`lld-http3-en.md`** (and -id).
 - **`docs/hld-tls-en.md`**, **`lld-tls-en.md`** (and -id).
-- **`docs/hld-grpc-en.md`**, **`hld-grpc-proxy-en.md`** (and -id) updated for native TLS.
+- **`docs/hld-grpc-en.md`**, **`hld-proxy-en.md`** (and -id) updated for native TLS.
 
 ---
 
@@ -905,7 +905,7 @@ __*Fix:*__
     - `zix.Grpc`: docs had no mention of the response cache (ADR-036) or the TLS dual listener (ADR-060), both already implemented.
     - `zix.Uds`: docs (and the `zix.Tcp` docs' own comparison, and ADR-022) claimed UDS frames use little-endian, they use big-endian, matching TCP, and always have (ADR-010).
     - `zix.Fix`: docs and a worked example used the field name `connection_timeout_ms`, the real field is `conn_timeout_ms`.
-    - `zix.Tcp`: docs used `max_msg_len`, the real field is `max_recv_buf`. `docs/lld-tcp-en/id.md` was also missing the `.EPOLL` / `.URING` dispatch models entirely.
+    - `zix.Tcp`: docs used `max_msg_len`, the real field is `max_recv_buf`. `docs/lld-tcp-en.md` / `docs/lld-tcp-id.md` was also missing the `.EPOLL` / `.URING` dispatch models entirely.
 
 <br>
 
@@ -929,7 +929,7 @@ __*Update:*__
     ---
 
 - SSE / streaming over TLS (ADR-054):
-    - `zix.Http` and `zix.Http1` serve Server-Sent Events over TLS on the thread-per-connection path (`.ASYNC` / `.POOL` / `.MIXED`). A per-connection stream sink (`TlsStreamSink`, type-erased over the live TLS 1.3 / 1.2 connection) encrypts one TLS record per write and sends it immediately, replacing the buffered capture only when a handler opts into streaming. `fdWriteAll` checks the buffered sink first, then the stream sink, so a normal response keeps the buffered fast path untouched.
+    - `zix.Http` and `zix.Http1` serve Server-Sent Events over TLS on the thread-per-connection path (`.ASYNC` / `.POOL` / `.MIXED`). A per-connection stream sink (`TlsStreamSink`, type-erased over the live TLS 1.3 / 1.2 connection) encrypts one TLS record per write and sends it immediately, replacing the buffered capture only when a handler opts into streaming. `writeAllFD` checks the buffered sink first, then the stream sink, so a normal response keeps the buffered fast path untouched.
     - `zix.Http` reuses `res.stream()` (no new public symbol, it now keeps the stream sink active over TLS). `zix.Http1` gains `beginStream()`, a no-op in cleartext, so one fd-handler serves cleartext and TLS. The multiplexed `tls_mux` path (`.EPOLL` / `.URING`) stays request / response only (later lifted by ADR-060 below).
     - New examples `examples/tls/tls_http_sse.zig` (port 9072) and `examples/tls/tls_http1_sse.zig` (port 9073), with runner steps `test-runner-tls-http-sse` / `test-runner-tls-http1-sse` (native `zix.Tls` client, no curl), folded into `test-runner-all`. `examples/http1_sse.zig` now calls `beginStream()`.
 
@@ -974,14 +974,14 @@ __*Update:*__
     - `zix.Grpc` serves native TLS (TLS 1.3, with a 1.2 fallback, ALPN h2) via `tls: ?*Tls.Context`, additive over the h2c default. The TLS path drives the resumable gRPC mux state machine (`grpcMuxProcessRing`) directly over the decrypted records, the same single-owner engine as the cleartext `.EPOLL` / `.URING` models, so it has no per-stream write races.
     - The h2-over-TLS terminator is factored into a shared, engine-agnostic `src/tcp/tls/h2_terminator.zig` (handshake 1.3 / 1.2, ALPN h2). It runs a caller-supplied inline-mux driver over the decrypted records and seals the engine's frames back into TLS records through a thread-local write hook, with no socketpair and no second thread. `zix.Http2` and `zix.Grpc` `tls_serve.zig` are thin wrappers supplying the driver.
     - Multiplexed TLS dispatch (ADR-052): for `.EPOLL` / `.URING`, one `SO_REUSEPORT` epoll worker per core terminates TLS in place via a resumable TLS 1.3 session (`src/tcp/tls/tls_session.zig`) and multiplexes many connections per worker (`tls_mux.zig`), so Http2 https and gRPC TLS no longer spawn a thread per connection at high concurrency. `.ASYNC` / `.POOL` / `.MIXED` keep the thread-per-connection terminator, which also serves the 1.2 fallback.
-    - Docs `hld-grpc`, `hld-tls`, `lld-tls`, and `hld-grpc-proxy` (en and -id) updated for native gRPC TLS.
+    - Docs `hld-grpc`, `hld-tls`, `lld-tls`, and `hld-proxy` (en and -id) updated for native gRPC TLS.
 
     ---
 
 - Response compression (gzip / deflate / brotli):
     - `Accept-Encoding` negotiation with gzip and deflate. New shared codec `src/utils/compression/flate.zig` (container-parameterized over `std.compress.flate`: gzip = RFC 1952, deflate = zlib-wrapped RFC 1950, not raw) plus the `compression.zig` facade (q-value negotiation, `q=0` and wildcard handling, size floor, already-compressed media-type skip, encode/decode dispatch).
     - brotli (`br`) joins the facade as `src/utils/compression/brotli.zig`, an in-tree codec authored from RFC 7932 (std has no brotli): a complete decoder plus an encoder, embedding the 122,784-byte Appendix A static dictionary (`brotli_dictionary.bin`). `.BR` is in `supported_default`, but gzip stays the default at equal q (the in-tree encoder is not yet competitive with gzip on small bodies), so brotli is served when the client prefers it. Interop is verified both ways against the system `brotli` CLI. The encoder always also produces a store-only stream and returns the smaller, so a body never grows (a tiny body simply falls back to identity).
-    - `zix.Http1` serves it via `core.writeNegotiated(fd, head, status, content_type, body)`, `zix.Http` via `Response.sendNegotiated(req, body)`, both setting `Content-Encoding` and `Vary: Accept-Encoding`. Active under `.EPOLL` and `.URING`, off by default. gRPC keeps its own per-message `grpc-encoding`, the raw transports have no HTTP negotiation.
+    - `zix.Http1` serves it via `core.sendNegotiateFD(fd, head, status, content_type, body)`, `zix.Http` via `Response.sendNegotiated(req, body)`, both setting `Content-Encoding` and `Vary: Accept-Encoding`. Active under `.EPOLL` and `.URING`, off by default. gRPC keeps its own per-message `grpc-encoding`, the raw transports have no HTTP negotiation.
     - `std.compress.flate.Compress` is about 230 KB and lives in a per-worker lazily mapped encode scratch (never a stack temporary), keeping the hot path free of allocation syscalls. A compressing worker still spawns with a 2 MiB stack floor (demand-paged, near-zero RSS) instead of the default 512 KB, headroom for the deeper codec call chains. The brotli encoder builds its dictionary index on the heap and the dictionary itself is `@embedFile` `.rodata`, so it adds no stack pressure.
     - Codec caller-buffer parity: `brotli.zig` gains `compressBrotli` / `decompressBrotli` (a buffer-into variant beside each alloc variant), so it mirrors `flate.zig`'s four-function shape. `flate.zig` and `brotli.zig` now expose matching named `EncodeError` / `DecodeError` (`BufferTooSmall` shared), and `compressBound` documents that brotli never expands while flate can. The bespoke `writeGzipCached` stays gzip-only by design (a json-comp A/B showed the unified replacement regresses about 1.2 to 6.8%), so no `writeBrotliCached` twin is added, brotli rides `writeNegotiated`.
     - New examples `http1_compression` (port 9058) and `http_compression` (port 9059), each with `/data` (negotiated) plus explicit `/gzip` `/deflate` `/br` routes that force one coding through the `compression.encode` facade. Individual runner steps `test-runner-http1-compression` / `test-runner-http-compression` (raw-socket, exercising br / gzip / deflate / identity / size-floor), and both examples are folded into `test-runner-all` as the `http-compression` / `http1-compression` rows (raw-socket read, decode, value-check each coding), taking the runner to 69 protocols.
@@ -1205,7 +1205,7 @@ __*Update:*__
 __*Fix:*__
 
 - gRPC and HTTP/2 stream write under EPOLL:
-    - `fdWriteAll` (`src/tcp/http2/frame.zig`) now handles `EAGAIN` on a non-blocking EPOLL socket with a full send buffer: it polls the fd for writable then retries, instead of treating the partial write as a broken pipe. Blocking sockets never hit this branch. Fixes truncated streaming replies and spurious stream errors under high concurrency.
+    - `writeAllFD` (`src/tcp/http2/frame.zig`) now handles `EAGAIN` on a non-blocking EPOLL socket with a full send buffer: it polls the fd for writable then retries, instead of treating the partial write as a broken pipe. Blocking sockets never hit this branch. Fixes truncated streaming replies and spurious stream errors under high concurrency.
 
 <br>
 

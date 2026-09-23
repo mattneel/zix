@@ -100,7 +100,7 @@ graph TD
     Http2 --> server["server.zig\nServer + dispatch_model switch"]
     Http2 --> static["static.zig\npublic_dir fallback\nHEADERS + capped DATA frames"]
 
-    server --> dispatch["dispatch/\nasync pool mixed epoll uring + common"]
+    server --> dispatch["dispatch/\nasync epoll uring + common"]
     server --> tls_serve["tls_serve.zig\nthread-per-conn TLS terminator"]
     server --> tls_mux["tls_mux.zig\nmultiplexed per-core TLS terminator"]
 
@@ -143,7 +143,7 @@ Access via `const zix = @import("zix");`
 | `zix.Http2.HpackEncoder` / `HpackDecoder` / `HpackEntry` | type | HPACK codec types |
 | `zix.Http2.huffEncode` / `huffDecode` | fn | HPACK Huffman codec |
 | `zix.Http2.respHeaderBlock` | fn | Encode a cached `[:status, content-type, content-encoding, content-length]` block |
-| `zix.Http2.FrameHeader` + `parseFrameHeader` / `writeFrameHeader` / `encodeFrameHeader` / `readFrameHeader` | type / fn | Frame-header codec for custom framing |
+| `zix.Http2.FrameHeader` + `parseFrameHeader` / `writeFrameHeaderFD` / `encodeFrameHeader` / `readFrameHeader` | type / fn | Frame-header codec for custom framing |
 | `zix.Http2.sendSettingsFD` / `sendSettingsAckFD` / `sendPingAckFD` / `sendGoawayFD` / `sendRstStreamFD` / `sendWindowUpdateFD` | fn | Control-frame senders |
 | `zix.Http2.FRAME_TYPE_*` / `FLAG_*` / `ERR_*` / `SETTINGS_*` | const | RFC 7540 frame, flag, error, and settings constants |
 | `zix.Http2.PREFACE` / `HPACK_STATIC` | const | Connection preface string, HPACK static table |
@@ -161,7 +161,6 @@ pub const Http2ServerConfig = struct {
     port:           u16,           // must be non-zero
     dispatch_model: DispatchModel, // required, no default
     kernel_backlog: u31   = 1024,
-    workers:        usize = 0,     // 0 = cpu_count accept threads, ignored by .ASYNC
     workers:        usize = 0,     // .EPOLL/.URING: 0 = cpu_count mux workers. Ignored by .ASYNC
     worker_stack_size_bytes: usize = 512 * 1024,
     busy_poll_us:   u32   = 0,     // SO_BUSY_POLL spin window (.EPOLL/.URING), 0 = unset
