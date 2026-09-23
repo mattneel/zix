@@ -11,7 +11,7 @@
 //! - **At least once, made harmless by revisions.** Every state change allocates the tenant's next
 //!   revision inside the same transaction that changes the state, and the outbox row carries it. The
 //!   dispatcher marks a row published only after the feed took it, so a crash in between replays the
-//!   event; a view that already applied revision N drops anything ≤ N, and a view that missed events
+//!   event; a view that already applied revision N drops anything <= N, and a view that missed events
 //!   rebuilds from the snapshot.
 //! - **Idempotency is the database's, not the caller's.** `(tenant_id, idempotency_key)` is unique, so a
 //!   retried submission returns the task it already created and inserts no second job.
@@ -153,7 +153,7 @@ pub const Event = struct {
     tenant_id: []const u8,
     rev: i64,
     kind: []const u8,
-    /// The event as the view receives it: `{"rev":N,"task":{…}}`.
+    /// The event as the view receives it: `{"rev":N,"task":{...}}`.
     payload: []const u8,
 };
 
@@ -293,7 +293,8 @@ pub const Store = struct {
         , .{ request.tenant, request.idempotency_key, request.title });
 
         if (inserted == null) {
-            const existing = (try tx.queryRow(ExistingRow,
+            const existing = (try tx.queryRow(
+                ExistingRow,
                 "SELECT id::int8 AS id, updated_rev::int8 AS rev FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2",
                 .{ request.tenant, request.idempotency_key },
             )).?;
@@ -402,7 +403,7 @@ pub const Store = struct {
     /// only if this attempt still owns the job.
     ///
     /// Note:
-    /// - Ownership is checked inside the same transaction as the writes it guards, against `attempts` — the
+    /// - Ownership is checked inside the same transaction as the writes it guards, against `attempts`: the
     ///   token every lease bumps. A worker whose lease expired and was taken over therefore cannot complete
     ///   a job another attempt holds: it gets `.not_owner`, writes nothing, and produces no event. Without
     ///   that check, lease expiry would be a duplicate execution rather than a recovery, and the slower of

@@ -49,10 +49,9 @@ var PAGE_PORT: u16 = 9444;
 var PUBLIC_PORT: u16 = 0;
 /// The page's port: HTTPS/1.1 over TCP. It is deliberately *not* the QUIC port. A browser that is told to
 /// force QUIC for an origin sends every request to that origin over QUIC, so a page served there cannot
-/// reload while the server is being rebuilt — and the development loop is exactly a rebuild followed by a
+/// reload while the server is being rebuilt: and the development loop is exactly a rebuild followed by a
 /// reload. Serving the page on TCP keeps reload (and the version poll that triggers it) independent of the
 /// QUIC server's lifecycle, while the session still goes to the QUIC port.
-
 /// Where the durable store lives. Every example in this repository points at a fixed local database; this
 /// is the one it points at.
 var DSN: []const u8 = "postgres://zix:zix@127.0.0.1:5432/zix_dev";
@@ -323,7 +322,7 @@ fn handleCommand(session: *zix.Webtransport.Session, stream: *const zix.Webtrans
 }
 
 /// The subscription: authorize the identity for the tenant, then answer with the committed state. This is
-/// also the resync path — a reconnect, a reload or a restarted server all land here and get the database.
+/// also the resync path: a reconnect, a reload or a restarted server all land here and get the database.
 fn subscribe(session: *zix.Webtransport.Session, stream: *const zix.Webtransport.Stream, object: std.json.ObjectMap) void {
     const principal = stringField(object, "principal");
     const tenant = stringField(object, "tenant");

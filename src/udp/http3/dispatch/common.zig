@@ -2928,7 +2928,6 @@ fn pumpWtStream(conn: *Connection, live: *wt.Stream, tx: *datagram.SendBatch, fd
 
     limit = @min(limit, live.send.limit);
 
-
     if (limit <= live.send.sent) return;
 
     const dgram: usize = @intCast(conn.sendDatagramSize(config.max_datagram_size, max_send_datagram_size));

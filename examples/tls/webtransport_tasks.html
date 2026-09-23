@@ -54,7 +54,7 @@
 </head>
 <body>
 <h1>zix · durable tasks</h1>
-<p class="sub">typed event → validated + authorized → one transaction (task + job) → worker lease → completion transaction + outbox → dispatcher → revisioned patch</p>
+<p class="sub">typed event -> validated + authorized -> one transaction (task + job) -> worker lease -> completion transaction + outbox -> dispatcher -> revisioned patch</p>
 
 <section id="controls">
   <button id="open">1 · open session</button>
@@ -78,19 +78,19 @@
     <h2>view state</h2>
     <dl>
       <dt>session</dt><dd id="status">closed</dd>
-      <dt>principal</dt><dd id="whoami">—</dd>
-      <dt>revision</dt><dd id="revision">—</dd>
+      <dt>principal</dt><dd id="whoami">: </dd>
+      <dt>revision</dt><dd id="revision">: </dd>
       <dt>tasks</dt><dd id="task-count">0</dd>
-      <dt>worker</dt><dd id="worker">—</dd>
+      <dt>worker</dt><dd id="worker">: </dd>
       <dt>patches</dt><dd id="patches">0</dd>
       <dt>duplicates</dt><dd id="duplicates">0</dd>
       <dt>sessions</dt><dd id="sessions">0</dd>
-      <dt>build</dt><dd id="build">—</dd>
-      <dt>last key</dt><dd id="last-key" class="hint">—</dd>
-      <dt>transient</dt><dd id="transient" class="hint">—</dd>
+      <dt>build</dt><dd id="build">: </dd>
+      <dt>last key</dt><dd id="last-key" class="hint">: </dd>
+      <dt>transient</dt><dd id="transient" class="hint">: </dd>
     </dl>
     <h2>last result</h2>
-    <dl><dt>submit</dt><dd id="result">—</dd></dl>
+    <dl><dt>submit</dt><dd id="result">: </dd></dl>
   </div>
   <div>
     <h2>tasks <span class="badge" id="applied">0 applied</span></h2>
@@ -113,7 +113,7 @@ const DEV_MARK = "m0";
 // `Alt-Svc: h3=":9444"`, which is how a browser learns that this origin is also reachable over HTTP/3. The
 // WebTransport dial then rides that HTTP/3 connection. Naming the QUIC port directly would be a *different*
 // origin, and no browser can discover HTTP/3 for an origin it has never had an Alt-Svc (or an HTTPS DNS
-// record) for — dialing the port only ever worked under a browser launched with
+// record) for: dialing the port only ever worked under a browser launched with
 // --origin-to-force-quic-on, which is not a demo anybody can open.
 const ENDPOINT = new URL("/tasks", location.origin);
 const state = { sessions: 0, patches: 0, duplicates: 0, events: 0, revision: 0, lastKey: null };
@@ -164,7 +164,7 @@ function apply(event, channel) {
     case "snapshot":
       state.revision = rev;
       ui.revision.textContent = String(rev);
-      ui.worker.textContent = event.worker || "—";
+      ui.worker.textContent = event.worker || ": ";
       renderTasks(event.tasks || []);
       break;
     case "task_created":
@@ -212,7 +212,7 @@ function upsertTask(task) {
   cells[1].textContent = task.title;
   cells[2].innerHTML = '<span class="state ' + task.state + '">' + task.state + "</span>";
   cells[3].textContent = String(task.attempts);
-  cells[4].textContent = task.result || "—";
+  cells[4].textContent = task.result || ": ";
 }
 
 async function readEvents(reader, channel) {
@@ -356,8 +356,8 @@ async function devloop() {
     }
   }, 50);
 
-  // Retry for as long as it takes. An attempt can land while the server is being rebuilt or restarted — the
-  // loop's own subject — and a development loop that gave up on the first refusal would measure nothing.
+  // Retry for as long as it takes. An attempt can land while the server is being rebuilt or restarted: the
+  // loop's own subject: and a development loop that gave up on the first refusal would measure nothing.
   for (;;) {
     try {
       await openSession();
