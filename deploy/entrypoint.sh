@@ -45,9 +45,17 @@ else
     if [ ! -f "$STATE/cert.pem" ]; then
         echo "[entrypoint] minting a certificate for $app_host"
         mkdir -p "$STATE"
-        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-            -keyout "$STATE/key.pem" -out "$STATE/cert.pem" -days 3650 \
+        # ecparam emits a SEC1 key on purpose: `openssl req -newkey ec` writes PKCS#8, and the server's PEM
+        # reader expects SEC1, so it fails with ZixInvalidKey on a key openssl considers perfectly fine.
+        openssl ecparam -name prime256v1 -genkey -noout -out "$STATE/key.pem"
+        openssl req -x509 -new -key "$STATE/key.pem" -out "$STATE/cert.pem" -days 3650 \
             -subj "/O=zix demo/CN=$app_host" -addext "subjectAltName=DNS:$app_host" >/dev/null 2>&1
+    elif head -1 "$STATE/key.pem" | grep -q "BEGIN PRIVATE KEY"; then
+        # A key minted before that distinction was known: convert it rather than leave a machine that cannot
+        # start until someone deletes the volume.
+        echo "[entrypoint] converting a PKCS#8 key on the volume to SEC1"
+        openssl ec -in "$STATE/key.pem" -out "$STATE/key.sec1.pem" >/dev/null 2>&1 \
+            && mv "$STATE/key.sec1.pem" "$STATE/key.pem"
     fi
 
     export ZIX_CERT="$STATE/cert.pem"
