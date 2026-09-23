@@ -872,7 +872,7 @@ test "zix webtransport: a stream buffer takes what it can and reports back press
     try std.testing.expectEqual(@as(usize, 29), stream.writable());
 
     // A write larger than the room is partially accepted, which is the back-pressure contract.
-    const big = [_]u8{0xaa} ** 40;
+    const big: [40]u8 = @splat(0xaa);
     try std.testing.expectEqual(@as(usize, 29), stream.write(&big));
     try std.testing.expectEqual(@as(usize, 0), stream.writable());
     try std.testing.expectEqual(@as(usize, 0), stream.write("more"));
@@ -913,7 +913,7 @@ test "zix webtransport: a long stream reuses one buffer across acknowledgements"
     var round: usize = 0;
     while (round < 40) : (round += 1) {
         const byte: u8 = @intCast(round % 251);
-        const payload = [_]u8{byte} ** 8;
+        const payload: [8]u8 = @splat(byte);
         try std.testing.expectEqual(@as(usize, 8), stream.write(&payload));
 
         const ready = stream.sendable();
@@ -1153,7 +1153,7 @@ test "zix webtransport: 6 a session ends with the close information the peer sen
     try std.testing.expect(session.close.message.ptr != "done here".ptr);
 
     // A message longer than the limit is clipped to the session's own buffer.
-    const long = [_]u8{'x'} ** (draft.max_close_message + 100);
+    const long: [draft.max_close_message + 100]u8 = @splat('x');
     session.close_(.{ .code = 1, .message = &long, .reason = .local_close });
     try std.testing.expectEqual(@as(usize, draft.max_close_message), session.close.message.len);
 }
