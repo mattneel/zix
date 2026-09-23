@@ -27,6 +27,9 @@ primary_region = "iad"
   ZIX_PAGE_IP = "0.0.0.0"
   ZIX_PAGE_PORT = "9444"
   ZIX_SESSION_PORT = "9444"
+  # The port a browser reaches this origin on. Alt-Svc has to name it, not the internal 9444: a browser told
+  # ":9444" for an origin it knows as :443 tries a port nothing listens on and falls back to TCP.
+  ZIX_PUBLIC_PORT = "443"
 
 [[mounts]]
   source = "certs"

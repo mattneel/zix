@@ -42,6 +42,11 @@ var PORT: u16 = 9444;
 /// The page's port: HTTPS/1.1 over TCP. It defaults to the session's port, because a session shares its
 /// page's origin; a deployment that terminates both behind one external port overrides both.
 var PAGE_PORT: u16 = 9444;
+/// The port Alt-Svc advertises for this origin's HTTP/3 service. It defaults to the port the page is served
+/// on, which is right when the process owns that port; behind a forwarder it is the port the browser
+/// connected to, because Alt-Svc names where the *origin* can be reached - a browser told ":9444" for an
+/// origin it knows as :443 tries a port nothing is listening on and falls back to TCP.
+var PUBLIC_PORT: u16 = 0;
 /// The page's port: HTTPS/1.1 over TCP. It is deliberately *not* the QUIC port. A browser that is told to
 /// force QUIC for an origin sends every request to that origin over QUIC, so a page served there cannot
 /// reload while the server is being rebuilt — and the development loop is exactly a rebuild followed by a
@@ -178,7 +183,7 @@ fn page(req: *zix.Http1.Request, res: *zix.Http1.Response, ctx: *zix.Http1.Conte
     // that https://host:9444 is reachable over QUIC: it tries TCP, finds nothing, and the WebTransport
     // dial fails. Only a browser launched with --origin-to-force-quic-on could connect, which is not a demo
     // anybody can run.
-    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAlt-Svc: h3=\":{d}\"; ma=86400\r\n\r\n", .{ served_page_len, PORT }) catch return;
+    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAlt-Svc: h3=\":{d}\"; ma=86400\r\n\r\n", .{ served_page_len, if (PUBLIC_PORT == 0) PORT else PUBLIC_PORT }) catch return;
 
     try res.sendRaw(head.buffered());
     try res.sendRaw(served_page[0..served_page_len]);
@@ -187,7 +192,7 @@ fn page(req: *zix.Http1.Request, res: *zix.Http1.Response, ctx: *zix.Http1.Conte
 fn sendText(res: *zix.Http1.Response, body: []const u8) !void {
     var head_buf: [128]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAlt-Svc: h3=\":{d}\"; ma=86400\r\n\r\n", .{ body.len, PORT }) catch return;
+    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAlt-Svc: h3=\":{d}\"; ma=86400\r\n\r\n", .{ body.len, if (PUBLIC_PORT == 0) PORT else PUBLIC_PORT }) catch return;
 
     try res.sendRaw(head.buffered());
     try res.sendRaw(body);
@@ -634,6 +639,7 @@ pub fn main(process: std.process.Init) !void {
     if (envOverride(process.environ_map, "ZIX_PAGE_IP")) |value| PAGE_IP = value;
     if (envOverride(process.environ_map, "ZIX_SESSION_PORT")) |value| PORT = std.fmt.parseInt(u16, value, 10) catch PORT;
     if (envOverride(process.environ_map, "ZIX_PAGE_PORT")) |value| PAGE_PORT = std.fmt.parseInt(u16, value, 10) catch PAGE_PORT;
+    if (envOverride(process.environ_map, "ZIX_PUBLIC_PORT")) |value| PUBLIC_PORT = std.fmt.parseInt(u16, value, 10) catch PUBLIC_PORT;
     if (envOverride(process.environ_map, "ZIX_CERT")) |value| CERT = value;
     if (envOverride(process.environ_map, "ZIX_KEY")) |value| KEY = value;
     if (envOverride(process.environ_map, "DATABASE_URL")) |value| DSN = value;
