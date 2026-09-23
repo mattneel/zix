@@ -55,7 +55,10 @@ if [ -z "${DATABASE_URL:-}" ]; then
         su postgres -c "$pgbin/initdb -D $pgdata" >/dev/null
     fi
 
-    su postgres -c "$pgbin/pg_ctl -D $pgdata -l /data/pg.log -o '-c listen_addresses=127.0.0.1' start" >/dev/null
+    # The log lives inside PGDATA, which postgres owns: the volume is mounted root-owned, so a log path at
+    # the volume root is one the server cannot create.
+    su postgres -c "$pgbin/pg_ctl -D $pgdata -l $pgdata/server.log -o '-c listen_addresses=127.0.0.1' start" >/dev/null \
+        || { echo "[entrypoint] the local database would not start:"; tail -20 "$pgdata/server.log"; exit 1; }
     for _ in $(seq 1 30); do "$pgbin/pg_isready" -q && break; sleep 0.5; done
 
     su postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='zix'\" | grep -q 1" \
