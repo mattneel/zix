@@ -1,0 +1,17 @@
+.{
+    .name = .zix_durable_tasks,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    // Changing this has security and trust implications.
+    .fingerprint = 0x6e329fe2e4222c8a,
+    .dependencies = .{
+        // The transport and the drivers, from the repository this example lives in.
+        .zix = .{ .path = "../.." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "tasks.zig",
+        "acceptance.zig",
+    },
+}
