@@ -27,6 +27,7 @@ const datagram = @import("../../datagram.zig");
 const packet = @import("../packet.zig");
 const protection = @import("../protection.zig");
 const frame = @import("../frame.zig");
+const certificate = @import("../../../tls/certificate.zig");
 const varint = @import("../varint.zig");
 const serverhello = @import("../serverhello.zig");
 const flight = @import("../flight.zig");
@@ -152,6 +153,13 @@ pub const Event = union(enum) {
     /// A client Handshake-level packet decrypted with the derived Handshake keys (proves the
     /// handshake-secret derivation is correct against the client).
     handshake_opened,
+    /// A client Handshake-level packet whose CRYPTO bytes carried the client's Finished, verified: the
+    /// TLS handshake is complete, so the server owes the client its handshake confirmation.
+    handshake_finished,
+    /// A client Finished arrived and did not verify: the handshake stays unconfirmed.
+    finished_mismatch,
+    /// A CONNECTION_CLOSE arrived inside a Handshake-level packet, carrying the reason the client gave.
+    handshake_close: close.ConnClose,
     /// A client 1-RTT packet decrypted with the derived application keys (proves the 1-RTT key
     /// derivation is correct against the client, the request is now readable).
     request_opened,
@@ -176,10 +184,28 @@ pub fn processDatagram(table: *ConnTable, data: []const u8, cid_len: usize, max_
         if (hdr.packet_type == 0) return openClientInitial(conn, data);
 
         // A client Handshake packet: decrypt with the derived client Handshake keys. Success proves
-        // the handshake-secret derivation (transcript + ECDHE + key schedule) matches byte-exact.
+        // the handshake-secret derivation (transcript + ECDHE + key schedule) matches byte-exact, and the
+        // packet carries the client's Finished: the CRYPTO bytes are fed and verified here, because a
+        // verified Finished is what makes the handshake complete.
         if (hdr.packet_type == 2 and conn.handshake_ready) {
             var hbuf: [2048]u8 = undefined;
-            if (protection.openHandshake(data, conn.hs_keys.client, &hbuf)) |_| return .handshake_opened else |_| {}
+            if (protection.openHandshake(data, conn.hs_keys.client, &hbuf)) |opened| {
+                // A client that gives up during the handshake says why here: a TLS alert (an
+                // unverifiable certificate, an unacceptable parameter) arrives as a CONNECTION_CLOSE
+                // carrying the alert code and the client's own description. It is worth surfacing,
+                // because the connection otherwise just goes quiet.
+                if (close.parseConnectionClose(opened.payload)) |cc| {
+                    return .{ .handshake_close = cc };
+                } else |_| {}
+
+                feedHandshakeFrames(conn, opened.payload);
+
+                return switch (clientFinishedState(conn)) {
+                    .verified => .handshake_finished,
+                    .mismatch => .finished_mismatch,
+                    .incomplete => .handshake_opened,
+                };
+            } else |_| {}
         }
 
         return .demuxed;
@@ -257,6 +283,60 @@ fn feedInitialFrames(conn: *Connection, payload: []const u8) void {
         if (parsed.len == 0) break;
         pos += parsed.len;
     }
+}
+
+/// Feed a Handshake-level packet's CRYPTO frames into the connection's Handshake reassembly stream.
+///
+/// Note:
+/// - The walk is type-driven with an unknown-frame skip, the same shape the datagram and stream passes
+///   use. A strict frame parser is no good here: a client's Handshake packet carries an ACK of the server
+///   flight first, and stopping there would drop the Finished that follows it.
+fn feedHandshakeFrames(conn: *Connection, payload: []const u8) void {
+    var pos: usize = 0;
+    while (pos < payload.len) {
+        const type_vi = varint.read(payload[pos..]) catch break;
+
+        switch (type_vi.value) {
+            0x06 => { // CRYPTO: offset, length, body.
+                const parsed = frame.parseFrame(payload[pos..]) catch break;
+                conn.crypto_handshake.insert(@intCast(parsed.frame.crypto.offset), parsed.frame.crypto.data);
+                pos += parsed.len;
+            },
+            else => {
+                const skipped = request.skipFrame(payload[pos..]) orelse break;
+                if (skipped == 0) break;
+                pos += skipped;
+            },
+        }
+    }
+}
+
+/// Whether the client's Finished has arrived and verifies (RFC 8446 4.4.4). Its verify_data covers the
+/// transcript through the server Finished, which is the hash the application keys were derived from, so
+/// no extra transcript bookkeeping is needed. A message split across Handshake packets is only checked
+/// once the reassembly stream holds it whole.
+///
+/// Note:
+/// - A Finished that does not verify leaves the handshake unconfirmed: the client gets no HANDSHAKE_DONE
+///   and no session, and the connection idles out. That is deliberate. Confirming a handshake the client
+///   never proved would let a peer reach the request path without the Finished, which is the one thing
+///   the message exists to prevent.
+fn clientFinishedState(conn: *Connection) enum { incomplete, verified, mismatch } {
+    if (conn.client_finished_verified) return .verified;
+
+    const bytes = conn.crypto_handshake.readable();
+    if (bytes.len < 4 or bytes[0] != 0x14) return .incomplete;
+
+    const declared = (@as(usize, bytes[1]) << 16) | (@as(usize, bytes[2]) << 8) | bytes[3];
+    if (declared != 32 or bytes.len < 4 + declared) return .incomplete;
+
+    const finished_key = certificate.finishedKey(conn.hs_keys.client_traffic);
+    const expected = certificate.finishedVerifyData(finished_key, conn.transcript_through_finished);
+    if (!std.mem.eql(u8, &expected, bytes[4 .. 4 + declared])) return .mismatch;
+
+    conn.client_finished_verified = true;
+
+    return .verified;
 }
 
 /// Effective worker count: the configured value, or one per available CPU when 0.
@@ -624,6 +704,12 @@ fn servePacket(comptime handler: core.HandlerFn, table: *ConnTable, pool: *reass
         .parse_alert => logSystem(config, .INFO, "decrypted client Initial but ClientHello parse raised an alert", .{}),
         .decrypt_failed => logSystem(config, .INFO, "long-header Initial failed to decrypt under the Initial keys", .{}),
         .handshake_opened => logSystem(config, .INFO, "decrypted client Handshake packet (handshake keys correct, validated live)", .{}),
+        .handshake_finished => {
+            logSystem(config, .INFO, "client Finished verified: the handshake is complete, sending the confirmation", .{});
+            sendHandshakeConfirmationFD(table, data, tx, fd, from, config);
+        },
+        .finished_mismatch => logSystem(config, .ERROR, "client Finished did not verify: the handshake stays unconfirmed", .{}),
+        .handshake_close => |cc| logSystem(config, .WARN, "client closed during the handshake: code {d} frame {d} reason \"{s}\"", .{ cc.error_code, cc.frame_type, cc.reason }),
         .request_opened => {
             if (stats) |st| st.requests += 1;
 
@@ -970,8 +1056,41 @@ fn sendServerHelloFD(table: *ConnTable, data: []const u8, tx: *datagram.SendBatc
     // 1-RTT application keys, derived from the transcript through the server Finished (which the
     // flight just appended). The client addresses us by our_scid from here on.
     conn.app_keys = keyschedule.applicationKeys(conn.hs_keys.handshake_secret, conn.handshake_transcript.current());
+    // The flight just appended the server Finished, so the transcript hash is now the exact input the
+    // client's Finished covers: keep it for that verification.
+    conn.transcript_through_finished = conn.handshake_transcript.current();
     conn.peer_scid = demux.ConnId.fromSlice(hdr.scid);
     conn.app_ready = true;
+}
+
+/// Leave as soon as the handshake is complete: the server's one-time 1-RTT prologue, a HANDSHAKE_DONE
+/// frame followed by the control stream's SETTINGS (RFC 9000 17.2.1, RFC 9114 6.2.1).
+///
+/// Note:
+/// - A client is entitled to wait for the handshake to be confirmed before it sends 1-RTT data, and
+///   Chromium does: it holds its SETTINGS, its CONNECT and every request until the confirmation lands. A
+///   server that only writes its prologue when a 1-RTT packet arrives therefore deadlocks against it, so
+///   the confirmation is sent here, on the client's Finished, rather than waiting for traffic.
+/// - The client's Handshake packets are not ACKed on this path; the handshake is complete either way, so
+///   the client discards its Handshake state with the HANDSHAKE_DONE and the confirmation is idempotent
+///   if a retransmitted Finished arrives first.
+fn sendHandshakeConfirmationFD(table: *ConnTable, data: []const u8, tx: *datagram.SendBatch, fd: std.posix.socket_t, peer: std.posix.sockaddr.in6, config: Http3ServerConfig) void {
+    const hdr = packet.parseLongHeader(data) catch return;
+    if (hdr.packet_type != 2) return;
+
+    const dcid = demux.ConnId.fromSlice(hdr.dcid);
+    const conn = table.find(&dcid) orelse return;
+    if (!conn.app_ready or conn.first_response_sent or !conn.client_finished_verified) return;
+
+    conn.peer_addr = peer;
+    conn.last_activity_us = recovery.nowUs();
+
+    var pbuf: [COALESCE_PAYLOAD_MAX]u8 = undefined;
+    const plen = buildConnectionPrologue(&pbuf, config);
+    conn.first_response_sent = true;
+
+    sealAndQueue(conn, tx, fd, peer, pbuf[0..plen], null);
+    tx.flush(fd) catch {};
 }
 
 /// Expand a request :path into a stable slice: Huffman-decoded into the connection scratch when the
@@ -3049,6 +3168,39 @@ pub fn sweepMaintenance(comptime handler: core.HandlerFn, table: *ConnTable, wt_
 
 // --------------------------------------------------------------- //
 // --------------------------------------------------------------- //
+
+test "zix http3: a client Finished verifies against the client handshake secret and the server-Finished transcript" {
+    const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+
+    var conn = Connection.init(&dcid, 1200, 10);
+    conn.hs_keys.client_traffic = @splat(0x2b);
+    conn.transcript_through_finished = @splat(0x11);
+
+    // Neither nothing nor a prefix of the message counts as a Finished: the handshake must not be
+    // confirmed on CRYPTO bytes that are still arriving.
+    try std.testing.expectEqual(.incomplete, clientFinishedState(&conn));
+
+    const finished_key = certificate.finishedKey(conn.hs_keys.client_traffic);
+    var fin_buf: [64]u8 = undefined;
+    const finished = certificate.buildFinished(&fin_buf, finished_key, conn.transcript_through_finished);
+
+    conn.crypto_handshake.insert(0, finished[0 .. finished.len - 1]);
+    try std.testing.expectEqual(.incomplete, clientFinishedState(&conn));
+
+    // The whole message verifies, and a second packet does not undo it (a retransmitted Finished, or any
+    // later Handshake packet, finds the handshake already complete).
+    conn.crypto_handshake.insert(finished.len - 1, finished[finished.len - 1 ..]);
+    try std.testing.expectEqual(.verified, clientFinishedState(&conn));
+    try std.testing.expectEqual(.verified, clientFinishedState(&conn));
+
+    // The same message against a different transcript does not verify: the check binds the client to the
+    // handshake it actually saw, so a peer that holds the secrets but not the transcript cannot pass.
+    var other = Connection.init(&dcid, 1200, 10);
+    other.hs_keys.client_traffic = conn.hs_keys.client_traffic;
+    other.transcript_through_finished = @splat(0x12);
+    other.crypto_handshake.insert(0, finished);
+    try std.testing.expectEqual(.mismatch, clientFinishedState(&other));
+}
 
 test "zix http3: processDatagram demuxes a long-header Initial by DCID" {
     // Heap like the worker loops: the 256-slot table is multi-MB and overflows

@@ -96,6 +96,33 @@ Tiga pemeriksaan terjadi sebelum aplikasi pernah melihat request, dan masing-mas
 
 ---
 
+## Handshake dan Konfirmasi
+
+Sebuah session menumpang koneksi QUIC yang sama dengan request HTTP/3 biasa, jadi binding tidak menambah
+apa pun pada handshake transport. Satu sifat handshake itu yang menentukan apakah sebuah session bisa
+berdiri:
+
+- **Finished dari client diverifikasi.** Paket Handshake milik client didekripsi, byte CRYPTO-nya
+  direassemble, lalu Finished diperiksa terhadap client handshake-traffic secret atas transcript sampai
+  server Finished (RFC 8446 4.4.4). Finished yang tidak lolos verifikasi membiarkan handshake tidak
+  terkonfirmasi: tidak ada HANDSHAKE_DONE, tidak ada session, dan koneksi mati oleh idle timeout. Peer yang
+  tidak pernah membuktikan penguasaan kunci tidak pernah mencapai jalur request, dan Finished yang
+  terbelah antar paket baru dinilai setelah stream reassembly memegangnya utuh.
+- **Konfirmasi adalah kewajiban server, dan dikirim segera.** `HANDSHAKE_DONE` tidak boleh keluar sebelum
+  handshake selesai (RFC 9000 17.2.1), dan momen handshake selesai adalah momen Finished terverifikasi.
+  Prologue sekali pakai (HANDSHAKE_DONE lalu SETTINGS stream control) karena itu keluar pada giliran yang
+  sama, bukan menunggu paket 1-RTT pertama dari client: client berhak menunggu konfirmasi sebelum mengirim
+  data 1-RTT apa pun, dan Chromium memang menunggu — ia menahan SETTINGS, CONNECT, dan setiap request
+  sampai konfirmasi tiba. aioquic dan client in-tree mengirim 1-RTT lebih awal, jadi server yang hanya
+  membalas 1-RTT terlihat benar sampai sebuah browser menyambung ke sana.
+- **Client yang menyerah menyebut alasannya.** Kegagalan handshake datang sebagai CONNECTION_CLOSE di dalam
+  paket Handshake, membawa kode alert TLS dan deskripsi dari client itu sendiri (sertifikat ditolak,
+  parameter tidak diterima). Engine mencatatnya pada level WARN, karena tanpa itu koneksi hanya diam dan
+  tidak ada lagi yang menyebut penyebabnya.
+- **Paket Handshake tidak di-ACK pada jalur ini.** Handshake selesai pada momen yang sama, jadi client
+  membuang state Handshake-nya bersama konfirmasi, dan Finished yang dikirim ulang dijawab dengan prologue
+  idempoten yang sama.
+
 ## Yang Dilihat Aplikasi
 
 Permukaan aplikasi adalah satu konfigurasi pada server yang sudah ada, lima callback, dan dua handle. `Session` dan `Stream` adalah view atas state engine: keduanya dibuat baru untuk callback yang memilikinya, dan menyalinnya legal tetapi salinannya hanya bisa dipakai selama callback itu berjalan.
@@ -276,6 +303,7 @@ Yang dibayar sebuah konfigurasi per koneksi tetap dan kecil: state `wt` inline (
 - **Capsule tak dikenal tidak bisa memaksa engine membuffer.** Reader memparse header capsule dulu dan baru memutuskan: capsule yang dikenal binding diakumulasi ke buffer tetap, dan yang lain dilewati byte per byte. Peer bebas mendeklarasikan panjang yang tidak akan pernah ditahan endpoint ini, dan melakukannya hanya menghabiskan byte wire-nya sendiri.
 - **Pesan close dibatasi dan divalidasi.** Pesan aplikasi dipotong pada batas karakter UTF-8 di 1024 byte saat dikirim, dan harus UTF-8 valid maksimal 1024 byte saat diterima (jika tidak, stream CONNECT direset dengan H3_MESSAGE_ERROR).
 - **Application error code tidak pernah jatuh di codepoint terreservasi.** Pemetaannya ke rentang `WT_APPLICATION_ERROR` melewati codepoint grease HTTP/3 (0x1f * N + 0x21), dan kode yang diterima yang terreservasi di dalam rentang terbaca sebagai "reset tanpa application error code" alih-alih sebagai nilai yang dipilih peer.
+- **Handshake hanya dikonfirmasi setelah client membuktikan penguasaan kunci.** Server mengirim `HANDSHAKE_DONE` hanya pada Finished client yang terverifikasi, tidak pernah pada hal lain: handshake yang tidak terverifikasi atau tidak dikenali membiarkan koneksi tanpa konfirmasi, dan peer yang penting (browser, aioquic) lalu menggagalkan session alih-alih mencapai sebuah handler.
 - **Stream yang diklaim tidak pernah dijawab sebagai request HTTP.** Pass receive binding berjalan lebih dulu dan menandai setiap stream yang dikenalnya, sehingga stream data WebTransport tidak bisa disalahartikan sebagai request yang body-nya kebetulan dimulai dengan 0x41.
 - **Error session adalah reset stream CONNECT** yang membawa error code terpetakan, diikuti teardown penuh: setiap stream session direset dengan `WT_SESSION_GONE`, datagram yang mengantre dibuang bersamanya, dan aplikasi menerima satu `on_close`.
 
@@ -318,6 +346,38 @@ Masing-masing dengan alasannya, supaya tidak ada yang menurunkan ulang pertanyaa
 | Contoh | Port | Yang ditunjukkan |
 | :- | :- | :- |
 | `http3_webtransport` | 9089 | session di `/echo`: setiap chunk stream data dipantulkan kembali (dengan FIN setelah seluruh chunk keluar), setiap datagram dipantulkan, satu stream unidirectional per session yang menulis banner lalu FIN, dan lifecycle session dicetak ke stderr |
+| `webtransport_live` | 9443 (TCP dan UDP) | live view yang dirender browser: halaman lewat HTTPS/1.1 di TCP dan session lewat HTTP/3 di UDP, satu port dan satu origin. Satu tick pada stream bidirectional menjadi increment event dan patch DOM, sebuah datagram membawa note dan mengembalikan patch-nya, stream kedua mengunggah 64 KiB dengan progress sementara tick tetap mengalir, dan reconnect menyinkronkan ulang dari snapshot. |
+
+### Menjalankan demo browser
+
+`zig build example-webtransport_live`, lalu buka `https://127.0.0.1:9443/`: halaman dilayani lewat
+HTTPS/1.1 di TCP, dan session yang dibukanya menuju host dan port yang sama lewat HTTP/3 (route yang sama
+juga dilayani lewat HTTP/3, jadi browser yang dipaksa ke QUIC tetap memuatnya).
+
+Chromium memverifikasi sertifikat server pada koneksi session dan melaporkan kegagalannya sebagai error
+protokol QUIC, jadi sertifikat self-signed milik demo harus diterima sebelum session bisa dijalankan:
+
+```
+# base64 SHA-256 dari SubjectPublicKeyInfo sertifikat yang dilayani
+openssl x509 -in examples/certs/ecdsa_p256_cert.pem -pubkey -noout \
+  | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64
+
+chrome --ignore-certificate-errors \
+       --ignore-certificate-errors-spki-list=<nilai itu> \
+       --origin-to-force-quic-on=127.0.0.1:9443
+```
+
+Allowlist SPKI adalah flag yang menentukan untuk QUIC: `--ignore-certificate-errors` saja cukup untuk
+halaman HTTPS/1.1 tetapi meninggalkan session gagal dengan `certificate unknown`.
+`--origin-to-force-quic-on` yang membuat browser memuat halaman lewat HTTP/3 juga.
+
+`scripts/webtransport_interop.py` adalah client independen berbasis skrip: ia menjalankan contoh
+`http3_webtransport` dengan aioquic (handshake, extended CONNECT, echo stream bidirectional, echo
+datagram, dan stream unidirectional yang dibuka server) dan melaporkan satu baris PASS/FAIL per
+pemeriksaan. Echo bidirectional dibaca dari byte stream mentah, karena lapisan HTTP/3 aioquic hanya
+mengklasifikasikan data stream masuk sebagai WebTransport ketika peer mengirim ulang stream header 0x41 —
+yang dilarang draft pada arah server dari stream yang dibuka client (draft-ietf-webtrans-http3-16 4.3),
+sehingga echo yang konforman tidak pernah sampai ke event WebTransport lapisan itu.
 
 Build dengan `zig build example-http3_webtransport` (binary `zig-out/bin/zix-example-http3_webtransport-x86_64-linux-debug`), dan jalankan dengan client WebTransport over HTTP/3 mana pun, termasuk draft deployed yang masih dikirim browser dan aioquic. Handler contoh ini tidak menyebut satu pun stream id, frame, atau capsule.
 

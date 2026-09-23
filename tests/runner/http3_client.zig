@@ -701,8 +701,10 @@ const CONTROL_STREAM_ID: u64 = 2;
 const CONNECT_STREAM_ID: u64 = 0;
 const DATA_STREAM_ID: u64 = 4;
 
-/// The first server-initiated unidirectional stream, where a server that opens one per session writes.
-const SERVER_UNI_STREAM_ID: u64 = 3;
+/// The server's unidirectional streams (RFC 9000 2.1: 3 mod 4). Stream 3 is its control stream, which
+/// every HTTP/3 connection opens with SETTINGS, so the first unidirectional stream a server has free
+/// for a WebTransport session is 7.
+const SERVER_UNI_STREAM_ID: u64 = 7;
 
 /// Bytes one tracked stream accumulates, and the largest payload a data stream or a datagram carries
 /// here. Both are small: this drives a session banner, one echo, and one datagram.

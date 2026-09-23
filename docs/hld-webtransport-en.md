@@ -96,6 +96,32 @@ Three checks happen before an application ever sees the request, and each one is
 
 ---
 
+## Handshake and Confirmation
+
+A session rides the same QUIC connection an ordinary HTTP/3 request uses, so the binding adds nothing to
+the transport handshake. One property of that handshake decides whether a session can establish at all:
+
+- **The client's Finished is verified.** A client's Handshake packet is decrypted, its CRYPTO bytes are
+  reassembled, and the Finished is checked against the client handshake-traffic secret over the transcript
+  through the server Finished (RFC 8446 4.4.4). A Finished that does not verify leaves the handshake
+  unconfirmed: no HANDSHAKE_DONE, no session, and the connection idles out. A peer that never proved key
+  possession never reaches the request path, and a Finished split across packets is only judged once the
+  reassembly stream holds it whole.
+- **The confirmation is the server's to send, immediately.** `HANDSHAKE_DONE` may not go out before the
+  handshake is complete (RFC 9000 17.2.1), and the moment it is complete is the moment the Finished
+  verifies. The one-time prologue (HANDSHAKE_DONE, then the control stream's SETTINGS) therefore leaves in
+  that same turn rather than waiting for the client's first 1-RTT packet: a client is entitled to wait for
+  the confirmation before it sends any 1-RTT data, and Chromium does — it holds its SETTINGS, its CONNECT,
+  and every request until the confirmation lands. aioquic and the in-tree client send 1-RTT early, which
+  is why a server that only replies to 1-RTT looks correct until a browser connects to it.
+- **A client that gives up says why.** A handshake failure arrives as a CONNECTION_CLOSE inside a
+  Handshake packet, carrying the TLS alert code and the client's own description (a rejected certificate,
+  an unacceptable parameter). The engine logs it at WARN, because the connection otherwise just goes quiet
+  and nothing else names the cause.
+- **Handshake packets are not acknowledged on this path.** The handshake is complete at the same moment, so
+  the client discards its Handshake state with the confirmation, and a retransmitted Finished is answered
+  with the same idempotent prologue.
+
 ## What the Application Sees
 
 The application surface is one config on the existing server, five callbacks, and two handles. `Session` and `Stream` are views over engine state: they are built fresh for the callback that owns them, and copying one is legal but the copy is only usable while that callback runs.
@@ -276,6 +302,7 @@ What a config costs per connection is fixed and small: the inline `wt` state (a 
 - **Unknown capsules cannot make the engine buffer.** The reader parses a capsule header first and only then decides: a capsule this binding knows is accumulated into a fixed buffer, and any other is skipped byte by byte. A peer is free to declare a length this endpoint will never hold, and doing so costs it nothing but wire bytes.
 - **A close message is bounded and validated.** The application message is truncated on a UTF-8 character boundary at 1024 bytes when sent, and must be valid UTF-8 of at most 1024 bytes when received (otherwise the CONNECT stream is reset with H3_MESSAGE_ERROR).
 - **Application error codes never land on a reserved codepoint.** The mapping into the `WT_APPLICATION_ERROR` range skips the HTTP/3 grease codepoints (0x1f * N + 0x21), and a received code that is reserved inside the range reads as "reset without an application error code" rather than as a value the peer chose.
+- **A handshake is confirmed only after the client proves key possession.** The server sends `HANDSHAKE_DONE` on a verified client Finished, and never on anything else: an unverified or unrecognized handshake leaves the connection unconfirmed, and the peers that matter (a browser, aioquic) then fail the session rather than reaching a handler.
 - **A claimed stream is never answered as an HTTP request.** The binding's receive pass runs first and marks every stream it recognizes, so a WebTransport data stream cannot be mistaken for a request whose body happens to start with 0x41.
 - **A session error is a reset of the CONNECT stream** carrying the mapped error code, followed by a full teardown: every stream of the session is reset with `WT_SESSION_GONE`, queued datagrams are dropped with it, and the application gets one `on_close`.
 
@@ -318,6 +345,38 @@ Each with a reason, so nobody re-derives the question:
 | Example | Port | What it shows |
 | :- | :- | :- |
 | `http3_webtransport` | 9089 | sessions on `/echo`: every data stream chunk echoed back (with a FIN once the whole chunk went out), every datagram echoed, one unidirectional stream per session writing a banner then a FIN, and the session lifecycle printed on stderr |
+| `webtransport_live` | 9443 (TCP and UDP) | a live view a browser renders: the page over HTTPS/1.1 on TCP and the session over HTTP/3 on UDP, one port and one origin. A tick on a bidirectional stream becomes an increment event and a DOM patch, a datagram carries a note and returns its patch, a second stream uploads 64 KiB with progress while the ticks keep flowing, and reconnecting resynchronizes from the snapshot. |
+
+### Driving the browser demo
+
+`zig build example-webtransport_live`, then open `https://127.0.0.1:9443/`: the page is served over
+HTTPS/1.1 on TCP, and the session it opens goes to the same host and port over HTTP/3 (the same route is
+also served over HTTP/3, so a browser forced onto QUIC loads it too).
+
+Chromium verifies the server certificate on the session connection and reports a failure there as a QUIC
+protocol error, so the demo's self-signed certificate has to be accepted before the session can be driven:
+
+```
+# the base64 SHA-256 of the served certificate's SubjectPublicKeyInfo
+openssl x509 -in examples/certs/ecdsa_p256_cert.pem -pubkey -noout \
+  | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl enc -base64
+
+chrome --ignore-certificate-errors \
+       --ignore-certificate-errors-spki-list=<that value> \
+       --origin-to-force-quic-on=127.0.0.1:9443
+```
+
+The SPKI allowlist is the flag that matters for QUIC: `--ignore-certificate-errors` alone covers the
+HTTPS/1.1 page but leaves the session failing with `certificate unknown`. `--origin-to-force-quic-on` is
+what makes the browser load the page over HTTP/3 as well.
+
+`scripts/webtransport_interop.py` is the scripted independent client: it drives the `http3_webtransport`
+example with aioquic (handshake, extended CONNECT, bidirectional stream echo, datagram echo, and the
+server-opened unidirectional stream) and reports one PASS/FAIL line per check. It reads the bidirectional
+echo from the raw stream bytes, because aioquic's HTTP/3 layer only classifies incoming stream data as
+WebTransport when the peer re-sends the 0x41 stream header — which the draft forbids on the server's
+direction of a client-initiated stream (draft-ietf-webtrans-http3-16 4.3), so a conformant echo never
+reaches that layer's WebTransport event.
 
 Build it with `zig build example-http3_webtransport` (binary `zig-out/bin/zix-example-http3_webtransport-x86_64-linux-debug`), and drive it with any WebTransport over HTTP/3 client, including the deployed draft that browsers and aioquic still send. The example's handler names no stream id, no frame, and no capsule.
 

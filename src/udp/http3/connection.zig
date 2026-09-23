@@ -238,8 +238,14 @@ pub const WebTransportState = struct {
     streams: [wt_api.connection_stream_cap]?*wt.Stream = @splat(null),
     /// The next server-initiated bidirectional stream id (RFC 9000 2.1: 1 mod 4) and unidirectional id
     /// (3 mod 4). A data stream takes an id only when the application opens one.
+    ///
+    /// Note:
+    /// - The unidirectional counter starts at 7, not 3: stream 3 is the server control stream, which
+    ///   `buildConnectionPrologue` opens with SETTINGS on every connection (RFC 9114 6.2.1), so a
+    ///   WebTransport unidirectional stream handed out as 3 would append data stream bytes to the
+    ///   control stream and break it for the peer.
     next_bidi_stream: u64 = 1,
-    next_uni_stream: u64 = 3,
+    next_uni_stream: u64 = 7,
     /// Datagrams that arrived for a session this connection does not have, and were dropped (4.6).
     dropped_datagrams: u64 = 0,
     /// The type of each client unidirectional stream this connection classified (RFC 9114 6.2).
@@ -529,6 +535,17 @@ pub const Connection = struct {
     close_state: close.CloseState = .open,
     control: h3.ControlStream = .{},
     crypto_initial: tls.CryptoStream = .{},
+    /// The client's Handshake-level CRYPTO bytes: its Finished. Verifying it against the transcript
+    /// through the server Finished is what completes the TLS handshake on the server side (RFC 8446
+    /// 4.4.4), and completing it is what lets the server confirm the handshake to the client.
+    crypto_handshake: tls.CryptoStream = .{},
+    /// The transcript hash through the server Finished: the input the client's verify_data covers. Set
+    /// where the application keys are derived, because the flight that appends the server Finished is
+    /// what leaves the transcript in exactly that state.
+    transcript_through_finished: crypto.Secret = @splat(0),
+    /// Whether the client's Finished verified. False keeps the handshake unconfirmed, so a peer that
+    /// cannot prove key possession never gets a session.
+    client_finished_verified: bool = false,
 
     // Handshake step 2 (server send path) state.
     server_hello_sent: bool = false,
@@ -991,6 +1008,19 @@ test "zix http3: sendDatagramSize clamps to the smallest of config, client limit
 
     // The ceiling caps everything when both config and client allow more.
     try std.testing.expectEqual(@as(u64, 16 * 1024), conn.sendDatagramSize(65527, 16 * 1024));
+}
+
+test "zix http3: a server's WebTransport stream ids skip the control stream (RFC 9114 6.2.1)" {
+    var state = WebTransportState{};
+
+    // Stream 3 is the server control stream: the connection prologue opens it with SETTINGS on every
+    // connection, so the first unidirectional id a session may use is 7, and the second is 11.
+    try std.testing.expectEqual(@as(u64, 7), state.takeStreamId(.uni));
+    try std.testing.expectEqual(@as(u64, 11), state.takeStreamId(.uni));
+
+    // Bidirectional ids are the server's own from the start (1 mod 4), with nothing to skip.
+    try std.testing.expectEqual(@as(u64, 1), state.takeStreamId(.bidi));
+    try std.testing.expectEqual(@as(u64, 5), state.takeStreamId(.bidi));
 }
 
 test "zix http3: Connection init derives Initial keys from DCID (RFC 9001 A.1)" {

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zix · WebTransport live view</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem 2rem; min-height: 100vh;
+    background: #0f1117; color: #d7dce5;
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; color: #9ad0ff; }
+  p.sub { margin: 0 0 1.25rem; color: #8b93a3; }
+  button {
+    font: inherit; padding: .45rem .8rem; margin: 0 .4rem .4rem 0;
+    background: #1b2130; color: #d7dce5; border: 1px solid #2d3648;
+    border-radius: 6px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #232b3d; border-color: #3b465e; }
+  button:disabled { opacity: .4; cursor: default; }
+  section.grid { display: grid; grid-template-columns: minmax(280px, 340px) 1fr; gap: 1.5rem; align-items: start; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .3rem 1rem; margin: 0; }
+  dt { color: #8b93a3; }
+  dd { margin: 0; color: #e6ebf5; }
+  #banner-text { color: #ffd479; }
+  h2 { font-size: .9rem; color: #8b93a3; margin: 0 0 .5rem; font-weight: 600; }
+  ol#events { list-style: none; margin: 0; padding: 0; max-height: 62vh; overflow: auto; }
+  ol#events li { padding: .3rem .5rem; border-bottom: 1px solid #1b2130; white-space: pre-wrap; word-break: break-word; }
+  .ch { display: inline-block; min-width: 5.5rem; margin-right: .5rem; color: #7f8ea8; }
+  .ch.stream { color: #7ee787; }
+  .ch.datagram { color: #f0a35e; }
+  .ch.uni { color: #c792ea; }
+  .ch.session { color: #79b8ff; }
+  .badge { display: inline-block; padding: 0 .35rem; border-radius: 4px; background: #1b2130; color: #8b93a3; }
+  .rev { color: #ffd479; }
+</style>
+</head>
+<body>
+<h1>zix · WebTransport live view</h1>
+<p class="sub">page over HTTPS/1.1 (TCP) · session over HTTP/3 (UDP) · same origin, same port</p>
+
+<section id="controls">
+  <button id="open">1 · open session</button>
+  <button id="subscribe" disabled>2 · subscribe</button>
+  <button id="tick" disabled>3 · tick ×5</button>
+  <button id="upload" disabled>4 · upload 64 KiB</button>
+  <button id="note" disabled>5 · note via datagram</button>
+  <button id="reconnect" disabled>6 · reconnect + resync</button>
+  <button id="close" disabled>close</button>
+</section>
+
+<section class="grid">
+  <div>
+    <h2>server-owned state</h2>
+    <dl>
+      <dt>session</dt><dd id="status">closed</dd>
+      <dt>revision</dt><dd id="revision">—</dd>
+      <dt>ticks</dt><dd id="count">—</dd>
+      <dt>uploaded</dt><dd id="uploaded">—</dd>
+      <dt>uploads</dt><dd id="uploads">—</dd>
+      <dt>notes</dt><dd id="notes">—</dd>
+      <dt>banner</dt><dd id="banner">—</dd>
+      <dt>patches</dt><dd id="patches">0</dd>
+      <dt>sessions</dt><dd id="sessions">0</dd>
+    </dl>
+  </div>
+  <div>
+    <h2>events <span class="badge" id="event-count">0</span></h2>
+    <ol id="events"></ol>
+  </div>
+</section>
+
+<script>
+"use strict";
+
+const ENDPOINT = new URL("/live", location.href);
+const state = { sessions: 0, patches: 0, events: 0, revision: null, uploadReceived: 0, uploadTotal: 0 };
+
+const ui = {};
+for (const id of ["status", "revision", "count", "uploaded", "uploads", "notes", "banner", "patches", "sessions", "event-count", "events"]) {
+  ui[id] = document.getElementById(id);
+}
+
+function setStatus(text) { ui.status.textContent = text; }
+
+function log(channel, text) {
+  const li = document.createElement("li");
+  const tag = document.createElement("span");
+  tag.className = "ch " + (channel.split(" ")[0] || "");
+  tag.textContent = channel;
+  li.append(tag, document.createTextNode(text));
+  ui.events.prepend(li);
+  ui["event-count"].textContent = String(++state.events);
+}
+
+/** Apply one typed event to the DOM. Every channel funnels through here: stream events are reliable,
+ *  datagram events are not, and both land in the same patch. */
+function patch(event, channel) {
+  state.patches++;
+  ui.patches.textContent = String(state.patches);
+  if (event.revision !== undefined) state.revision = event.revision;
+
+  switch (event.kind || event.action) {
+    case "snapshot":
+      state.revision = event.rev;
+      ui.revision.textContent = String(event.rev);
+      ui.count.textContent = String(event.count);
+      ui.uploaded.textContent = String(event.uploaded) + " B";
+      ui.uploads.textContent = String(event.uploads);
+      ui.notes.textContent = String(event.notes);
+      break;
+    case "increment":
+      ui.revision.textContent = String(event.rev);
+      ui.count.textContent = String(event.count);
+      break;
+    case "upload":
+      state.uploadReceived = event.received;
+      state.uploadTotal = event.total;
+      ui.revision.textContent = String(event.rev);
+      ui.uploaded.textContent = event.received + " / " + event.total + " B";
+      break;
+    case "upload_done":
+      ui.revision.textContent = String(event.rev);
+      ui.uploaded.textContent = String(event.received) + " B";
+      ui.uploads.textContent = String(event.uploads);
+      break;
+    case "note":
+      ui.revision.textContent = String(event.rev);
+      ui.notes.textContent = String(event.notes);
+      break;
+    default:
+      break;
+  }
+
+  log(channel, JSON.stringify(event));
+}
+
+/** Read newline-delimited events off a stream until the peer finishes. */
+async function readEvents(reader, channel) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, end).trim();
+        buffer = buffer.slice(end + 1);
+        if (!line) continue;
+        try { patch(JSON.parse(line), channel); } catch (err) { log(channel, "unparsed: " + line); }
+      }
+      if (done) return;
+    }
+  } catch (err) {
+    log(channel, "stream ended: " + err);
+  }
+}
+
+let session = null;
+let feedWriter = null;
+let feedReader = null;
+let datagramWriter = null;
+let datagramReader = null;
+let uploadWriter = null;
+
+async function readDatagrams() {
+  try {
+    for await (const datagram of session.datagrams.readable) {
+      const text = new TextDecoder().decode(datagram);
+      try { patch(JSON.parse(text), "datagram"); } catch (err) { log("datagram", text); }
+    }
+  } catch (err) {
+    // The readable rejects when the session closes; that is the end of the channel, not a fault.
+  }
+}
+
+async function readServerStreams() {
+  try {
+    for await (const stream of session.incomingUnidirectionalStreams) {
+      const text = await new Response(stream).text();
+      ui.banner.textContent = text.trim();
+      log("uni", "server-opened stream: " + text.trim());
+    }
+  } catch (err) {
+    // Same as the datagram channel: a close ends the loop.
+  }
+}
+
+async function openSession() {
+  session = new WebTransport(ENDPOINT);
+  setStatus("connecting");
+  log("session", "dialing " + ENDPOINT.href);
+  await session.ready;
+  setStatus("open");
+  state.sessions++;
+  ui.sessions.textContent = String(state.sessions);
+  log("session", "ready (HTTP/3, " + ENDPOINT.host + ")");
+
+  session.closed.then(() => { setStatus("closed"); log("session", "closed"); })
+                 .catch((err) => { setStatus("failed"); log("session", "closed with " + err); });
+
+  datagramReader = session.datagrams.readable;
+  void readDatagrams();
+  void readServerStreams();
+  toggle(true);
+}
+
+async function subscribe() {
+  const stream = await session.createBidirectionalStream();
+  feedWriter = stream.writable.getWriter();
+  feedReader = stream.readable.getReader();
+  void readEvents(feedReader, "stream feed");
+  await feedWriter.write(new TextEncoder().encode("sub\n"));
+  log("stream feed", "subscribed");
+}
+
+async function tick(times) {
+  const payload = new TextEncoder().encode("tick\n");
+  for (let i = 0; i < times; i++) await feedWriter.write(payload);
+  log("stream feed", "sent " + times + " ticks");
+}
+
+async function upload(bytes) {
+  const stream = await session.createBidirectionalStream();
+  const writer = stream.writable.getWriter();
+  void readEvents(stream.readable.getReader(), "stream upload");
+  await writer.write(new TextEncoder().encode("upload:" + bytes + "\n"));
+
+  const chunk = new Uint8Array(8192);
+  for (let i = 0; i < chunk.length; i++) chunk[i] = i & 0xff;
+  let sent = 0;
+  while (sent < bytes) {
+    await writer.write(chunk);
+    sent += chunk.length;
+    if (sent === 16384) tick(5); // prove the feed keeps flowing mid-upload
+  }
+  await writer.close();
+  log("stream upload", "wrote " + sent + " bytes and finished the stream");
+}
+
+async function note() {
+  if (!datagramWriter) datagramWriter = session.datagrams.writable.getWriter();
+  const text = "note: hello from the page at " + new Date().toISOString();
+  await datagramWriter.write(new TextEncoder().encode(text));
+  log("datagram", "sent " + text);
+}
+
+async function reconnect() {
+  log("session", "closing to reconnect");
+  try { session.close(); } catch (err) { /* already closed */ }
+  await new Promise((resolve) => { if (!session) return resolve(); session.closed.then(resolve).catch(resolve); });
+  await openSession();
+  await subscribe();
+  log("session", "resubscribed; snapshot carries the revision the events were missed at");
+}
+
+function close() {
+  if (session) session.close();
+}
+
+const CONTROLS = ["subscribe", "tick", "upload", "note", "reconnect", "close"];
+
+function toggle(enabled) {
+  for (const id of CONTROLS) document.getElementById(id).disabled = !enabled;
+}
+
+document.getElementById("open").addEventListener("click", () => openSession().catch((err) => log("session", "open failed: " + err)));
+document.getElementById("subscribe").addEventListener("click", () => subscribe().catch((err) => log("session", err)));
+document.getElementById("tick").addEventListener("click", () => tick(5).catch((err) => log("session", err)));
+document.getElementById("upload").addEventListener("click", () => upload(65536).catch((err) => log("session", err)));
+document.getElementById("note").addEventListener("click", () => note().catch((err) => log("session", err)));
+document.getElementById("reconnect").addEventListener("click", () => reconnect().catch((err) => log("session", err)));
+document.getElementById("close").addEventListener("click", close);
+
+// The same surface the buttons drive, for a test harness reading the patched state back.
+window.liveview = { openSession, subscribe, tick, upload, note, reconnect, close, state, ui };
+</script>
+</body>
+</html>
