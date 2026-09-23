@@ -47,6 +47,18 @@ const SESSION_PATH: []const u8 = "/tasks";
 /// The page, embedded so the binary runs from any working directory.
 const PAGE: []const u8 = @embedFile("webtransport_tasks.html");
 
+/// The build marker a source edit bumps, and the placeholder it replaces in the page. The page renders it
+/// and reports it back, so a change that never reached the browser fails the development loop's check
+/// instead of being assumed to have arrived.
+const dev_token: []const u8 = "d0";
+const dev_placeholder = "__DEV_TOKEN__";
+
+/// The page as this process serves it, and a version for it: an edit anywhere in the page, the token, or the
+/// code that renders them changes the version, and the browser reloads when the version it polls changes.
+var served_page: [PAGE.len + 64]u8 = undefined;
+var served_page_len: usize = 0;
+var served_version: u64 = 0;
+
 /// Event bytes one poll may hand to a session at once, the longest line one event can be, and how much
 /// undelivered patch text one view may hold before it is re-snapshotted instead.
 const patches_per_poll = 32;
@@ -121,18 +133,61 @@ var current_io: std.Io = undefined;
 
 // --------------------------------------------------------- //
 
-fn page(_: *zix.Http1.Request, res: *zix.Http1.Response, _: *zix.Http1.Context) !void {
+fn page(req: *zix.Http1.Request, res: *zix.Http1.Response, _: *zix.Http1.Context) !void {
+    const path = req.path();
+
+    // The version the development loop polls: it changes exactly when the bytes this server serves change.
+    if (std.mem.eql(u8, path, "/devloop/version")) {
+        var body_buf: [24]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, "{x}\n", .{served_version}) catch return;
+
+        return sendText(res, body);
+    }
+
+    // The browser's own report that it rendered the changed behaviour and finished a durable action.
+    if (std.mem.startsWith(u8, path, "/verified")) {
+        std.debug.print("[devloop] verified {s}\n", .{path["/verified".len..]});
+
+        return sendText(res, "ok\n");
+    }
+
     var head_buf: [192]u8 = undefined;
     var head = std.Io.Writer.fixed(&head_buf);
-    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n\r\n", .{PAGE.len}) catch return;
+    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n\r\n", .{served_page_len}) catch return;
 
     try res.sendRaw(head.buffered());
-    try res.sendRaw(PAGE);
+    try res.sendRaw(served_page[0..served_page_len]);
+}
+
+fn sendText(res: *zix.Http1.Response, body: []const u8) !void {
+    var head_buf: [128]u8 = undefined;
+    var head = std.Io.Writer.fixed(&head_buf);
+    head.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nCache-Control: no-store\r\n\r\n", .{body.len}) catch return;
+
+    try res.sendRaw(head.buffered());
+    try res.sendRaw(body);
+}
+
+/// Compose the page this process serves: the embedded file with the build token substituted in.
+fn preparePage() void {
+    const marker = std.mem.indexOf(u8, PAGE, dev_placeholder) orelse {
+        @memcpy(served_page[0..PAGE.len], PAGE);
+        served_page_len = PAGE.len;
+
+        return;
+    };
+
+    @memcpy(served_page[0..marker], PAGE[0..marker]);
+    @memcpy(served_page[marker..][0..dev_token.len], dev_token);
+    const rest = PAGE[marker + dev_placeholder.len ..];
+    @memcpy(served_page[marker + dev_token.len ..][0..rest.len], rest);
+
+    served_page_len = PAGE.len - dev_placeholder.len + dev_token.len;
 }
 
 fn root(_: *const zix.Http3.Request, res: *zix.Http3.Response, _: *zix.Http3.Context) !void {
     res.content_type = "text/html; charset=utf-8";
-    res.send(PAGE);
+    res.send(served_page[0..served_page_len]);
 }
 
 // --------------------------------------------------------- //
@@ -505,6 +560,8 @@ fn writeLine(stream: *const zix.Webtransport.Stream, line: []const u8) void {
 
 pub fn main(process: std.process.Init) !void {
     current_io = process.io;
+    preparePage();
+    served_version = std.hash.Fnv1a_64.hash(served_page[0..served_page_len]);
 
     // The demo owns its database rows: start from a clean slice so the page and the log agree on what is
     // there. A deployment would migrate instead, and never truncate.

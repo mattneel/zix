@@ -85,6 +85,7 @@
       <dt>patches</dt><dd id="patches">0</dd>
       <dt>duplicates</dt><dd id="duplicates">0</dd>
       <dt>sessions</dt><dd id="sessions">0</dd>
+      <dt>build</dt><dd id="build">—</dd>
       <dt>last key</dt><dd id="last-key" class="hint">—</dd>
       <dt>transient</dt><dd id="transient" class="hint">—</dd>
     </dl>
@@ -105,17 +106,24 @@
 <script>
 "use strict";
 
+const DEV_TOKEN = "__DEV_TOKEN__";
+const DEV_MARK = "m0";
+
 const ENDPOINT = new URL("/tasks", location.href);
 const state = { sessions: 0, patches: 0, duplicates: 0, events: 0, revision: 0, lastKey: null };
 
 const ui = {};
 for (const id of ["status", "whoami", "revision", "task-count", "worker", "patches", "duplicates", "sessions",
-                  "last-key", "transient", "result", "applied", "event-count", "events", "tasks",
+                  "last-key", "transient", "result", "applied", "event-count", "events", "tasks", "build",
                   "principal", "tenant", "title", "create", "resubmit", "subscribe", "open"]) {
   ui[id] = document.getElementById(id);
 }
 
 const CONTROLS = ["subscribe", "principal", "tenant", "title", "create", "resubmit"];
+
+// What this page was built from, rendered into the DOM like any other state: the development-loop benchmark
+// reads it back out of the DOM, so a change that never reached the browser fails rather than flatters.
+ui.build.textContent = DEV_TOKEN + "·" + DEV_MARK;
 
 function log(channel, text) {
   const li = document.createElement("li");
@@ -320,6 +328,54 @@ ui.resubmit.addEventListener("click", () => create(state.lastKey).catch((err) =>
 
 // The same surface the buttons drive, for a test harness reading the patched state back.
 window.tasks = { openSession, subscribe, create, state, ui };
+
+/// The development loop's own client. With `?devloop` this page keeps checking the build it is running
+/// against, reloads itself the moment the server serves a different one, and then proves the whole path
+/// again from scratch: dial, subscribe, submit a durable action, wait for the completion patch, and read the
+/// changed behaviour out of the DOM. That report is what the benchmark's stopwatch ends on.
+async function devloop() {
+  let seen = null;
+  setInterval(async () => {
+    try {
+      const response = await fetch("/devloop/version", { cache: "no-store" });
+      const version = (await response.text()).trim();
+      if (seen === null) {
+        seen = version;
+      } else if (version !== seen) {
+        seen = version;
+        location.reload();
+      }
+    } catch (err) {
+      // The server is being rebuilt or restarted: the next poll picks the new build up.
+    }
+  }, 50);
+
+  await openSession();
+  await subscribe();
+  await create(null);
+  await tick(3);
+
+  const deadline = Date.now() + 20000;
+  while (Date.now() < deadline) {
+    const row = document.querySelector("#tasks tr td.state span");
+    const build = (document.querySelector("#build") || {}).textContent || "";
+    if (row && row.textContent === "completed" && build === DEV_TOKEN + "·" + DEV_MARK) {
+      await fetch("/verified?token=" + encodeURIComponent(DEV_TOKEN) + "&mark=" + encodeURIComponent(DEV_MARK));
+      return;
+    }
+    await sleepFor(100);
+  }
+
+  await fetch("/verified?token=none&mark=none");
+}
+
+function sleepFor(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+if (location.search.includes("devloop")) {
+  devloop().catch((err) => log("session", "devloop failed: " + err));
+}
 </script>
 </body>
 </html>

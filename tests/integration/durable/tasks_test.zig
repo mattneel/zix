@@ -250,13 +250,74 @@ test "durable tasks: a crashed worker's job is recovered after its lease expires
 
     // Worker B finishes it. The lease's own slices stay valid until the call that uses them, which is why
     // nothing resets the store's arena in between.
-    const done = try store.complete(recovered.?, "recovered");
+    const done = switch (try store.complete(recovered.?, "recovered")) {
+        .committed => |rev| rev,
+        .not_owner => return error.JobWasTakenOver,
+    };
 
     const finished = try store.snapshot(t4);
     try testing.expectEqualStrings("completed", finished.tasks[0].state);
     try testing.expectEqualStrings("recovered", finished.tasks[0].result.?);
     try testing.expectEqual(@as(i64, 2), finished.tasks[0].attempts);
     try testing.expectEqual(done, finished.rev);
+}
+
+test "durable tasks: a worker whose lease expired cannot complete the job another worker holds" {
+    var harness = Harness.init();
+    defer harness.deinit();
+
+    var tenant_buf: [32]u8 = undefined;
+    const t = try harness.tenant(&tenant_buf, "t-ownership");
+
+    var store = try harness.openStore();
+    defer store.deinit();
+
+    try store.truncate();
+    try harness.principal(&store, t, "alice");
+    _ = try store.create(.{ .principal = "alice", .tenant = t, .idempotency_key = "k1", .title = "one job, two workers" });
+
+    // Worker A takes the job with a lease short enough to expire while it works.
+    const stale = (try store.lease(200)).?;
+    try testing.expectEqual(@as(i64, 1), stale.attempts);
+
+    // The lease expires and worker B takes over: the job now belongs to attempt 2.
+    var taken_over: ?tasks.Lease = null;
+    var waited_ms: usize = 0;
+    while (taken_over == null and waited_ms < 5_000) : (waited_ms += 100) {
+        harness.io().sleep(.fromMilliseconds(100), .awake) catch {};
+        taken_over = try store.lease(5_000);
+    }
+    try testing.expect(taken_over != null);
+    try testing.expectEqual(@as(i64, 2), taken_over.?.attempts);
+
+    const conn = try harness.conn();
+    defer conn.deinit();
+
+    // Worker A finishes late. Its completion must be refused — inside its own transaction — rather than
+    // overwriting the attempt that owns the job now, and it must leave no event behind.
+    // Create and both leases have each published one event; a refused completion adds none.
+    try testing.expect((try store.complete(stale, "the slower worker's answer")) == .not_owner);
+    try testing.expectEqual(@as(i64, 3), try countOf(conn, outbox_in, t));
+
+    const during = try store.snapshot(t);
+    try testing.expectEqualStrings("running", during.tasks[0].state);
+    try testing.expectEqual(@as(i64, 2), during.tasks[0].attempts);
+    try testing.expect(during.tasks[0].result == null);
+
+    // Worker B, the current owner, completes normally.
+    const committed = switch (try store.complete(taken_over.?, "the worker that owns it")) {
+        .committed => |rev| rev,
+        .not_owner => return error.OwnerRefusedCompletion,
+    };
+
+    const after = try store.snapshot(t);
+    try testing.expectEqualStrings("completed", after.tasks[0].state);
+    try testing.expectEqualStrings("the worker that owns it", after.tasks[0].result.?);
+    try testing.expectEqual(committed, after.rev);
+
+    // A double completion by the same worker is refused too: the job is done, not running.
+    try testing.expect((try store.complete(taken_over.?, "again")) == .not_owner);
+    try testing.expectEqual(@as(i64, 4), try countOf(conn, outbox_in, t));
 }
 
 test "durable tasks: a crash after the commit, before publication, still delivers" {
@@ -300,7 +361,7 @@ test "durable tasks: a crash after the commit, before publication, still deliver
 
     // The lease and the completion also land in the outbox, and both reach the view.
     const lease = (try store.lease(5_000)).?;
-    _ = try store.complete(lease, "ok");
+    try testing.expect((try store.complete(lease, "ok")) == .committed);
     try testing.expectEqual(@as(usize, 2), try dispatcher.runOnce());
 
     const rest = feed.drain(t5, cursor, &buf);

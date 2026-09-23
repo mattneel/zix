@@ -126,6 +126,15 @@ pub const Outcome = union(enum) {
     rejected: []const u8,
 };
 
+pub const Completion = union(enum) {
+    /// The job was still this attempt's to finish: the task, the job and the outbox row committed together.
+    committed: i64,
+    /// Another attempt owns the job now, so nothing was written. This is what a worker whose lease expired
+    /// and was taken over gets: its result must not overwrite the newer attempt's, and its event must not
+    /// reach a view.
+    not_owner,
+};
+
 pub const Snapshot = struct {
     rev: i64,
     tasks: []const Task,
@@ -385,19 +394,33 @@ pub const Store = struct {
         };
     }
 
-    /// Complete a leased job: the task update, the job completion, and the outbox row commit together.
-    /// Returns the revision the completion landed at.
-    pub fn complete(self: *Store, held: Lease, result: []const u8) !i64 {
+    /// Complete a leased job: the task update, the job completion, and the outbox row commit together, and
+    /// only if this attempt still owns the job.
+    ///
+    /// Note:
+    /// - Ownership is checked inside the same transaction as the writes it guards, against `attempts` — the
+    ///   token every lease bumps. A worker whose lease expired and was taken over therefore cannot complete
+    ///   a job another attempt holds: it gets `.not_owner`, writes nothing, and produces no event. Without
+    ///   that check, lease expiry would be a duplicate execution rather than a recovery, and the slower of
+    ///   two workers would decide the result.
+    pub fn complete(self: *Store, held: Lease, result: []const u8) !Completion {
         const conn = try self.pool.acquire();
         defer self.pool.release(conn);
 
         var tx = try conn.begin();
         defer tx.rollback();
 
+        const owned = try tx.queryRow(IdRow,
+            \\UPDATE jobs SET state = 'done', lease_until = NULL
+            \\WHERE id = $1 AND attempts = $2 AND state = 'running'
+            \\RETURNING id::int8 AS id
+        , .{ held.job_id, held.attempts });
+
+        if (owned == null) return .not_owner;
+
         const rev = try nextRevision(&tx, held.tenant_id);
 
         _ = try tx.exec("UPDATE tasks SET state = 'completed', result = $2, updated_rev = $3 WHERE id = $1", .{ held.task_id, result, rev });
-        _ = try tx.exec("UPDATE jobs SET state = 'done', lease_until = NULL WHERE id = $1", .{held.job_id});
 
         var payload_buf: [512]u8 = undefined;
         const payload = try renderTaskEvent(&payload_buf, rev, "task_completed", held.task_id, held.title, "completed", held.attempts, result);
@@ -405,7 +428,7 @@ pub const Store = struct {
 
         try tx.commit();
 
-        return rev;
+        return .{ .committed = rev };
     }
 
     /// The unpublished outbox rows, oldest first. Nothing is marked here: the dispatcher marks a row
@@ -638,6 +661,9 @@ pub const Worker = struct {
     work_ms: u64 = 20,
     done: u64 = 0,
 
+    /// Completions this worker dropped because another attempt owned the job by then.
+    lost: u64 = 0,
+
     pub fn runOnce(self: *Worker) !bool {
         const lease = (try self.store.lease(self.lease_ms)) orelse return false;
 
@@ -648,8 +674,14 @@ pub const Worker = struct {
         var result_buf: [64]u8 = undefined;
         const result = try std.fmt.bufPrint(&result_buf, "done by {s}", .{self.id});
 
-        _ = try self.store.complete(lease, result);
-        self.done += 1;
+        switch (try self.store.complete(lease, result)) {
+            .committed => self.done += 1,
+            .not_owner => {
+                // The lease expired while this worker was working and someone else took the job. The result is
+                // dropped: the attempt that owns it now decides what the task becomes.
+                self.lost += 1;
+            },
+        }
 
         return true;
     }
