@@ -20,7 +20,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 # lego rather than certbot: it has a Spaceship DNS provider, and a DNS-01 challenge needs nothing inbound -
 # no port 80 through a proxy, no HTTP surface on a machine whose whole point is that TLS ends inside it.
-RUN curl -fsSL https://github.com/go-acme/lego/releases/latest/download/lego_v4.25.0_linux_amd64.tar.gz \
+RUN curl -fsSL https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_amd64.tar.gz \
     | tar -xz -C /usr/local/bin lego
 WORKDIR /app
 COPY --from=build /out/bin/zix-example-webtransport_tasks-x86_64-linux-debug /app/zix-demo
