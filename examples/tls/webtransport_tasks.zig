@@ -39,7 +39,7 @@ const PORT: u16 = 9444;
 /// reload while the server is being rebuilt — and the development loop is exactly a rebuild followed by a
 /// reload. Serving the page on TCP keeps reload (and the version poll that triggers it) independent of the
 /// QUIC server's lifecycle, while the session still goes to the QUIC port.
-const PAGE_PORT: u16 = 9445;
+
 /// Where the durable store lives. Every example in this repository points at a fixed local database; this
 /// is the one it points at.
 const DSN: []const u8 = "postgres://zix:zix@127.0.0.1:5432/zix_dev";
@@ -610,7 +610,7 @@ pub fn main(process: std.process.Init) !void {
     var page_server = zix.Http1.Server.init(page, .{
         .io = process.io,
         .ip = IP,
-        .port = PAGE_PORT,
+        .port = PORT,
         .tls = &page_tls,
         .dispatch_model = if (builtin.os.tag == .linux) .URING else .ASYNC,
         .workers = 1,
@@ -654,7 +654,7 @@ pub fn main(process: std.process.Init) !void {
     }.serve, .{&page_server});
     page_thread.detach();
 
-    log("page https://{s}:{d}/ · session https://{s}:{d}{s}", .{ IP, PAGE_PORT, IP, PORT, SESSION_PATH });
+    log("page https://{s}:{d}/ · session https://{s}:{d}{s} (same origin: TCP serves the page, UDP serves HTTP/3)", .{ IP, PORT, IP, PORT, SESSION_PATH });
 
     try tasks_server.run();
 }

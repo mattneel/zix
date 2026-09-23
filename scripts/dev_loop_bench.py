@@ -53,7 +53,7 @@ CHROME = Path(
 SPKI = "icvjpo9jth21Jte9ZDs5vIYTVbMdL4UUewni7JD1ZsI="
 # The session's QUIC port (the origin Chrome is told to force QUIC on) and the page's TCP port.
 QUIC_PORT = 9444
-PAGE_PORT = 9445
+PAGE_PORT = 9444
 
 # Each edit is a list of (file, old, new) where `new` may carry a {mark} the runner fills in per iteration.
 # The token lives in the Zig source (the server substitutes it into the page); the mark lives in the page
