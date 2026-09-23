@@ -16,6 +16,8 @@
 
 const std = @import("std");
 
+const varint = @import("varint.zig");
+
 /// Select the packet-number encoding length in bytes (RFC 9000 17.1, Appendix A.2): the sender MUST
 /// use a size able to represent more than twice the range of unacknowledged packet numbers.
 pub fn packetNumberLength(full_pn: u64, largest_acked: ?u64) usize {
@@ -117,6 +119,35 @@ pub fn parseLongHeader(data: []const u8) ParseError!LongHeader {
         .scid = scid,
         .rest = data[pos..],
     };
+}
+
+/// Where one long-header packet sits inside the datagram that carried it: the byte index of its packet
+/// number and the byte index one past its AEAD tag. A long header carries a Length field covering the
+/// packet number, the payload, and the tag (RFC 9000 17.2), which is what makes a datagram holding
+/// several packets (RFC 9000 12.2) walkable.
+pub const PacketBounds = struct { pn_offset: usize, end: usize };
+
+/// The bounds of the long-header packet at the start of `data`, or null when the header, the Token
+/// Length, or the Length field is malformed or runs past the buffer.
+pub fn longPacketBounds(data: []const u8) ?PacketBounds {
+    const hdr = parseLongHeader(data) catch return null;
+
+    var pos = data.len - hdr.rest.len;
+
+    // An Initial carries a Token Length and a Token before its Length field; the other long-header types
+    // do not (RFC 9000 17.2).
+    if (hdr.packet_type == 0) {
+        const token = varint.read(data[pos..]) catch return null;
+        pos += token.len + @as(usize, @intCast(token.value));
+        if (pos > data.len) return null;
+    }
+
+    const length = varint.read(data[pos..]) catch return null;
+    const span: usize = std.math.cast(usize, length.value) orelse return null;
+    const pn_offset = pos + length.len;
+    if (pn_offset + span > data.len) return null;
+
+    return .{ .pn_offset = pn_offset, .end = pn_offset + span };
 }
 
 /// A version-1 short header (1-RTT) packet split into its fields (RFC 9000 17.3). The Destination

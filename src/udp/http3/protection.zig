@@ -5,6 +5,10 @@
 //!   step of the handshake: a server opens the client's Initial with the DCID-derived client keys
 //!   (crypto.zig), recovers the packet number, and returns the decrypted frame payload (CRYPTO +
 //!   PADDING) for the frame parser.
+//! - The packet is bounded by its own Length field, not by the end of the datagram (RFC 9000 17.2): a
+//!   client is free to fill the rest of a datagram after its Initial, and real clients do (aioquic pads
+//!   its first datagram past the packet). Reading the tag from the end of the datagram instead of the
+//!   end of the packet authenticates the wrong bytes and fails on every such client.
 //! - The send (seal) primitives live in crypto.zig. This module is the inverse: sample the
 //!   ciphertext, compute the header-protection mask, unmask the first byte and packet number, then
 //!   open the AEAD with the unprotected header as associated data.
@@ -45,19 +49,13 @@ pub const Opened = struct {
     payload: []const u8,
 };
 
-/// The packet-number offset for a long-header Initial (RFC 9000 17.2): the byte index where the
-/// protected packet number begins, after the Token Length + Token and the Length field.
-fn initialPnOffset(data: []const u8, hdr: packet.LongHeader) OpenError!usize {
-    var pos = data.len - hdr.rest.len;
+/// The bounds of a long-header Initial (RFC 9000 17.2): where its packet number starts and where the
+/// packet ends. Shares the walk with the coalesced-packet loop (packet.longPacketBounds), so the server
+/// and the demux agree on where one packet stops.
+fn initialBounds(data: []const u8, hdr: packet.LongHeader) OpenError!packet.PacketBounds {
+    if (hdr.packet_type != 0) return error.ZixNotInitial;
 
-    const token = varint.read(data[pos..]) catch return error.ZixTruncated;
-    pos += token.len + @as(usize, @intCast(token.value));
-    if (pos > data.len) return error.ZixTruncated;
-
-    const length = varint.read(data[pos..]) catch return error.ZixTruncated;
-    pos += length.len;
-
-    return pos;
+    return packet.longPacketBounds(data) orelse error.ZixTruncated;
 }
 
 /// Open a long-header Initial packet (RFC 9001 5.3 / 5.4). `keys` are the Initial keys for the
@@ -75,20 +73,17 @@ pub fn openInitial(data: []const u8, keys: crypto.AesKeys, out: []u8) OpenError!
     const hdr = packet.parseLongHeader(data) catch return error.ZixTruncated;
     if (hdr.packet_type != 0) return error.ZixNotInitial;
 
-    const pn_offset = try initialPnOffset(data, hdr);
+    const bounds = try initialBounds(data, hdr);
 
-    return openLongHeaderAt(data, keys, out, pn_offset);
+    return openLongHeaderAt(data, keys, out, bounds.pn_offset, bounds.end);
 }
 
-/// The packet-number offset for a long-header Handshake packet (RFC 9000 17.2): after the Length
-/// field. Unlike an Initial there is no Token Length / Token.
-fn handshakePnOffset(data: []const u8, hdr: packet.LongHeader) OpenError!usize {
-    var pos = data.len - hdr.rest.len;
+/// The bounds of a long-header Handshake packet (RFC 9000 17.2). Unlike an Initial there is no Token
+/// Length / Token, which the shared walk handles from the packet type.
+fn handshakeBounds(data: []const u8, hdr: packet.LongHeader) OpenError!packet.PacketBounds {
+    if (hdr.packet_type != 2) return error.ZixNotHandshake;
 
-    const length = varint.read(data[pos..]) catch return error.ZixTruncated;
-    pos += length.len;
-
-    return pos;
+    return packet.longPacketBounds(data) orelse error.ZixTruncated;
 }
 
 /// Open a long-header Handshake packet (RFC 9001 5.3 / 5.4). `keys` are the Handshake keys for the
@@ -97,14 +92,20 @@ pub fn openHandshake(data: []const u8, keys: crypto.AesKeys, out: []u8) OpenErro
     const hdr = packet.parseLongHeader(data) catch return error.ZixTruncated;
     if (hdr.packet_type != 2) return error.ZixNotHandshake;
 
-    const pn_offset = try handshakePnOffset(data, hdr);
+    const bounds = try handshakeBounds(data, hdr);
 
-    return openLongHeaderAt(data, keys, out, pn_offset);
+    return openLongHeaderAt(data, keys, out, bounds.pn_offset, bounds.end);
 }
 
 /// Remove header protection and AEAD-decrypt a long-header packet whose packet number begins at
-/// `pn_offset`. Shared by `openInitial` and `openHandshake`.
-fn openLongHeaderAt(data: []const u8, keys: crypto.AesKeys, out: []u8, pn_offset: usize) OpenError!Opened {
+/// `pn_offset` and whose last byte (the AEAD tag's) is at `packet_end`. Shared by `openInitial` and
+/// `openHandshake`.
+///
+/// Note:
+/// - `data` may hold more than this packet: the bytes after `packet_end` belong to whatever the sender
+///   put next in the datagram (a coalesced packet, or the padding a client adds to reach the 1200-byte
+///   floor outside the packet). They take no part in this packet's AEAD.
+fn openLongHeaderAt(data: []const u8, keys: crypto.AesKeys, out: []u8, pn_offset: usize, packet_end: usize) OpenError!Opened {
     // Header-protection sample: 16 bytes starting at pn_offset + 4 (RFC 9001 5.4.2).
     const sample_offset = pn_offset + 4;
     if (data.len < sample_offset + 16) return error.ZixTruncated;
@@ -118,7 +119,8 @@ fn openLongHeaderAt(data: []const u8, keys: crypto.AesKeys, out: []u8, pn_offset
     const pn_len: usize = @as(usize, first & 0x03) + 1;
 
     const header_len = pn_offset + pn_len;
-    if (data.len < header_len + Aes128Gcm.tag_length) return error.ZixTruncated;
+    if (packet_end < header_len + Aes128Gcm.tag_length) return error.ZixTruncated;
+    if (packet_end > data.len) return error.ZixTruncated;
 
     // Rebuild the unprotected header for the AEAD associated data: the unmasked first byte and the
     // unmasked packet-number bytes, the rest copied verbatim.
@@ -137,12 +139,14 @@ fn openLongHeaderAt(data: []const u8, keys: crypto.AesKeys, out: []u8, pn_offset
     // First Initial: no prior largest, so the recovered number is the truncated value.
     const full_pn = truncated_pn;
 
+    // A long-header packet ends where its Length field says it does, not at the end of the datagram:
+    // the bytes after it belong to whatever the sender coalesced or padded after it (RFC 9000 17.2).
     const nonce = crypto.aeadNonce(keys.iv, full_pn);
-    const ciphertext = data[header_len .. data.len - Aes128Gcm.tag_length];
+    const ciphertext = data[header_len .. packet_end - Aes128Gcm.tag_length];
     if (ciphertext.len > out.len) return error.ZixTruncated;
 
     var tag: [Aes128Gcm.tag_length]u8 = undefined;
-    @memcpy(&tag, data[data.len - Aes128Gcm.tag_length ..]);
+    @memcpy(&tag, data[packet_end - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length]);
 
     Aes128Gcm.decrypt(out[0..ciphertext.len], ciphertext, tag, hdr_buf[0..header_len], nonce, keys.key) catch return error.ZixDecrypt;
 
@@ -173,7 +177,9 @@ pub fn openShort(data: []const u8, keys: crypto.AesKeys, dcid_len: usize, larges
     @memcpy(&sample, data[sample_offset .. sample_offset + 16]);
     const mask = crypto.headerMaskAes(keys.hp, sample);
 
-    // Short header: header protection masks the low 5 bits of the first byte (RFC 9001 5.4.1).
+    // Short header: header protection masks the low 5 bits of the first byte (RFC 9001 5.4.1). A short
+    // header carries no Length field, so this packet runs to the end of the datagram: it is always the
+    // last packet in one (RFC 9000 12.2).
     const first = data[0] ^ (mask[0] & 0x1f);
     const pn_len: usize = @as(usize, first & 0x03) + 1;
 
@@ -196,12 +202,14 @@ pub fn openShort(data: []const u8, keys: crypto.AesKeys, dcid_len: usize, larges
     // packet has no prior largest, so its number is the wire value as-is.
     const full_pn = if (largest_pn) |lp| packet.decodePacketNumber(lp, truncated_pn, @intCast(pn_len * 8)) else truncated_pn;
 
+    // A short-header packet has no Length field, so its payload runs to the end of the datagram it
+    // arrived in (RFC 9000 17.3): the tag is the last 16 bytes of `data`.
     const nonce = crypto.aeadNonce(keys.iv, full_pn);
     const ciphertext = data[header_len .. data.len - Aes128Gcm.tag_length];
     if (ciphertext.len > out.len) return error.ZixTruncated;
 
     var tag: [Aes128Gcm.tag_length]u8 = undefined;
-    @memcpy(&tag, data[data.len - Aes128Gcm.tag_length ..]);
+    @memcpy(&tag, data[data.len - Aes128Gcm.tag_length ..][0..Aes128Gcm.tag_length]);
 
     Aes128Gcm.decrypt(out[0..ciphertext.len], ciphertext, tag, hdr_buf[0..header_len], nonce, keys.key) catch return error.ZixDecrypt;
 

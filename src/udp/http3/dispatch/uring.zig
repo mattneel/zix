@@ -16,6 +16,7 @@ const datagram = @import("../../datagram.zig");
 const recovery = @import("../recovery.zig");
 const reassembly = @import("../reassembly.zig");
 const common = @import("common.zig");
+const wt_pool = @import("../webtransport/pool.zig");
 const reuseport = @import("../../../multiplexers/reuseport.zig");
 const listen_report = @import("../../../multiplexers/listen_report.zig");
 const epoll = @import("epoll.zig");
@@ -295,26 +296,29 @@ fn workerLoopUring(comptime handler: core.HandlerFn, config: Http3ServerConfig, 
     var pool = common.openReassemblyPool(config) catch return;
     defer pool.deinit(config.allocator);
 
+    var wt_pool_handle = common.openWebtransportPool(config);
+    defer if (wt_pool_handle) |*opened| opened.deinit(config.allocator);
+
     var tx = UringTx.init(config.allocator, config.send_batch, common.sendBufBytes(config)) catch return;
     defer tx.deinit();
 
     tx.setGso(config.gso_enabled and datagram.probeGso(fd));
 
-    runRecvLoop(handler, &ring, fd, table, &pool, &tx, config, worker_id);
+    runRecvLoop(handler, &ring, fd, table, &pool, if (wt_pool_handle) |*opened| opened else null, &tx, config, worker_id);
 }
 
 /// Drive receives on the ring: set up the multishot provided buffer ring and run the multishot loop, or
 /// fall back to the one-shot recvmsg slot pool when the buffer ring cannot be registered (older kernel).
-fn runRecvLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.socket_t, table: *common.ConnTable, pool: *reassembly.Pool, tx: *UringTx, config: Http3ServerConfig, worker_id: usize) void {
+fn runRecvLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.socket_t, table: *common.ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, tx: *UringTx, config: Http3ServerConfig, worker_id: usize) void {
     const buf_size = std.mem.alignForward(usize, recvmsg_out_hdr + mshot_name_reserve + config.max_recv_buf, 16);
 
     const br = IoUring.setup_buf_ring(ring.fd, uring_ring_bufs, uring_buf_group, .{ .inc = false }) catch
-        return runOneShotLoop(handler, ring, fd, table, pool, tx, config, worker_id);
+        return runOneShotLoop(handler, ring, fd, table, pool, wt_pool_ptr, tx, config, worker_id);
     defer IoUring.free_buf_ring(ring.fd, br, uring_ring_bufs, uring_buf_group);
     IoUring.buf_ring_init(br);
 
     const backing = config.allocator.alloc(u8, uring_ring_bufs * buf_size) catch
-        return runOneShotLoop(handler, ring, fd, table, pool, tx, config, worker_id);
+        return runOneShotLoop(handler, ring, fd, table, pool, wt_pool_ptr, tx, config, worker_id);
     defer config.allocator.free(backing);
 
     const mask = IoUring.buf_ring_mask(uring_ring_bufs);
@@ -386,7 +390,7 @@ fn runRecvLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.s
                     const used = @min(@as(usize, @intCast(cqe.res)), buf_size);
                     if (parseMultishotBuf(buf[0..used], mshot_name_reserve, msg.controllen, config.max_recv_buf)) |parsed| {
                         stats.datagrams += 1;
-                        common.serveDatagram(handler, table, pool, .{ .data = parsed.payload, .from = parsed.peer }, tx.active(), fd, config, &stats);
+                        common.serveDatagram(handler, table, pool, wt_pool_ptr, .{ .data = parsed.payload, .from = parsed.peer }, tx.active(), fd, config, &stats);
                     }
                 }
 
@@ -403,7 +407,7 @@ fn runRecvLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.s
         // sends. At most once per interval however often a completion wakes the worker.
         const now_us = recovery.nowUs();
         if (now_us -| last_sweep_us >= common.maintenance_interval_us) {
-            common.sweepMaintenance(table, tx.active(), fd, config, now_us, &stats);
+            common.sweepMaintenance(handler, table, wt_pool_ptr, tx.active(), fd, config, now_us, &stats);
             last_sweep_us = now_us;
         }
 
@@ -421,7 +425,7 @@ fn runRecvLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.s
 /// The one-shot recvmsg fallback (still io_uring): a pool of recvmsg submissions stays in flight, one
 /// buffer + sockaddr + msghdr per slot, and each completion hands back the bytes and peer address by slot
 /// index, re-armed per datagram. Used when the provided buffer ring cannot be registered.
-fn runOneShotLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.socket_t, table: *common.ConnTable, pool: *reassembly.Pool, tx: *UringTx, config: Http3ServerConfig, worker_id: usize) void {
+fn runOneShotLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.socket_t, table: *common.ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, tx: *UringTx, config: Http3ServerConfig, worker_id: usize) void {
     const bufs = config.allocator.alloc(u8, uring_recv_slots * config.max_recv_buf) catch return;
     defer config.allocator.free(bufs);
     const names = config.allocator.alloc(std.posix.sockaddr.in6, uring_recv_slots) catch return;
@@ -504,7 +508,7 @@ fn runOneShotLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posi
             if (cqe.res > 0) {
                 const len: usize = @min(@as(usize, @intCast(cqe.res)), config.max_recv_buf);
                 stats.datagrams += 1;
-                common.serveDatagram(handler, table, pool, .{ .data = bufs[slot * config.max_recv_buf ..][0..len], .from = names[slot] }, tx.active(), fd, config, &stats);
+                common.serveDatagram(handler, table, pool, wt_pool_ptr, .{ .data = bufs[slot * config.max_recv_buf ..][0..len], .from = names[slot] }, tx.active(), fd, config, &stats);
             }
 
             if (!armUringRecv(ring, &msgs[slot], slot, fd)) {
@@ -517,7 +521,7 @@ fn runOneShotLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posi
         // sends. At most once per interval however often a completion wakes the worker.
         const now_us = recovery.nowUs();
         if (now_us -| last_sweep_us >= common.maintenance_interval_us) {
-            common.sweepMaintenance(table, tx.active(), fd, config, now_us, &stats);
+            common.sweepMaintenance(handler, table, wt_pool_ptr, tx.active(), fd, config, now_us, &stats);
             last_sweep_us = now_us;
         }
 

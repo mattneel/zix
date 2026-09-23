@@ -81,6 +81,7 @@
     - [Channel](./README-en.md#channel)
     - [UDP](./README-en.md#udp)
     - [HTTP/3](./README-en.md#http3)
+    - [WebTransport](./README-en.md#webtransport)
     - [WebRTC](./README-en.md#webrtc)
     - [Logger](./README-en.md#logger)
     - [JSON (jzon)](./README-en.md#json-jzon)
@@ -107,6 +108,7 @@
 | [`docs/hld-logger-en.md`](docs/hld-logger-en.md) | Logger: goals, API, log methods, formats, file rotation, protocol wiring |
 | [`docs/hld-tls-en.md`](docs/hld-tls-en.md) | TLS: goals, version policy, Tls.Context, handshake flow, engine integration, client |
 | [`docs/hld-http3-en.md`](docs/hld-http3-en.md) | HTTP/3 (QUIC): goals, runtime model, API, router, dispatch models, handshake, QPACK, memory model |
+| [`docs/hld-webtransport-en.md`](docs/hld-webtransport-en.md) | WebTransport over HTTP/3: goals, the two dialects, session negotiation, API, dispatch, flow control, memory model, security notes |
 | [`docs/hld-webrtc-en.md`](docs/hld-webrtc-en.md) | WebRTC: goals, runtime model, API, ICE-lite, data channels, media forwarding, dispatch models, memory model |
 | [`docs/lld-http-en.md`](docs/lld-http-en.md) | HTTP: internal data structures and algorithms |
 | [`docs/lld-http1-en.md`](docs/lld-http1-en.md) | HTTP/1: internal parsing, write helpers, router, EPOLL engine, WebSocket codec |
@@ -120,6 +122,7 @@
 | [`docs/lld-logger-en.md`](docs/lld-logger-en.md) | Logger: internal write buffer, spinlock, rotation algorithm |
 | [`docs/lld-tls-en.md`](docs/lld-tls-en.md) | TLS: wire / handshake / key-schedule / record internals, Tls.Context validate, serve paths |
 | [`docs/lld-http3-en.md`](docs/lld-http3-en.md) | HTTP/3 (QUIC): per-layer internals (crypto, packet, frame, flow, recovery, QPACK, connection, demux, dispatch) |
+| [`docs/lld-webtransport-en.md`](docs/lld-webtransport-en.md) | WebTransport: per-file internals (draft codepoints, capsules, datagrams, stream headers, session and pool), the engine hooks, the limits |
 | [`docs/lld-webrtc-en.md`](docs/lld-webrtc-en.md) | WebRTC: per-layer internals (demux, STUN, ICE, DTLS, SCTP, data channels, SDP, media, dispatch) |
 | [`docs/zix-deploy-en.md`](docs/zix-deploy-en.md) | Deployment: build a Docker image (zig fetch or vendor) and configure the TLS context for Ed25519 / ECDSA P-256 / RSA |
 | [`docs/zix-config-en.md`](docs/zix-config-en.md) | Config reference: every config field with its default, effect, and tuning trade-offs (server engines plus the TLS context) |
@@ -304,8 +307,8 @@ patched, so the supply chain is the Zig toolchain plus this repository.
 __*1. Full protocol stack under one roof:*__
 
 Tcp (raw), Udp, Uds (Unix domain sockets), Http (HTTP/1.1), Http1 (hot-path-optimized
-variant), Http2 (h2c), Http3 (HTTP/3 over QUIC), Webrtc (data channels and media), Grpc
-(gRPC over h2c), Fix (FIX 4.x), plus Channel and Logger.
+variant), Http2 (h2c), Http3 (HTTP/3 over QUIC, plus WebTransport over HTTP/3), Webrtc (data channels
+and media), Grpc (gRPC over h2c), Fix (FIX 4.x), plus Channel and Logger.
 
 > One coherent memory/threading model across monolith, micro-service, and
 modular-micro-service backends, instead of stitching together separate libraries with
@@ -434,9 +437,9 @@ TLS 1.3 with a TLS 1.2 floor, on `std.crypto`, no OpenSSL. Opt-in and additive: 
 
 __*16. HTTP/3 over QUIC, pure-Zig:*__
 
-`zix.Http3` serves HTTP/3 (RFC 9114) over QUIC (RFC 9000 / 9001 / 9002), built from the RFCs on `std.crypto`: packet protection, the TLS 1.3 handshake over CRYPTO streams, loss recovery, QPACK, and per-core dispatch on the `zix.Udp` substrate. Same comptime `Router` and `Tls.Context` as the TCP engines.
+`zix.Http3` serves HTTP/3 (RFC 9114) over QUIC (RFC 9000 / 9001 / 9002), built from the RFCs on `std.crypto`: packet protection, the TLS 1.3 handshake over CRYPTO streams, loss recovery, QPACK, and per-core dispatch on the `zix.Udp` substrate. Same comptime `Router` and `Tls.Context` as the TCP engines. `zix.Webtransport` extends it with WebTransport over HTTP/3 (RFC 9220 / 9297 / 9221): sessions, reliable data streams, and unreliable datagrams multiplexed on the same connection, speaking draft-ietf-webtrans-http3-16 and the deployed draft-07 dialect browsers still send.
 
-> The newest HTTP transport ships in-tree with no C QUIC library, sharing the router and TLS config already used for HTTP/1 and HTTP/2.
+> The newest HTTP transport ships in-tree with no C QUIC library, sharing the router and TLS config already used for HTTP/1 and HTTP/2, and the browser-facing WebTransport binding rides the same connection, certificate, and congestion controller.
 
 <br>
 
@@ -525,6 +528,7 @@ Buffer, socket, timeout, and cache fields keep the same names wherever a protoco
 | `response_cache` and the four `cache_*` fields | see [Response Cache Awareness](#response-cache-awareness-response_cache) | `zix.Http1`, `zix.Http`, `zix.Grpc` |
 | `process_queue_len` | `usize` | `zix.Http1`, `zix.Http` (`.URING` submission-queue park ring, see [Process Queue Awareness](#process-queue-awareness-process_queue_len)) |
 | `compress`, `compression_min_size`, `compression_max_out` | `bool` / `usize` / `usize` | `zix.Http1`, `zix.Http` |
+| `webtransport` | `zix.Webtransport.Config` | `zix.Http3` (WebTransport over HTTP/3: sessions, streams, datagrams, see [WebTransport](#webtransport)) |
 
 A few differences are by design, not drift:
 
@@ -566,6 +570,22 @@ The raw path (`zix.Udp.Raw`,) allocates its recv / send batches and worker-threa
 ### HTTP/2 and gRPC
 
 HTTP/2 and gRPC `.EPOLL` / `.URING` mux both pool stream slots per worker, so resident stream memory tracks concurrent streams rather than `max_streams` per connection. The thread-path model (`.ASYNC`) keeps a heap-allocated per-connection stream array (stack allocation of `max_streams` `Stream` structs would overflow the thread stack). Handlers receive the same `req`/`res`/`ctx` trio as every other engine (ADR-063): `ctx.allocator` is a per-request arena backed by a fixed stack buffer (no heap call), reset per request, not per connection.
+
+### WebTransport over HTTP/3
+
+`zix.Webtransport` is a feature of `zix.Http3`, so it adds one worker-owned pool and nothing per packet.
+
+| Scope | Allocator | Lifetime |
+| :- | :- | :- |
+| Worker pool (session slots, stream slots, send buffers, pre-session buffers) | `config.allocator`, once at worker start | Worker lifetime, released at worker exit |
+| Session slot | inside the pool | Session lifetime, recycled on close |
+| Data stream slot and its send buffer | inside the pool, one contiguous allocation for every buffer | Stream lifetime, recycled when both halves of the stream are finished |
+| Pre-session stream buffer | inside the pool | Until its session appears, or until the stream is refused |
+| Per-connection WebTransport state (`Connection.wt`) | inline in the connection slot | Connection lifetime, fixed size (no per-packet heap) |
+
+The receive path allocates nothing: sessions and streams come from the pool, and the pool returns null instead of growing, so a peer cannot make the server allocate. A worker's WebTransport memory cost is exactly `pool_streams * stream_send_bytes` plus `pool_orphan_streams * pool_orphan_bytes` (1 MiB of send buffers plus 8 KiB of orphan buffers at the defaults), paid once and independent of the connection count. `zix.Webtransport.capacityError` refuses a config that outgrows the compile-time ceilings rather than silently truncating the feature.
+
+The full pool sizing and the per-connection cost are in [`docs/hld-webtransport-en.md`](docs/hld-webtransport-en.md).
 
 For full memory details see [`docs/hld-http-en.md`](docs/hld-http-en.md) and [`docs/hld-udp-en.md`](docs/hld-udp-en.md). For threading models see [`docs/concurrency-en.md`](docs/concurrency-en.md).
 
@@ -2198,6 +2218,106 @@ curl --http3-only -k https://127.0.0.1:9063/
 **Example:** [examples/tls/http3_basic.zig](examples/tls/http3_basic.zig) (port 9063) serves `/`, a query-sum `/baseline2`, a 256 KiB `/big` that exercises the multi-packet streamed send path, a `/negotiated` that serves a brotli-precompressed body with `content-encoding: br` when the client accepts br, and an `/echo` that answers a POST with the byte count it received, whether that was the whole body, and the body itself.
 
 See [`docs/hld-http3-en.md`](docs/hld-http3-en.md) and [`docs/lld-http3-en.md`](docs/lld-http3-en.md) for the full design and per-layer internals.
+
+<br>
+
+### WebTransport
+
+`zix.Webtransport` is WebTransport over HTTP/3, served by `zix.Http3` on the QUIC connection it already owns: a browser (or any WebTransport client) opens a session with an extended CONNECT (RFC 9220) and then uses reliable data streams and unreliable datagrams on that one connection, alongside ordinary HTTP/3 requests. Pure-Zig from the drafts, with no library in the loop.
+
+Two revisions are accepted at once. draft-ietf-webtrans-http3-16 is the current one (token `webtransport-h3`, `SETTINGS_WT_ENABLED` 0x2c7cf000, session-level flow control, `RESET_STREAM_AT` on a stream reset), and the deployed draft-07 (token `webtransport`, `SETTINGS_ENABLE_WEBTRANSPORT` 0x2b603742) is what browsers and aioquic still send. The server advertises both in one SETTINGS frame, and the CONNECT `:protocol` token decides which one the session speaks.
+
+```zig
+const std = @import("std");
+const zix = @import("zix");
+
+// A plain HTTP/3 route: WebTransport sessions and ordinary requests share one connection.
+fn home(_: *const zix.Http3.Request, res: *zix.Http3.Response, _: *zix.Http3.Context) !void {
+    res.send("hello over http/3\n");
+}
+
+/// Decide a session: null accepts, a status refuses it.
+fn onSession(session: *zix.Webtransport.Session) ?u16 {
+    const request = session.sessionRequest();
+    if (!std.mem.eql(u8, request.path, "/echo")) return 404;
+
+    // A unidirectional stream the server opens for this session.
+    if (session.openUni()) |stream| {
+        _ = stream.write("hello from zix\n");
+        stream.finish();
+    }
+
+    return null;
+}
+
+/// Echo whatever arrives on a data stream. A short write is normal back pressure.
+fn onStream(session: *zix.Webtransport.Session, stream: *const zix.Webtransport.Stream) void {
+    _ = session;
+    _ = stream.write(stream.read());
+    stream.finish();
+}
+
+/// Echo a datagram. A datagram is never queued: false means it did not go.
+fn onDatagram(session: *zix.Webtransport.Session, datagram: []const u8) void {
+    _ = session.sendDatagram(datagram);
+}
+
+fn onClose(session: *zix.Webtransport.Session) void {
+    const info = session.closeInfo();
+    std.log.info("session {d} closed: {s} code={d}", .{ session.id(), @tagName(info.reason), info.code });
+}
+
+pub fn main(process: std.process.Init) !void {
+    var tls = try zix.Tls.Context.init(std.heap.smp_allocator, process.io, .{
+        .cert_path = "examples/certs/ecdsa_p256_cert.pem",
+        .key_path  = "examples/certs/ecdsa_p256_key.pem",
+    });
+    defer tls.deinit();
+
+    const Routes = zix.Http3.Router(&[_]zix.Http3.Route{
+        .{ .path = "/", .handler = home },
+    });
+
+    var server = zix.Http3.Server.init(Routes.dispatch, .{
+        .io             = process.io,
+        .allocator      = std.heap.smp_allocator,
+        .ip             = "127.0.0.1",
+        .port           = 9089,
+        .dispatch_model = .ASYNC,
+        .tls            = &tls,
+        .webtransport = .{
+            .enabled = true,
+            .max_sessions_per_connection = 4,
+            .max_streams_bidi = 16,
+            .max_streams_uni = 16,
+            .max_session_data = 1 << 20,
+            .handler = .{
+                .on_session = onSession,
+                .on_stream = onStream,
+                .on_datagram = onDatagram,
+                .on_close = onClose,
+            },
+        },
+    });
+    defer server.deinit();
+
+    try server.run();
+}
+```
+
+**Handler:** five optional callbacks. `on_session` decides a CONNECT (null accepts, an HTTP status refuses, and the engine answers the request stream either way), `on_stream` gets a data stream chunk, `on_stream_reset` gets a stream the peer aborted, `on_datagram` gets one datagram with its routing already stripped, and `on_close` gets the session after it ended.
+
+- `Session` answers through `openBidi`, `openUni`, `sendDatagram`, `close`, and `drain`, and reports `id()`, `dialect()`, `state()`, `isOpen()`, `sessionRequest()`, `streamsAvailable(kind)`, and `closeInfo()`. `Stream` answers through `write`, `finish`, `reset`, and `stop`, and reports `id()`, `kind()`, `initiator()`, `read()`, `chunk_offset`, `finished()`, `resetCode()`, and `writable()`.
+- Lifetimes follow the rest of zix: a session, a stream, and every slice they hand over are valid for the callback that produced them. An application that needs the bytes later copies them, and a handle captured past its callback is inert rather than dangling.
+- A short `write` is back pressure, not an error: the peer has not acknowledged what is queued, so the remainder goes out from the next callback. `sendDatagram` returns false when the datagram could not go now (no datagram negotiation, payload past the peer's frame limit, or no congestion-window room) and never queues it for later.
+- Callbacks arrive on the worker that owns the QUIC connection, one datagram at a time, so a handler runs single-threaded per connection and needs no lock. The dispatcher is the HTTP/3 one, unchanged.
+- Limits are advertised and enforced: `max_sessions_per_connection` (429 when reached, 503 when the worker pool has no slot), `max_streams_bidi` / `max_streams_uni` per session, `max_session_data` for the session-level byte budget, `stream_send_bytes` as the per-stream write window, and `max_datagram_frame_size` for both directions. A pre-session stream past the worker's buffer is reset with `WT_BUFFERED_STREAM_REJECTED`, and every stream of a closing session is reset with `WT_SESSION_GONE`.
+- `legacy_dialect = false` accepts only the current revision. Turn it off only when every client is known to speak it, since every shipping browser still sends the deployed token.
+- Origin validation is the application's: the engine hands `on_session` the request's `origin` (a browser always sends one) and does not invent a policy.
+
+**Example:** [examples/tls/http3_webtransport.zig](examples/tls/http3_webtransport.zig) (port 9089) accepts sessions on `/echo`, echoes every data-stream chunk and every datagram, opens one unidirectional stream per session with a banner, and prints the session lifecycle on stderr. Built with `zig build example-http3_webtransport`. Drive it with any WebTransport over HTTP/3 client, and `zig build test-runner-webtransport` drives it end to end from the in-tree client.
+
+See [`docs/hld-webtransport-en.md`](docs/hld-webtransport-en.md) and [`docs/lld-webtransport-en.md`](docs/lld-webtransport-en.md) for the full design and per-file internals.
 
 <br>
 

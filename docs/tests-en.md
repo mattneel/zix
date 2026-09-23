@@ -155,6 +155,20 @@ The HTTP/3 (QUIC) layers are pure-Zig from the RFCs, so each carries the spec's 
 | `udp/http3/config.zig` / `server.zig` | `refAllDecls` + behavioral: required config fields and defaults, a null `Tls.Context` is rejected at run |
 | `udp/http3/static.zig` | `refAllDecls` + behavioral: content-encoding maps only what the response path can emit, serve declines when caching is off (the body must outlive the handler, so it can only come from the cache), the response is filled from cached bytes and the pin is KEPT, the body stays readable after the handler frame is gone, a `.br` sibling is picked and named, traversal and a missing file are rejected, exactly one pin is held and `releasePin` returns it, a released pin lets the entry be reclaimed, an in-flight body is immune to the file being rewritten in place |
 
+### zix.Webtransport
+
+WebTransport over HTTP/3 is a feature of `zix.Http3` (`Http3ServerConfig.webtransport`), so the binding's modules are pure-Zig from their own drafts: each one carries the codepoints, the RFC layouts, and crafted byte streams as in-file tests. The live round trip is driven end to end by a native client hand-rolled from the HTTP/3 primitives in `test-runner-webtransport` / `test-runner-all`.
+
+| Module | Coverage |
+| :- | :- |
+| `udp/http3/webtransport/draft.zig` | `refAllDecls` + behavioral: the two upgrade tokens select their dialect and an unknown token selects neither, the draft-16 codepoints against the IANA registrations (settings, stream type and signal value, error codes, capsule types), the deployed draft-07 pair still accepted, the application error mapping at both ends of the range and over an exhaustive sweep that no encoded value is a reserved grease codepoint, a reserved codepoint inside the range carrying no application error, and the flow control capsule classification |
+| `udp/http3/webtransport/capsule.zig` | `refAllDecls` + behavioral: RFC 9297 3.2 capsule framing, the close capsule's application code and message with its UTF-8 character-boundary truncation, the flow control capsules encoding and decoding one varint, the streaming reader handing over capsules split across datagrams, skipping an unknown capsule without buffering it, skipping an oversized known capsule, a refused capsule stopping the reader, and a huge declared length consuming exactly what it declares while buffering nothing |
+| `udp/http3/webtransport/datagram.zig` | `refAllDecls` + behavioral: the RFC 9221 4 frame forms (both types, empty datagrams, a length past the buffer, a truncated header), the encoded frame size the peer's limit counts, the limit gating every send, the RFC 9297 2.1 quarter stream id carrying the session, the HTTP/3 datagram round tripping through it, and the payload budget subtracting both layers of framing overhead |
+| `udp/http3/webtransport/stream_header.zig` | `refAllDecls` + behavioral: the 0x54 / 0x41 layout for both kinds with one-byte and two-byte session ids, a stream that opens with another protocol refused, the session id rule for a client-initiated bidirectional stream, the reliable reset size covering the header, and the stream id space a data stream can live in |
+| `udp/http3/webtransport/session.zig` | `refAllDecls` + behavioral: the send buffer taking what it can and reporting back pressure, a long stream reusing one buffer across acknowledgements, a loss rewinding the sent offset without disturbing the queue, a reset always covering the stream header, the receive side replenishing credit before it runs dry, flow control only enabled when both endpoints declare it, the session data limit enforced and charged, the incoming stream count limited per kind, opening streams respecting the peer's limit, the monotonic rule for `WT_MAX_DATA` and `WT_MAX_STREAMS`, the endpoint raising its own limits as the peer consumes them, a session ending with the peer's close information, streams attaching and detaching, and a session id being its CONNECT stream id |
+| `udp/http3/webtransport/pool.zig` | `refAllDecls` + behavioral: slots handed out, refused past capacity, and recycled; every stream slot carrying its own send buffer; the orphan table holding a bounded set of pre-session streams; buffered streams replayed only to their own session; a tiny configured buffer raised to one that can hold a stream header; and an empty pool refusing every acquisition |
+| `udp/http3/webtransport/Webtransport.zig` | `refAllDecls` + behavioral: the default config offering nothing until it is enabled, a config that outgrows the connection tables refused by the field name that crossed them, the pool sizing following the advertised limits, and the stream kind and dialect vocabulary the application sees |
+
 ### zix.Webrtc
 
 Every WebRTC layer is written from its own RFC, so each file carries its tests in-file and the
@@ -410,6 +424,18 @@ the engine would go on to frame, including the cache pin it hands back.
 | Router keeps routed paths ahead of the static fallback | a routed handler wins over a file that would shadow it |
 | Router 404s static paths when caching is off | the file exists, but this engine has no safe body source without the cache |
 | Router serves a multi-packet body that outlives the dispatch call | a 64 KiB body reads back intact after the Context is gone |
+
+#### `webtransport_test.zig`
+
+The WebTransport over HTTP/3 paths that only work when the pieces agree: the request decode that has to recognize a session request, the SETTINGS codec a client reads before it sends one, and the transport parameters the feature is built on. The bytes are built by hand from the same public primitives a peer uses, so what is asserted is the wire contract rather than a decode driven by an encoder that shares its mistakes.
+
+| Test | What it verifies |
+| :- | :- |
+| the request decode reports the token a WebTransport session is opened with | the exact bytes of an extended CONNECT (`:method CONNECT`, `:scheme`, `:authority`, `:path`, and `:protocol` under a literal name) decode to the token, and the token names the dialect |
+| a Huffman-coded protocol token still names the dialect | the decode leaves the value in the coding it arrived in, so the layer that recognizes a session request expands it before matching |
+| a protocol on a request that is not CONNECT is malformed | `:protocol` extends CONNECT alone (RFC 9220 4), and a GET carrying a WebTransport token is never read as a session request |
+| the settings a WebTransport server advertises are the ones a client needs | the three support flags a client checks, the draft-16 session limits, and the deployed pair so a draft-07 client sees support too |
+| the WebTransport transport parameters parse out of the client hello | `max_datagram_frame_size` (0x20) and `reset_stream_at` (0x1d) parse beside the flow control limits the response path reads |
 
 ### tests/integration/webrtc/
 
@@ -734,6 +760,20 @@ RFC 10008 QUERY support through the public `zix.Http1` surface.
 | Static fields are stored as set | all three round-trip |
 | Static serving needs caching, unlike the other engines | pins the deliberate asymmetry: on Http3 a ttl of 0 disables static serving entirely, because the response body outlives its handler |
 
+#### `webtransport_test.zig`
+
+The `zix.Webtransport` surface an application and a peer depend on, driven through the handles a caller actually holds: the engine hooks here are the dispatch layer's contract (open a stream, send a datagram, close a session) implemented over a worker pool, so a session and a stream move the way a connection moves them, minus the socket.
+
+| Test | What it verifies |
+| :- | :- |
+| the HTTP/3 server config carries the feature off and costs nothing while it is | the default is disabled, and an off config advertises nothing |
+| a config past the connection ceilings is refused by the field that crossed them | `capacityError` names the field, and the ceilings themselves are accepted |
+| the pool sizing a config asks for is the window a stream has to write into | the pool config a `Config` maps onto carries the stream buffer size through |
+| the token a client sends is the dialect its session speaks | the CONNECT `:protocol` token decides draft-16 or draft-07, and an unknown token decides neither |
+| a stream is a write window, a FIN closes it, and only an acknowledgement finishes it | the write/back-pressure contract, the FIN rule, and the send-finished predicate |
+| a session enforces the data limit it advertised and raises it as the peer consumes it | the session data limit rejects what crosses it and a capsule raises it |
+| a datagram is framed with its session's quarter stream id and bounded by the peer's limit | the HTTP/3 datagram layout and the payload budget against the advertised frame size |
+
 ### tests/behaviour/webrtc/
 
 #### `session_test.zig`
@@ -1028,6 +1068,21 @@ The boundaries where the engine has to decline rather than hand its send path a 
 | Bytes survive a truncation to a shorter file | the dangerous shape: the file shrinks while a response is still sending |
 | Declines every unsafe path before touching the disk | traversal, absolute, and empty |
 | Bytes are snapshotted once and reused across requests | one copy backs concurrent responses, and each holds its own pin |
+
+#### `webtransport_test.zig`
+
+The boundaries of `zix.Webtransport` at its public surface, and the hostile input a peer is free to send: a capsule stream that declares more than the reader holds, an application error at the ends of its range, a send window whose bookkeeping is full, a pool at its last slot, and a session that has already ended.
+
+| Test | What it verifies |
+| :- | :- |
+| the capsule reader holds a value up to its limit and skips one past it | `max_known_value` is exactly the largest capsule the binding defines, one byte more is skipped in place, and the capsule behind it still arrives |
+| a capsule value one byte short of its own length is not delivered | the declared length is what the reader trusts, so a short capsule is still arriving |
+| the application error mapping spans the 32-bit ends without landing on a grease code | `0` and `0xffffffff` map to the ends of the application range, and a framing error code does not decode as one |
+| a peer reset reports an application code only when it carried one | a code outside the application range reads as a reset with no application code |
+| a stream whose sent-range list is full is offered no more bytes | the list is bounded, and a full list stops the pump rather than sending a byte it could no longer account for |
+| a reset covers at least the header of the kind it resets | a reliable reset delivers the header, or the peer could not tell which session the stream belonged to |
+| the pool refuses past its last slot and the pre-session table holds nothing it refuses | a one-slot pool refuses the second session instead of serving it out of the first one's slot |
+| a closed session refuses streams and datagrams and clips its close message | a closed session opens nothing, sends nothing, and reports a message no longer than the limit |
 
 ### tests/edge/webrtc/
 

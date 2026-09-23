@@ -81,6 +81,7 @@
     - [Channel](./README-id.md#channel)
     - [UDP](./README-id.md#udp)
     - [HTTP/3](./README-id.md#http3)
+    - [WebTransport](./README-id.md#webtransport)
     - [WebRTC](./README-id.md#webrtc)
     - [Logger](./README-id.md#logger)
     - [JSON (jzon)](./README-id.md#json-jzon)
@@ -107,6 +108,7 @@
 | [`docs/hld-logger-id.md`](docs/hld-logger-id.md) | Logger: tujuan, API, metode log, format, rotasi file, pemasangan protokol |
 | [`docs/hld-tls-id.md`](docs/hld-tls-id.md) | TLS: tujuan, version policy, Tls.Context, alur handshake, integrasi engine, client |
 | [`docs/hld-http3-id.md`](docs/hld-http3-id.md) | HTTP/3 (QUIC): tujuan, runtime model, API, router, dispatch model, handshake, QPACK, memory model |
+| [`docs/hld-webtransport-id.md`](docs/hld-webtransport-id.md) | WebTransport over HTTP/3: tujuan, kedua dialect, negosiasi session, API, dispatch, flow control, memory model, catatan keamanan |
 | [`docs/hld-webrtc-id.md`](docs/hld-webrtc-id.md) | WebRTC: tujuan, runtime model, API, ICE-lite, data channel, forwarding media, dispatch model, memory model |
 | [`docs/lld-http-id.md`](docs/lld-http-id.md) | HTTP: struktur data internal dan algoritma |
 | [`docs/lld-http1-id.md`](docs/lld-http1-id.md) | HTTP/1: parsing internal, write helper, router, engine EPOLL, codec WebSocket |
@@ -120,6 +122,7 @@
 | [`docs/lld-logger-id.md`](docs/lld-logger-id.md) | Logger: buffer tulis internal, spinlock, algoritma rotasi |
 | [`docs/lld-tls-id.md`](docs/lld-tls-id.md) | TLS: internal wire / handshake / key-schedule / record, validate Tls.Context, jalur serve |
 | [`docs/lld-http3-id.md`](docs/lld-http3-id.md) | HTTP/3 (QUIC): internal per-layer (crypto, packet, frame, flow, recovery, QPACK, connection, demux, dispatch) |
+| [`docs/lld-webtransport-id.md`](docs/lld-webtransport-id.md) | WebTransport: internal per-file (codepoint draft, capsule, datagram, header stream, session dan pool), hook engine, limitnya |
 | [`docs/lld-webrtc-id.md`](docs/lld-webrtc-id.md) | WebRTC: internal per-layer (demux, STUN, ICE, DTLS, SCTP, data channel, SDP, media, dispatch) |
 | [`docs/zix-deploy-id.md`](docs/zix-deploy-id.md) | Deployment: bangun Docker image (zig fetch atau vendor) dan konfigurasi TLS context untuk Ed25519 / ECDSA P-256 / RSA |
 | [`docs/zix-config-id.md`](docs/zix-config-id.md) | Referensi config: tiap field config dengan default, efek, dan trade-off tuning-nya (engine server plus TLS context) |
@@ -304,8 +307,8 @@ di-pin, atau terus di-patch, jadi supply chain-nya adalah Zig toolchain plus rep
 __*1. Stack protokol lengkap dalam satu tempat:*__
 
 Tcp (raw), Udp, Uds (Unix domain sockets), Http (HTTP/1.1), Http1 (varian
-hot-path-optimized), Http2 (h2c), Http3 (HTTP/3 melalui QUIC), Webrtc (data channel dan
-media), Grpc (gRPC melalui h2c), Fix (FIX 4.x), plus Channel dan Logger.
+hot-path-optimized), Http2 (h2c), Http3 (HTTP/3 melalui QUIC, plus WebTransport over HTTP/3), Webrtc
+(data channel dan media), Grpc (gRPC melalui h2c), Fix (FIX 4.x), plus Channel dan Logger.
 
 > Satu model memori/threading yang koheren untuk backend monolith, micro-service, dan
 modular-micro-service, alih-alih menggabungkan banyak library terpisah dengan
@@ -434,9 +437,9 @@ TLS 1.3 dengan floor TLS 1.2, di atas `std.crypto`, tanpa OpenSSL. Opt-in dan ad
 
 __*16. HTTP/3 di atas QUIC, pure-Zig:*__
 
-`zix.Http3` menyajikan HTTP/3 (RFC 9114) di atas QUIC (RFC 9000 / 9001 / 9002), dibangun dari RFC di atas `std.crypto`: packet protection, handshake TLS 1.3 di atas CRYPTO stream, loss recovery, QPACK, dan dispatch per-core di atas substrat `zix.Udp`. `Router` comptime dan `Tls.Context` yang sama dengan engine TCP.
+`zix.Http3` menyajikan HTTP/3 (RFC 9114) di atas QUIC (RFC 9000 / 9001 / 9002), dibangun dari RFC di atas `std.crypto`: packet protection, handshake TLS 1.3 di atas CRYPTO stream, loss recovery, QPACK, dan dispatch per-core di atas substrat `zix.Udp`. `Router` comptime dan `Tls.Context` yang sama dengan engine TCP. `zix.Webtransport` melengkapinya dengan WebTransport over HTTP/3 (RFC 9220 / 9297 / 9221): session, stream data yang reliabel, dan datagram yang tidak reliabel dimultipleks di koneksi yang sama, berbicara draft-ietf-webtrans-http3-16 dan dialect draft-07 deployed yang masih dikirim browser.
 
-> Transport HTTP terbaru hadir in-tree tanpa C QUIC library, berbagi router dan config TLS yang sudah dipakai untuk HTTP/1 dan HTTP/2.
+> Transport HTTP terbaru hadir in-tree tanpa C QUIC library, berbagi router dan config TLS yang sudah dipakai untuk HTTP/1 dan HTTP/2, dan binding WebTransport yang menghadap browser menumpang koneksi, sertifikat, serta congestion controller yang sama.
 
 <br>
 
@@ -525,6 +528,7 @@ Field buffer, socket, timeout, dan cache memakai nama yang sama di mana pun prot
 | `response_cache` dan empat field `cache_*` | lihat [Kesadaran Cache Respons](#kesadaran-cache-respons-response_cache) | `zix.Http1`, `zix.Http`, `zix.Grpc` |
 | `process_queue_len` | `usize` | `zix.Http1`, `zix.Http` (park ring submission-queue `.URING`, lihat [Kesadaran Process Queue](#kesadaran-process-queue-process_queue_len)) |
 | `compress`, `compression_min_size`, `compression_max_out` | `bool` / `usize` / `usize` | `zix.Http1`, `zix.Http` |
+| `webtransport` | `zix.Webtransport.Config` | `zix.Http3` (WebTransport over HTTP/3: session, stream, datagram, lihat [WebTransport](#webtransport)) |
 
 Beberapa perbedaan disengaja, bukan drift:
 
@@ -566,6 +570,22 @@ Jalur raw (`zix.Udp.Raw`,) mengalokasikan recv / send batch dan array worker-thr
 ### HTTP/2 dan gRPC
 
 Mux `.EPOLL` / `.URING` HTTP/2 dan gRPC sama-sama memakai pool slot stream per worker, jadi memori stream residen mengikuti stream konkuren, bukan `max_streams` per koneksi. Model thread-path (`.ASYNC`) tetap memakai array stream per-koneksi yang dialokasikan heap (alokasi stack dari `max_streams` struct `Stream` akan meluap stack thread). Handler menerima trio `req`/`res`/`ctx` yang sama seperti engine lainnya (ADR-063): `ctx.allocator` adalah arena per-permintaan yang didukung buffer stack tetap (tanpa pemanggilan heap), direset per permintaan, bukan per koneksi.
+
+### WebTransport over HTTP/3
+
+`zix.Webtransport` adalah fitur `zix.Http3`, jadi ia menambah satu pool milik worker dan tidak menambah apa pun per paket.
+
+| Cakupan | Allocator | Lifetime |
+| :- | :- | :- |
+| Worker pool (slot session, slot stream, send buffer, buffer pra-session) | `config.allocator`, sekali saat worker mulai | Lifetime worker, dilepas saat worker keluar |
+| Slot session | di dalam pool | Lifetime session, didaur ulang saat close |
+| Slot stream data dan send buffer-nya | di dalam pool, satu alokasi terpisah untuk semua buffer | Lifetime stream, didaur ulang saat kedua half stream selesai |
+| Buffer stream pra-session | di dalam pool | Sampai session-nya muncul, atau sampai stream-nya ditolak |
+| State WebTransport per koneksi (`Connection.wt`) | inline di slot koneksi | Lifetime koneksi, ukuran tetap (tanpa heap per paket) |
+
+Jalur receive tidak mengalokasi apa pun: session dan stream datang dari pool, dan pool mengembalikan null alih-alih tumbuh, sehingga peer tidak bisa memaksa server mengalokasi. Biaya memori WebTransport satu worker persis `pool_streams * stream_send_bytes` plus `pool_orphan_streams * pool_orphan_bytes` (1 MiB send buffer plus 8 KiB buffer orphan pada default), dibayar sekali dan tidak bergantung pada jumlah koneksi. `zix.Webtransport.capacityError` menolak config yang melewati plafon compile-time alih-alih memotong fitur secara diam-diam.
+
+Sizing pool lengkap dan biaya per koneksi ada di [`docs/hld-webtransport-id.md`](docs/hld-webtransport-id.md).
 
 Untuk detail memori lengkap lihat [`docs/hld-http-id.md`](docs/hld-http-id.md) dan [`docs/hld-udp-id.md`](docs/hld-udp-id.md). Untuk model threading lihat [`docs/concurrency-id.md`](docs/concurrency-id.md).
 
@@ -2207,6 +2227,105 @@ curl --http3-only -k https://127.0.0.1:9063/
 **Contoh:** [examples/tls/http3_basic.zig](examples/tls/http3_basic.zig) (port 9063) menyajikan `/`, query-sum `/baseline2`, `/big` 256 KiB yang menguji jalur kirim streamed multi-packet, `/negotiated` yang menyajikan body brotli-precompressed dengan `content-encoding: br` saat klien menerima br, dan `/echo` yang menjawab POST dengan jumlah byte yang diterima, apakah itu body utuh, beserta body-nya.
 
 Lihat [`docs/hld-http3-id.md`](docs/hld-http3-id.md) dan [`docs/lld-http3-id.md`](docs/lld-http3-id.md) untuk desain lengkap dan internal per-layer.
+
+<br>
+
+### WebTransport
+
+`zix.Webtransport` adalah WebTransport over HTTP/3, dilayani `zix.Http3` di koneksi QUIC yang sudah dimilikinya: browser (atau client WebTransport apa pun) membuka session dengan extended CONNECT (RFC 9220) lalu memakai stream data yang reliabel dan datagram yang tidak reliabel di satu koneksi itu, berdampingan dengan request HTTP/3 biasa. Pure-Zig dari draft-nya, tanpa library di dalamnya.
+
+Dua revisi diterima sekaligus. draft-ietf-webtrans-http3-16 adalah revisi saat ini (token `webtransport-h3`, `SETTINGS_WT_ENABLED` 0x2c7cf000, flow control level session, `RESET_STREAM_AT` pada reset stream), dan draft-07 deployed (token `webtransport`, `SETTINGS_ENABLE_WEBTRANSPORT` 0x2b603742) adalah yang masih dikirim browser dan aioquic. Server mengiklankan keduanya di satu SETTINGS frame, dan token `:protocol` pada CONNECT yang menentukan mana yang diucapkan sebuah session.
+
+```zig
+const std = @import("std");
+const zix = @import("zix");
+
+// Route HTTP/3 biasa: session WebTransport dan request biasa berbagi satu koneksi.
+fn home(_: *const zix.Http3.Request, res: *zix.Http3.Response, _: *zix.Http3.Context) !void {
+    res.send("hello over http/3\n");
+}
+
+fn onSession(session: *zix.Webtransport.Session) ?u16 {
+    const request = session.sessionRequest();
+    if (!std.mem.eql(u8, request.path, "/echo")) return 404;
+
+    // Stream unidirectional yang dibuka server untuk session ini.
+    if (session.openUni()) |stream| {
+        _ = stream.write("hello from zix\n");
+        stream.finish();
+    }
+
+    return null;
+}
+
+/// Pantulkan apa pun yang tiba di stream data. Tulisan pendek adalah back pressure yang normal.
+fn onStream(session: *zix.Webtransport.Session, stream: *const zix.Webtransport.Stream) void {
+    _ = session;
+    _ = stream.write(stream.read());
+    stream.finish();
+}
+
+/// Pantulkan sebuah datagram. Datagram tidak pernah diantre: false berarti tidak terkirim.
+fn onDatagram(session: *zix.Webtransport.Session, datagram: []const u8) void {
+    _ = session.sendDatagram(datagram);
+}
+
+fn onClose(session: *zix.Webtransport.Session) void {
+    const info = session.closeInfo();
+    std.log.info("session {d} closed: {s} code={d}", .{ session.id(), @tagName(info.reason), info.code });
+}
+
+pub fn main(process: std.process.Init) !void {
+    var tls = try zix.Tls.Context.init(std.heap.smp_allocator, process.io, .{
+        .cert_path = "examples/certs/ecdsa_p256_cert.pem",
+        .key_path  = "examples/certs/ecdsa_p256_key.pem",
+    });
+    defer tls.deinit();
+
+    const Routes = zix.Http3.Router(&[_]zix.Http3.Route{
+        .{ .path = "/", .handler = home },
+    });
+
+    var server = zix.Http3.Server.init(Routes.dispatch, .{
+        .io             = process.io,
+        .allocator      = std.heap.smp_allocator,
+        .ip             = "127.0.0.1",
+        .port           = 9089,
+        .dispatch_model = .ASYNC,
+        .tls            = &tls,
+        .webtransport = .{
+            .enabled = true,
+            .max_sessions_per_connection = 4,
+            .max_streams_bidi = 16,
+            .max_streams_uni = 16,
+            .max_session_data = 1 << 20,
+            .handler = .{
+                .on_session = onSession,
+                .on_stream = onStream,
+                .on_datagram = onDatagram,
+                .on_close = onClose,
+            },
+        },
+    });
+    defer server.deinit();
+
+    try server.run();
+}
+```
+
+**Handler:** lima callback opsional. `on_session` memutuskan sebuah CONNECT (null menerima, status HTTP menolak, dan engine menjawab stream request-nya pada kedua kasus), `on_stream` menerima chunk stream data, `on_stream_reset` menerima stream yang dibatalkan peer, `on_datagram` menerima satu datagram dengan routing-nya sudah dilepas, dan `on_close` menerima session setelah berakhir.
+
+- `Session` menjawab lewat `openBidi`, `openUni`, `sendDatagram`, `close`, dan `drain`, serta melaporkan `id()`, `dialect()`, `state()`, `isOpen()`, `sessionRequest()`, `streamsAvailable(kind)`, dan `closeInfo()`. `Stream` menjawab lewat `write`, `finish`, `reset`, dan `stop`, serta melaporkan `id()`, `kind()`, `initiator()`, `read()`, `chunk_offset`, `finished()`, `resetCode()`, dan `writable()`.
+- Lifetime mengikuti sisa zix: session, stream, dan setiap slice yang diserahkannya valid untuk callback yang menghasilkannya. Aplikasi yang membutuhkan byte-nya nanti harus menyalinnya, dan handle yang disimpan melewati callback-nya bersifat inert, bukan menggantung.
+- `write` yang pendek adalah back pressure, bukan error: peer belum mengakui apa yang diantre, jadi sisanya keluar dari callback berikutnya. `sendDatagram` mengembalikan false ketika datagram tidak bisa dikirim sekarang (tanpa negosiasi datagram, payload melewati limit frame peer, atau tidak ada ruang congestion window) dan tidak pernah mengantrenya untuk nanti.
+- Callback tiba di worker yang memiliki koneksi QUIC, satu datagram pada satu waktu, sehingga handler berjalan single-threaded per koneksi dan tidak butuh lock. Dispatcher-nya milik HTTP/3, tidak berubah.
+- Limit diiklankan dan ditegakkan: `max_sessions_per_connection` (429 saat tercapai, 503 saat pool worker tidak punya slot), `max_streams_bidi` / `max_streams_uni` per session, `max_session_data` untuk anggaran byte level session, `stream_send_bytes` sebagai write window per stream, dan `max_datagram_frame_size` di kedua arah. Stream pra-session melewati buffer worker direset dengan `WT_BUFFERED_STREAM_REJECTED`, dan setiap stream session yang menutup direset dengan `WT_SESSION_GONE`.
+- `legacy_dialect = false` hanya menerima revisi saat ini. Matikan hanya ketika setiap client diketahui mengucapkannya, karena setiap browser yang beredar masih mengirim token deployed.
+- Validasi origin milik aplikasi: engine menyerahkan `origin` request ke `on_session` (browser selalu mengirimnya) dan tidak mengarang kebijakan.
+
+**Contoh:** [examples/tls/http3_webtransport.zig](examples/tls/http3_webtransport.zig) (port 9089) menerima session di `/echo`, memantulkan setiap chunk stream data dan setiap datagram, membuka satu stream unidirectional per session dengan banner, dan mencetak lifecycle session ke stderr. Dibangun dengan `zig build example-http3_webtransport`. Gerakkan dengan client WebTransport over HTTP/3 mana pun, dan `zig build test-runner-webtransport` menggerakkannya end to end dari client in-tree.
+
+Lihat [`docs/hld-webtransport-id.md`](docs/hld-webtransport-id.md) dan [`docs/lld-webtransport-id.md`](docs/lld-webtransport-id.md) untuk desain lengkap dan internal per-file.
 
 <br>
 

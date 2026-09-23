@@ -49,9 +49,29 @@ pub const initial_max_data: u64 = 1048576;
 /// answerable only because the serve path replenishes it.
 pub const initial_max_stream_data: u64 = 262144;
 
+/// The QUIC extensions beyond RFC 9000 an endpoint advertises in its transport parameters. Both are
+/// WebTransport prerequisites: the binding carries datagrams over the DATAGRAM frame and resets a data
+/// stream with RESET_STREAM_AT so the stream header survives the reset.
+///
+/// Note:
+/// - An endpoint that does not advertise `max_datagram_frame_size` MUST NOT be sent DATAGRAM frames
+///   (RFC 9221 3), and one that does not advertise `reset_stream_at` MUST NOT be sent RESET_STREAM_AT
+///   (draft-ietf-quic-reliable-stream-reset-09 3), so both are left off when the feature that needs
+///   them is disabled: a peer then sees no reason to require them.
+pub const TransportExtensions = struct {
+    /// The largest DATAGRAM frame this endpoint accepts, type and length included (RFC 9221 3). 0
+    /// omits the parameter, which tells the peer this endpoint does not accept DATAGRAM frames.
+    pub const max_datagram_frame_size_id: u64 = 0x20;
+    /// The empty reset_stream_at parameter (draft-ietf-quic-reliable-stream-reset-09 3).
+    pub const reset_stream_at_id: u64 = 0x1d;
+
+    max_datagram_frame_size: u64 = 0,
+    reset_stream_at: bool = false,
+};
+
 /// Encode the QUIC transport parameters (RFC 9000 18.2). The connection-id params are validated by
 /// the peer, so they MUST carry the client's first DCID and our SCID exactly.
-fn encodeTransportParams(buf: []u8, original_dcid: []const u8, source_cid: []const u8, max_idle_ms: u64, max_streams: u64) usize {
+fn encodeTransportParams(buf: []u8, original_dcid: []const u8, source_cid: []const u8, max_idle_ms: u64, max_streams: u64, ext: TransportExtensions) usize {
     var pos: usize = 0;
 
     putBytesParam(buf, &pos, 0x00, original_dcid); // original_destination_connection_id
@@ -64,12 +84,19 @@ fn encodeTransportParams(buf: []u8, original_dcid: []const u8, source_cid: []con
     putIntParam(buf, &pos, 0x08, max_streams); // initial_max_streams_bidi
     putIntParam(buf, &pos, 0x09, max_streams); // initial_max_streams_uni
 
+    // The two extension parameters are only sent when the feature behind them is on: an advertised 0
+    // (or an absent parameter) is how an endpoint says it will not accept the frames at all.
+    if (ext.max_datagram_frame_size != 0) {
+        putIntParam(buf, &pos, TransportExtensions.max_datagram_frame_size_id, ext.max_datagram_frame_size);
+    }
+    if (ext.reset_stream_at) putBytesParam(buf, &pos, TransportExtensions.reset_stream_at_id, "");
+
     return pos;
 }
 
 /// Build the EncryptedExtensions handshake message (RFC 8446 4.3.1) carrying ALPN "h3" and the
 /// quic_transport_parameters extension (RFC 9001 8.2). Returns the wire slice.
-pub fn buildEncryptedExtensions(buf: []u8, original_dcid: []const u8, source_cid: []const u8, max_idle_ms: u64, max_streams: u64) []const u8 {
+pub fn buildEncryptedExtensions(buf: []u8, original_dcid: []const u8, source_cid: []const u8, max_idle_ms: u64, max_streams: u64, ext: TransportExtensions) []const u8 {
     var p: usize = 0;
     buf[p] = 0x08; // EncryptedExtensions handshake type
     p += 1;
@@ -99,7 +126,7 @@ pub fn buildEncryptedExtensions(buf: []u8, original_dcid: []const u8, source_cid
     const tp_len_at = p;
     p += 2;
     const tp_start = p;
-    p += encodeTransportParams(buf[p..], original_dcid, source_cid, max_idle_ms, max_streams);
+    p += encodeTransportParams(buf[p..], original_dcid, source_cid, max_idle_ms, max_streams, ext);
     std.mem.writeInt(u16, buf[tp_len_at..][0..2], @intCast(p - tp_start), .big);
 
     std.mem.writeInt(u16, buf[exts_len_at..][0..2], @intCast(p - exts_start), .big);
@@ -127,6 +154,8 @@ pub fn buildEncryptedExtensions(buf: []u8, original_dcid: []const u8, source_cid
 /// source_cid - []const u8 (our SCID, for the transport parameter)
 /// max_idle_ms - u64 (idle timeout transport parameter)
 /// max_streams - u64 (stream limit transport parameter)
+/// ext - TransportExtensions (the DATAGRAM and reliable-reset parameters, empty when the features that
+///   need them are off)
 ///
 /// Return:
 /// - []const u8 (the sealed Handshake packet), or null on a builder / signing error
@@ -143,12 +172,13 @@ pub fn buildHandshakeFlight(
     source_cid: []const u8,
     max_idle_ms: u64,
     max_streams: u64,
+    ext: TransportExtensions,
 ) ?[]const u8 {
     var flight: [4096]u8 = undefined;
     var fp: usize = 0;
 
     var ee_buf: [512]u8 = undefined;
-    const ee = buildEncryptedExtensions(&ee_buf, original_dcid, source_cid, max_idle_ms, max_streams);
+    const ee = buildEncryptedExtensions(&ee_buf, original_dcid, source_cid, max_idle_ms, max_streams, ext);
     @memcpy(flight[fp..][0..ee.len], ee);
     fp += ee.len;
     transcript.update(ee);
@@ -199,7 +229,7 @@ test "zix http3: transport parameters carry the validated connection ids" {
     var buf: [256]u8 = undefined;
     const dcid = hexBytes("8394c8f03e515708");
     const scid = hexBytes("c0ffee00");
-    const len = encodeTransportParams(&buf, &dcid, &scid, 30000, 128);
+    const len = encodeTransportParams(&buf, &dcid, &scid, 30000, 128, .{});
     const params = buf[0..len];
 
     // original_destination_connection_id (0x00): id, length 8, then the DCID bytes.
@@ -213,9 +243,38 @@ test "zix http3: transport parameters carry the validated connection ids" {
     try std.testing.expectEqualSlices(u8, &scid, params[12..16]);
 }
 
+test "zix http3: the DATAGRAM and reliable-reset parameters are advertised only when asked for" {
+    var buf: [256]u8 = undefined;
+    const dcid = hexBytes("8394c8f03e515708");
+    const scid = hexBytes("c0ffee00");
+
+    // Off: neither parameter appears, so a peer must not send either frame (RFC 9221 3,
+    // draft-ietf-quic-reliable-stream-reset-09 3).
+    const plain = encodeTransportParams(&buf, &dcid, &scid, 30000, 128, .{});
+    try std.testing.expect(std.mem.indexOfScalar(u8, buf[0..plain], 0x20) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, buf[0..plain], 0x1d) == null);
+
+    // On: max_datagram_frame_size (0x20) with its value, then the empty reset_stream_at (0x1d, length 0).
+    const ext = encodeTransportParams(&buf, &dcid, &scid, 30000, 128, .{ .max_datagram_frame_size = 1200, .reset_stream_at = true });
+
+    const dgram_at = std.mem.indexOfScalar(u8, buf[0..ext], 0x20).?;
+    try std.testing.expectEqual(@as(u8, 0x20), buf[dgram_at]);
+    try std.testing.expectEqual(@as(u8, 2), buf[dgram_at + 1]); // a 1200 value needs two varint bytes
+    try std.testing.expectEqualSlices(u8, &hexBytes("44b0"), buf[dgram_at + 2 .. dgram_at + 4]);
+
+    const reset_at = std.mem.indexOfScalar(u8, buf[dgram_at + 4 .. ext], 0x1d).? + dgram_at + 4;
+    try std.testing.expectEqual(@as(u8, 0x1d), buf[reset_at]);
+    try std.testing.expectEqual(@as(u8, 0), buf[reset_at + 1]); // an empty value
+
+    // A zero frame size is the same as omitting the parameter: the peer would otherwise read it as
+    // "datagrams supported, but nothing fits".
+    const zero = encodeTransportParams(&buf, &dcid, &scid, 30000, 128, .{ .max_datagram_frame_size = 0, .reset_stream_at = true });
+    try std.testing.expect(std.mem.indexOfScalar(u8, buf[0..zero], 0x20) == null);
+}
+
 test "zix http3: EncryptedExtensions carries ALPN h3 and transport parameters" {
     var buf: [512]u8 = undefined;
-    const ee = buildEncryptedExtensions(&buf, &hexBytes("8394c8f03e515708"), &hexBytes("c0ffee00"), 30000, 128);
+    const ee = buildEncryptedExtensions(&buf, &hexBytes("8394c8f03e515708"), &hexBytes("c0ffee00"), 30000, 128, .{});
 
     // EncryptedExtensions handshake type, and the 24-bit length matches the remaining bytes.
     try std.testing.expectEqual(@as(u8, 0x08), ee[0]);

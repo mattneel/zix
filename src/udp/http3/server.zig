@@ -24,6 +24,7 @@ const core = @import("core.zig");
 const static_cache = @import("../../utils/static_cache.zig");
 const dispatch_support = @import("../../utils/dispatch_support.zig");
 
+const Webtransport = @import("webtransport/Webtransport.zig");
 const common = @import("dispatch/common.zig");
 const async_model = @import("dispatch/async.zig");
 const epoll_model = @import("dispatch/epoll.zig");
@@ -66,9 +67,21 @@ fn Http3ServerImpl(comptime handler: HandlerFn) type {
         /// - error.ZixPortNotConfigured if config.port is 0
         /// - error.ZixTlsRequired if config.tls is null (QUIC has no cleartext mode)
         /// - error.ZixDispatchModelUnsupported if dispatch_model is .EPOLL or .URING off Linux
+        /// - error.ZixWebtransportConfig if the WebTransport knobs exceed what the engine can hold
         pub fn run(self: *const Self) !void {
             if (self.config.port == 0) return error.ZixPortNotConfigured;
-            if (self.config.tls == null) return error.ZixTlsRequired;
+
+            // WebTransport is checked before anything is bound, so a config the engine cannot honour
+            // fails to start instead of silently running with a smaller feature than it advertises.
+            // Webtransport.capacityError(config) names the offending field for a caller that wants to
+            // report which knob to lower; the run path only needs the verdict.
+            if (self.config.webtransport.enabled) {
+                if (Webtransport.capacityError(self.config.webtransport) != null) return error.ZixWebtransportConfig;
+
+                // One decrypted 1-RTT payload has to hold a whole DATAGRAM frame for the receive path to
+                // read it, so the advertised frame limit cannot exceed that buffer.
+                if (self.config.webtransport.max_datagram_frame_size > common.max_app_payload_buf) return error.ZixWebtransportConfig;
+            }
 
             // Reject an unrunnable model before binding, so a rejected config leaves nothing
             // behind (ADR-065).
@@ -77,6 +90,8 @@ fn Http3ServerImpl(comptime handler: HandlerFn) type {
 
                 return error.ZixDispatchModelUnsupported;
             }
+
+            if (self.config.tls == null) return error.ZixTlsRequired;
 
             // Static serving is opt-in: when public_dir is set, fail fast if the directory is absent
             // rather than 404-ing every file request at runtime. Mirrors zix.Http1.Server.run.
@@ -160,6 +175,38 @@ pub const Server = struct {
 // --------------------------------------------------------------- //
 
 fn noopHandler(_: *const Request, _: *Response, _: *Context) !void {}
+
+test "zix http3: run rejects a WebTransport config the engine cannot hold" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    // The connection tables are sized from these ceilings, so a larger value would promise a client more
+    // sessions than the engine can track.
+    var too_many_sessions = Server.init(noopHandler, .{
+        .io = threaded.io(),
+        .allocator = std.testing.allocator,
+        .ip = "127.0.0.1",
+        .port = 9063,
+        .dispatch_model = .ASYNC,
+        .webtransport = .{ .enabled = true, .max_sessions_per_connection = Webtransport.connection_session_cap + 1 },
+    });
+    defer too_many_sessions.deinit();
+
+    try std.testing.expectError(error.ZixWebtransportConfig, too_many_sessions.run());
+
+    // A DATAGRAM frame larger than the payload buffer the receive path decodes into could never be read.
+    var too_large = Server.init(noopHandler, .{
+        .io = threaded.io(),
+        .allocator = std.testing.allocator,
+        .ip = "127.0.0.1",
+        .port = 9063,
+        .dispatch_model = .ASYNC,
+        .webtransport = .{ .enabled = true, .max_datagram_frame_size = common.max_app_payload_buf + 1 },
+    });
+    defer too_large.deinit();
+
+    try std.testing.expectError(error.ZixWebtransportConfig, too_large.run());
+}
 
 test "zix http3: run rejects port zero and missing TLS" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});

@@ -2,8 +2,10 @@
 //!
 //! What:
 //! - The prefixed-integer codec every representation rides on (4.1.1, reusing the RFC 7541 integer),
-//!   the read-only static table (Appendix A), the two unidirectional stream types (4.2), and the
-//!   field line representations (4.5): Indexed Field Line and Literal Field Line with Name Reference.
+//!   the read-only static table (the full Appendix A), the two unidirectional stream types (4.2), and
+//!   the field line representations (4.5): Indexed Field Line, Literal Field Line with Name Reference,
+//!   and Literal Field Line with Literal Name (4.5.6, the one a client has to use for a name the table
+//!   carries no entry for, which is how `:protocol` arrives).
 //! - For a static-only field section the Encoded Field Section Prefix is Required Insert Count 0 /
 //!   Base 0 (two zero bytes). The dynamic table and decoder instructions live in qpack_dynamic.zig.
 //! - Proven against the RFC 7541 Appendix C.1 integer vectors and RFC 9204 representations below.
@@ -11,8 +13,13 @@
 //! Note:
 //! - The static-table encoding is live. StreamRegistry (the at-most-one encoder / decoder stream
 //!   check) is implemented and tested but not enforced in the serve path yet (deferred).
+//! - The string literals (4.1.2) of a field line stay as they arrived: a VALUE is handed over with its
+//!   `H` bit, so only a caller that uses it pays for expanding it. A field NAME is expanded here, into
+//!   the caller's scratch, because a name has to be readable to say which field the line is.
 
 const std = @import("std");
+
+const huffman = @import("huffman.zig");
 
 /// A decoded prefixed integer (RFC 7541 5.1): the value plus how many bytes it occupied.
 pub const IntResult = struct { value: u64, len: usize };
@@ -69,10 +76,15 @@ pub fn encodePrefixedInt(out: []u8, prefix_bits: u4, high_bits: u8, value: u64) 
 /// A field line: a name and value (RFC 9204 Appendix A entries, and decoded representations).
 pub const Field = struct { name: []const u8, value: []const u8 };
 
-/// The leading block of the RFC 9204 Appendix A static table (indices 0..43). Covers every
-/// pseudo-header, `accept-encoding` (index 31, the request content-negotiation input), and
-/// `content-encoding` (indices 42 br / 43 gzip, the response codings served). The remaining Appendix A
-/// entries are reached as Literal Field Lines with Name Reference until the full table is carried.
+/// The RFC 9204 Appendix A static table, all 99 entries. A client references it by index and the
+/// encoder must reference only entries the decoder knows, so a short table is not a smaller feature:
+/// it is a name this decoder cannot resolve (`origin` is entry 90, and the WebTransport binding reads
+/// exactly that field). `:authority` (0), `accept-encoding` (31) and `content-encoding` (42 br /
+/// 43 gzip) are the entries the rest of this tree reaches for by name today.
+///
+/// Note:
+/// - `:protocol` is not in Appendix A: a CONNECT carrying it spells the name out (4.5.6), which is why
+///   that representation has to be decoded, not looked up.
 pub const static_table = [_]Field{
     .{ .name = ":authority", .value = "" }, // 0
     .{ .name = ":path", .value = "/" }, // 1
@@ -118,6 +130,61 @@ pub const static_table = [_]Field{
     .{ .name = "cache-control", .value = "public, max-age=31536000" }, // 41
     .{ .name = "content-encoding", .value = "br" }, // 42
     .{ .name = "content-encoding", .value = "gzip" }, // 43
+    .{ .name = "content-type", .value = "application/dns-message" }, // 44
+    .{ .name = "content-type", .value = "application/javascript" }, // 45
+    .{ .name = "content-type", .value = "application/json" }, // 46
+    .{ .name = "content-type", .value = "application/x-www-form-urlencoded" }, // 47
+    .{ .name = "content-type", .value = "image/gif" }, // 48
+    .{ .name = "content-type", .value = "image/jpeg" }, // 49
+    .{ .name = "content-type", .value = "image/png" }, // 50
+    .{ .name = "content-type", .value = "text/css" }, // 51
+    .{ .name = "content-type", .value = "text/html; charset=utf-8" }, // 52
+    .{ .name = "content-type", .value = "text/plain" }, // 53
+    .{ .name = "content-type", .value = "text/plain;charset=utf-8" }, // 54
+    .{ .name = "range", .value = "bytes=0-" }, // 55
+    .{ .name = "strict-transport-security", .value = "max-age=31536000" }, // 56
+    .{ .name = "strict-transport-security", .value = "max-age=31536000; includesubdomains" }, // 57
+    .{ .name = "strict-transport-security", .value = "max-age=31536000; includesubdomains; preload" }, // 58
+    .{ .name = "vary", .value = "accept-encoding" }, // 59
+    .{ .name = "vary", .value = "origin" }, // 60
+    .{ .name = "x-content-type-options", .value = "nosniff" }, // 61
+    .{ .name = "x-xss-protection", .value = "1; mode=block" }, // 62
+    .{ .name = ":status", .value = "100" }, // 63
+    .{ .name = ":status", .value = "204" }, // 64
+    .{ .name = ":status", .value = "206" }, // 65
+    .{ .name = ":status", .value = "302" }, // 66
+    .{ .name = ":status", .value = "400" }, // 67
+    .{ .name = ":status", .value = "403" }, // 68
+    .{ .name = ":status", .value = "421" }, // 69
+    .{ .name = ":status", .value = "425" }, // 70
+    .{ .name = ":status", .value = "500" }, // 71
+    .{ .name = "accept-language", .value = "" }, // 72
+    .{ .name = "access-control-allow-credentials", .value = "FALSE" }, // 73
+    .{ .name = "access-control-allow-credentials", .value = "TRUE" }, // 74
+    .{ .name = "access-control-allow-headers", .value = "*" }, // 75
+    .{ .name = "access-control-allow-methods", .value = "get" }, // 76
+    .{ .name = "access-control-allow-methods", .value = "get, post, options" }, // 77
+    .{ .name = "access-control-allow-methods", .value = "options" }, // 78
+    .{ .name = "access-control-expose-headers", .value = "content-length" }, // 79
+    .{ .name = "access-control-request-headers", .value = "content-type" }, // 80
+    .{ .name = "access-control-request-method", .value = "get" }, // 81
+    .{ .name = "access-control-request-method", .value = "post" }, // 82
+    .{ .name = "alt-svc", .value = "clear" }, // 83
+    .{ .name = "authorization", .value = "" }, // 84
+    .{ .name = "content-security-policy", .value = "script-src 'none'; object-src 'none'; base-uri 'none'" }, // 85
+    .{ .name = "early-data", .value = "1" }, // 86
+    .{ .name = "expect-ct", .value = "" }, // 87
+    .{ .name = "forwarded", .value = "" }, // 88
+    .{ .name = "if-range", .value = "" }, // 89
+    .{ .name = "origin", .value = "" }, // 90
+    .{ .name = "purpose", .value = "prefetch" }, // 91
+    .{ .name = "server", .value = "" }, // 92
+    .{ .name = "timing-allow-origin", .value = "*" }, // 93
+    .{ .name = "upgrade-insecure-requests", .value = "1" }, // 94
+    .{ .name = "user-agent", .value = "" }, // 95
+    .{ .name = "x-forwarded-for", .value = "" }, // 96
+    .{ .name = "x-frame-options", .value = "deny" }, // 97
+    .{ .name = "x-frame-options", .value = "sameorigin" }, // 98
 };
 
 /// The two QPACK unidirectional stream types (RFC 9204 4.2).
@@ -167,6 +234,22 @@ pub fn encodeStaticIndexedFieldLine(out: []u8, index: u64) usize {
     return encodePrefixedInt(out, 6, 0x80 | 0x40, index);
 }
 
+/// A string literal (RFC 9204 4.1.2): an `H` bit, an N-bit prefix length, then the bytes, still
+/// Huffman-coded when that bit is set. Expanding is the caller's call, not this layer's.
+const StringLiteral = struct { bytes: []const u8, huffman: bool, len: usize };
+
+/// Decode a string literal (RFC 9204 4.1.2) whose `H` bit and length prefix start at `data[0]`.
+fn decodeStringLiteral(data: []const u8, prefix_bits: u4) error{ZixTruncated}!StringLiteral {
+    if (data.len == 0) return error.ZixTruncated;
+
+    const huffman_coded = data[0] & 0x80 != 0;
+    const length = try decodePrefixedInt(data, prefix_bits);
+    const end = length.len + @as(usize, @intCast(length.value));
+    if (data.len < end) return error.ZixTruncated;
+
+    return .{ .bytes = data[length.len..end], .huffman = huffman_coded, .len = end };
+}
+
 /// A decoded Literal Field Line with Name Reference (RFC 9204 4.5.4). `len` is the total bytes the
 /// representation consumed, for walking a field section.
 pub const LiteralNameRef = struct { static: bool, name_index: u64, value: []const u8, huffman: bool, len: usize };
@@ -179,16 +262,73 @@ pub fn decodeLiteralNameRef(data: []const u8) error{ ZixTruncated, ZixNotLiteral
 
     const is_static = data[0] & 0x10 != 0;
     const name = try decodePrefixedInt(data, 4);
-    var pos = name.len;
+    const value = try decodeStringLiteral(data[name.len..], 7);
 
-    if (pos >= data.len) return error.ZixTruncated;
+    return .{ .static = is_static, .name_index = name.value, .value = value.bytes, .huffman = value.huffman, .len = name.len + value.len };
+}
 
-    const huffman = data[pos] & 0x80 != 0;
-    const length = try decodePrefixedInt(data[pos..], 7);
-    pos += length.len;
-    if (data.len < pos + length.value) return error.ZixTruncated;
+/// A decoded Literal Field Line with Literal Name (RFC 9204 4.5.6). `len` is the total bytes the
+/// representation consumed, for walking a field section.
+///
+/// Note:
+/// - `name` is expanded into the caller's `name_scratch` when it arrived Huffman-coded, because a name
+///   has to be readable to say which field the line is. A name that does not fit the scratch leaves
+///   `name` empty: the line is then one the caller does not model, which is the caller's business and
+///   not a decode failure. `value` keeps the coding it arrived in, like every other decoded value.
+pub const LiteralLiteralName = struct {
+    name: []const u8,
+    name_huffman: bool,
+    value: []const u8,
+    huffman: bool,
+    len: usize,
+};
 
-    return .{ .static = is_static, .name_index = name.value, .value = data[pos .. pos + length.value], .huffman = huffman, .len = pos + @as(usize, @intCast(length.value)) };
+/// Decode a Literal Field Line with Literal Name (RFC 9204 4.5.6): leading '001', the 'N' bit, the
+/// name's own 'H' bit, a 3-bit prefix name length, the name string, then an 8-bit prefix value length
+/// and the value string.
+///
+/// Note:
+/// - This is the only representation that can carry a name the static table has no entry for, which is
+///   what makes it load-bearing for a WebTransport session: `:protocol` is in no static entry, so an
+///   extended CONNECT spells it out (RFC 9220 4).
+///
+/// Param:
+/// data - []const u8 (the field section, from this representation's first byte)
+/// name_scratch - []u8 (destination for a Huffman-coded name; empty is legal and drops every such name)
+///
+/// Return:
+/// - LiteralLiteralName
+/// - error.ZixTruncated when the representation runs past `data`
+/// - error.ZixNotLiteralLiteralName when the first byte is not this representation
+pub fn decodeLiteralLiteralName(data: []const u8, name_scratch: []u8) error{ ZixTruncated, ZixNotLiteralLiteralName }!LiteralLiteralName {
+    if (data.len == 0) return error.ZixTruncated;
+    if (data[0] & 0xe0 != 0x20) return error.ZixNotLiteralLiteralName;
+
+    const name_huffman = data[0] & 0x08 != 0;
+    const name_length = try decodePrefixedInt(data, 3);
+    const name_end = name_length.len + @as(usize, @intCast(name_length.value));
+    if (data.len < name_end) return error.ZixTruncated;
+
+    const encoded_name = data[name_length.len..name_end];
+    const value = try decodeStringLiteral(data[name_end..], 7);
+
+    return .{
+        .name = if (name_huffman) expandName(name_scratch, encoded_name) else encoded_name,
+        .name_huffman = name_huffman,
+        .value = value.bytes,
+        .huffman = value.huffman,
+        .len = name_end + value.len,
+    };
+}
+
+/// The bytes a Huffman-coded field name expands to, or empty when the scratch does not hold it. Both
+/// outcomes let the walk move on, which is what the caller needs: an unreadable name is a field it
+/// does not model. A bigger buffer would not buy it anything either, because every name it models is
+/// short, `accept-encoding` (15) and `:authority` (10) included.
+fn expandName(scratch: []u8, encoded: []const u8) []const u8 {
+    const len = huffman.decode(scratch, encoded) orelse return "";
+
+    return scratch[0..len];
 }
 
 /// Encode a Literal Field Line with Name Reference against the static table (RFC 9204 4.5.4): the
@@ -275,6 +415,25 @@ test "zix http3: RFC 9204 Appendix A static table and 4.2 streams" {
     try std.testing.expectError(error.ZixStreamCreationError, registry.register(decoder_stream_type));
 }
 
+test "zix http3: the static table is the whole Appendix A, origin included" {
+    // A client may reference any Appendix A index, so a table that stops early is a name the decoder
+    // cannot resolve. `origin` (90) is the one the WebTransport binding reads; the values 52/54 and 57
+    // are the ones the RFC wraps mid-token in its own fixed-width table, so they are pinned here to
+    // the unwrapped values: folding them wrongly in would be silent.
+    try std.testing.expectEqual(@as(usize, 99), static_table.len);
+
+    try std.testing.expect(fieldIs(staticEntry(0).?, ":authority", ""));
+    try std.testing.expect(fieldIs(staticEntry(52).?, "content-type", "text/html; charset=utf-8"));
+    try std.testing.expect(fieldIs(staticEntry(54).?, "content-type", "text/plain;charset=utf-8"));
+    try std.testing.expect(fieldIs(staticEntry(57).?, "strict-transport-security", "max-age=31536000; includesubdomains"));
+    try std.testing.expect(fieldIs(staticEntry(85).?, "content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"));
+    try std.testing.expect(fieldIs(staticEntry(90).?, "origin", ""));
+    try std.testing.expect(fieldIs(staticEntry(98).?, "x-frame-options", "sameorigin"));
+
+    // Past the table is past what any client may reference.
+    try std.testing.expect(staticEntry(99) == null);
+}
+
 test "zix http3: RFC 9204 4.5 static-table field line representations" {
     const idx_path = try decodeIndexedFieldLine(&hexBytes("c1"));
     try std.testing.expect(idx_path.static and fieldIs(static_table[idx_path.index], ":path", "/"));
@@ -291,6 +450,68 @@ test "zix http3: RFC 9204 4.5 static-table field line representations" {
     const lit = try decodeLiteralNameRef(&hexBytes("500b6578616d706c652e636f6d"));
     try std.testing.expect(lit.static and std.mem.eql(u8, static_table[lit.name_index].name, ":authority"));
     try std.testing.expect(std.mem.eql(u8, lit.value, "example.com") and !lit.huffman);
+}
+
+test "zix http3: RFC 9204 4.5.6 literal field line with a literal name" {
+    // `:protocol: webtransport` spelled out, which is the only way a name with no static entry can
+    // arrive: leading '001' (0x27 with the 3-bit prefix saturated), the name length as a continuation
+    // byte (0x02, so 9 in total), the name, then the value as an 8-bit prefix string literal.
+    const encoded = hexBytes("27023a70726f746f636f6c0c7765627472616e73706f7274");
+    var scratch: [32]u8 = undefined;
+
+    const line = try decodeLiteralLiteralName(&encoded, &scratch);
+    try std.testing.expectEqualStrings(":protocol", line.name);
+    try std.testing.expect(!line.name_huffman);
+    try std.testing.expectEqualStrings("webtransport", line.value);
+    try std.testing.expect(!line.huffman);
+    try std.testing.expectEqual(encoded.len, line.len);
+
+    // The representations are told apart by their leading bits, in both directions.
+    try std.testing.expectError(error.ZixNotLiteralNameRef, decodeLiteralNameRef(&encoded));
+    try std.testing.expectError(error.ZixNotLiteralLiteralName, decodeLiteralLiteralName(&hexBytes("c1"), &scratch));
+
+    // A name length left without its continuation byte is a truncated representation.
+    try std.testing.expectError(error.ZixTruncated, decodeLiteralLiteralName(&hexBytes("27"), &scratch));
+}
+
+test "zix http3: RFC 9204 4.5.6 expands a Huffman-coded name and leaves the value coded" {
+    // The same line with both strings Huffman-coded, the shape a browser sends: the name's 'H' bit is
+    // set (0x2f) and so is the value's (0x89).
+    const encoded = hexBytes("2f00b95d8749c87a3f89f058d360ea4567b13f");
+    var scratch: [32]u8 = undefined;
+
+    const line = try decodeLiteralLiteralName(&encoded, &scratch);
+    try std.testing.expect(line.name_huffman);
+    try std.testing.expectEqualStrings(":protocol", line.name);
+    try std.testing.expect(line.huffman);
+
+    // The value is handed over exactly as it arrived: Huffman("webtransport"), for the caller to
+    // expand only if it is going to use it.
+    try std.testing.expectEqualSlices(u8, &hexBytes("f058d360ea4567b13f"), line.value);
+    try std.testing.expectEqual(encoded.len, line.len);
+
+    // Without a scratch the name cannot be compared, so it comes back empty (the line is then not one
+    // the caller models), and the representation is still measured out whole.
+    const dropped = try decodeLiteralLiteralName(&encoded, &[_]u8{});
+    try std.testing.expectEqual(@as(usize, 0), dropped.name.len);
+    try std.testing.expect(dropped.name_huffman);
+    try std.testing.expectEqualSlices(u8, line.value, dropped.value);
+    try std.testing.expectEqual(encoded.len, dropped.len);
+}
+
+test "zix http3: RFC 9204 4.5.6 drops a Huffman name too long for the scratch" {
+    // A 64-byte name, Huffman-coded to 56 bytes ('x' is a 7-bit code, repeated). The scratch holds 48,
+    // so the name is unreadable and comes back empty, while the value and the length are still read:
+    // the walk can move on either way.
+    const encoded = hexBytes("2f31" ++ "f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9f3e7cf9" ++ "0176");
+    var scratch: [48]u8 = undefined;
+
+    const line = try decodeLiteralLiteralName(&encoded, &scratch);
+    try std.testing.expect(line.name_huffman);
+    try std.testing.expectEqual(@as(usize, 0), line.name.len);
+    try std.testing.expectEqualStrings("v", line.value);
+    try std.testing.expect(!line.huffman);
+    try std.testing.expectEqual(encoded.len, line.len);
 }
 
 test "zix http3: encodeStaticLiteralNameRef writes a field line its own decoder reads back" {

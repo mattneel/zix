@@ -32,6 +32,7 @@ pub const Http1 = @import("tcp/http1/Http1.zig");
 pub const Http2 = @import("tcp/http2/Http2.zig");
 pub const Http3 = @import("udp/http3/Http3.zig");
 pub const Webrtc = @import("udp/webrtc/Webrtc.zig");
+pub const Webtransport = @import("udp/http3/webtransport/Webtransport.zig");
 pub const Grpc = @import("tcp/http2/grpc/Grpc.zig");
 pub const Fix = @import("tcp/fix/Fix.zig");
 pub const Uds = @import("uds/Uds.zig");

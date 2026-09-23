@@ -47,6 +47,36 @@ __*Fix:*__
 
 ## X.Y.Z (YYYY-MM-DD)
 
+### __**Fitur Baru:**__
+
+#### Modul Baru: `zix.Webtransport` (WebTransport over HTTP/3)
+
+WebTransport over HTTP/3 sebagai fitur `zix.Http3` (ADR-069), dilayani di koneksi QUIC yang sudah dimiliki engine. Diaktifkan dengan `Http3ServerConfig.webtransport`, dan request HTTP/3 biasa tetap dilayani di koneksi yang sama.
+
+- **Dua dialect di wire, keduanya diterima.** draft-ietf-webtrans-http3-16 (token `webtransport-h3`, `SETTINGS_WT_ENABLED` 0x2c7cf000, flow control level session, `RESET_STREAM_AT` pada reset stream) dan draft-07 deployed (token `webtransport`, `SETTINGS_ENABLE_WEBTRANSPORT` 0x2b603742, `SETTINGS_WEBTRANSPORT_MAX_SESSIONS` 0xc671706a) yang masih dikirim browser dan aioquic. Server mengiklankan kedua codepoint di satu SETTINGS frame, dan token `:protocol` pada CONNECT yang memilih dialect session.
+- **Public API `zix.Webtransport`:** `Config` pada server HTTP/3, `Handler` dengan lima callback opsional (`on_session`, `on_stream`, `on_stream_reset`, `on_datagram`, `on_close`), dan dua handle, `Session` (`openBidi`, `openUni`, `sendDatagram`, `close`, `drain`, `streamsAvailable`, `closeInfo`) serta `Stream` (`read`, `write`, `finish`, `reset`, `stop`). Handler tidak pernah menyebut stream id, frame, atau capsule.
+- **Wire:** extended CONNECT over HTTP/3 (RFC 9220) membuka session, capsule protocol (RFC 9297 3) membawa close dan drain plus capsule flow control draft-16, HTTP/3 datagram (RFC 9297 2) menumpang QUIC DATAGRAM frame (RFC 9221) dengan kunci quarter stream id, dan stream data adalah stream QUIC yang dibuka dengan type 0x54 (unidirectional) atau signal value 0x41 (bidirectional) lalu session id. Reset draft-16 memakai `RESET_STREAM_AT` (draft-ietf-quic-reliable-stream-reset-09) dengan reliable size yang mencakup header stream, sehingga asosiasi session bertahan meski payload-nya dibuang.
+- **Codepoint:** capsule `WT_CLOSE_SESSION` 0x2843, `WT_DRAIN_SESSION` 0x78ae, `WT_MAX_DATA` 0x190B4D3D, `WT_DATA_BLOCKED` 0x190B4D41, `WT_MAX_STREAMS` 0x190B4D3F / 0x190B4D40, `WT_STREAMS_BLOCKED` 0x190B4D43 / 0x190B4D44; error code `WT_SESSION_GONE` 0x170d7b68, `WT_BUFFERED_STREAM_REJECTED` 0x3994bd84, `WT_FLOW_CONTROL_ERROR` 0x045d4487; application error code dipetakan ke rentang terreservasi 0x52e4a40fa8db sampai 0x52e5ac983162 sambil melewati setiap codepoint grease HTTP/3.
+- **Milik worker, kapasitas tetap.** Session, stream data beserta send buffer-nya, dan buffer stream pra-session berasal dari pool yang dialokasikan sekali per worker, sehingga jalur receive tidak mengalokasi apa pun dan pool menolak alih-alih tumbuh. `Webtransport.capacityError` melaporkan field yang melewati plafon compile-time (`connection_session_cap` 8 session, `connection_stream_cap` 32 stream per koneksi, dan maxima pool) alih-alih memotong fitur secara diam-diam.
+- **Penolakan adalah jawaban protokol, bukan drop.** Plafon session dijawab 429 dan pool penuh 503 pada stream request; stream pra-session melewati buffer direset dengan `WT_BUFFERED_STREAM_REJECTED`; pelanggaran flow control session menutup session dengan `WT_FLOW_CONTROL_ERROR`; dan setiap stream session yang berakhir direset dengan `WT_SESSION_GONE`.
+- **Contoh:** [examples/tls/http3_webtransport.zig](examples/tls/http3_webtransport.zig) pada 127.0.0.1:9089, dibangun sebagai `zig build example-http3_webtransport`: menerima session di `/echo`, memantulkan setiap chunk stream data dan setiap datagram, membuka satu stream unidirectional per session dengan banner, dan mencetak lifecycle session ke stderr.
+- **Runner:** `zig build test-runner-webtransport` menjalankan contoh itu dan menggerakkannya end to end dengan client HTTP/3 buatan sendiri (extended CONNECT dijawab 2xx, banner pada stream unidirectional, echo stream data bidirectional, dan echo datagram). Step ini juga bagian dari `test-runner-all`.
+- **Dokumentasi:** [`docs/hld-webtransport-id.md`](docs/hld-webtransport-id.md) / [`docs/hld-webtransport-en.md`](docs/hld-webtransport-en.md) dan [`docs/lld-webtransport-id.md`](docs/lld-webtransport-id.md) / [`docs/lld-webtransport-en.md`](docs/lld-webtransport-en.md), plus ADR-069.
+- **Belum di pass ini:** varian WebTransport over HTTP/2 berbasis capsule, session 0-RTT, keying-material exporter, priority signalling, dan drain session yang dipicu GOAWAY. Lihat tabel Belum Diwire di HLD.
+
+<br>
+
+### __**Fixed:**__
+
+#### HTTP/3 over QUIC
+
+Dua cacat yang sudah ada sebelumnya di engine dan muncul ke permukaan oleh pekerjaan WebTransport, keduanya ditemukan oleh client nyata, bukan oleh client in-tree.
+
+- **Paket long-header dibatasi field Length miliknya sendiri, bukan akhir datagram (`src/udp/http3/protection.zig`).** AEAD membaca tag-nya melewati batas paket: client yang menulis apa pun setelah Initial-nya (paket yang dikoalesikan, atau padding yang ditambahkan aioquic untuk mencapai lantai datagram 1200 byte) mengautentikasi byte yang salah lalu gagal, sehingga handshake-nya tidak pernah mulai. `packet.longPacketBounds` sekarang menyediakan akhir paket dan dipakai bersama oleh walk paket terkoalesi, sehingga aritmetika yang sama menentukan keduanya. Initial aioquic hasil capture (field Length 478 byte di dalam datagram 1200 byte) gagal sebelumnya dan kini terbuka, dan aioquic menyelesaikan handshake QUIC / TLS terhadap engine lalu membuka session.
+- **Setiap paket yang dibawa satu datagram dilayani, bukan hanya yang pertama (`src/udp/http3/dispatch/common.zig`).** `serveDatagram` membaca paket pertama sebuah datagram lalu berhenti, sehingga paket 1-RTT yang dikoalesikan setelah paket Initial atau Handshake dibuang diam-diam. Ia kini menelusuri paket-paket dalam satu datagram (RFC 9000 12.2), dengan `servePacket` sebagai langkah per paket, dan itulah yang diandalkan client yang mengoalesikan flight pertamanya.
+
+<br>
+
 __**Update:**__
 - Memperkenalkan `zix.utils.charsets` dari `src/utils/charsets.zig`:
     - Mengkover mulai dari `alphabet`, `ALPHABET`, `ALPHANUMERIC`, `NUMERIC_STRING`, `punctuation`, `ALPHANUMERIC_PUNCTUATION`, `base32`, dan `base64`.

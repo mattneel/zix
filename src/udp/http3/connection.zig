@@ -24,6 +24,11 @@ const demux = @import("demux.zig");
 const keyschedule = @import("keyschedule.zig");
 const transport_params = @import("transport_params.zig");
 const response = @import("response.zig");
+const wt = @import("webtransport/session.zig");
+const wt_api = @import("webtransport/Webtransport.zig");
+const stream_header = @import("webtransport/stream_header.zig");
+const wt_pool = @import("webtransport/pool.zig");
+const varint = @import("varint.zig");
 const static = @import("static.zig");
 const ks = @import("../../tls/key_schedule.zig");
 
@@ -39,6 +44,10 @@ pub const max_send_streams = 64;
 
 /// Decrypted 1-RTT payload copy buffer per connection: caps multiplexed request bytes per datagram.
 const DEFAULT_APP_PAYLOAD_BUF: usize = 2048;
+
+/// The decrypted 1-RTT payload buffer size, for callers that must not exceed it: a whole DATAGRAM frame
+/// has to fit here for the receive path to read it, which is what caps the advertised frame size.
+pub const app_payload_buf_len: usize = DEFAULT_APP_PAYLOAD_BUF;
 
 /// Huffman-decoded :path scratch buffer per connection: caps the decoded path length.
 const DEFAULT_PATH_SCRATCH: usize = 1024;
@@ -94,6 +103,9 @@ pub const SentRangeInfo = struct {
     stream_id: u64,
     offset: usize,
     length: u32,
+    /// Whether this range is a DATAGRAM frame rather than stream bytes: ack-eliciting and congestion
+    /// controlled, but never retransmitted (RFC 9221 5.2), so the recovery paths leave it alone.
+    datagram: bool = false,
 };
 
 /// One entry in the per-connection sent-packet log (Connection.sent_ranges): a SentRangeInfo tagged
@@ -105,6 +117,9 @@ const SentRange = struct {
     stream_id: u64 = 0,
     offset: usize = 0,
     length: u32 = 0,
+    /// Whether this range was a DATAGRAM frame: ack-eliciting, congestion controlled, never retransmitted
+    /// (RFC 9221 5.2), so the recovery paths leave it alone.
+    datagram: bool = false,
     in_flight: bool = false,
 };
 
@@ -172,6 +187,335 @@ pub const Maintenance = struct {
     idle: bool = false,
 };
 
+/// How many client unidirectional streams this connection remembers the type of. A client opens a
+/// handful per connection (a control stream, two QPACK streams, then one per WebTransport unidirectional
+/// stream), and the table is only needed to classify a stream whose type varint straddled a frame.
+pub const wt_uni_stream_types_cap: usize = 8;
+
+/// Bytes of the client's control stream this connection keeps. Its first frame is SETTINGS, which is small
+/// and is the only thing the engine reads off the control stream.
+pub const wt_control_stream_bytes: usize = 256;
+
+/// How many WebTransport CONNECT streams this connection holds while it waits for the client's SETTINGS.
+/// A client sends its SETTINGS and its CONNECT in the same flight, so one or two are enough; past this
+/// many the excess is refused rather than held.
+pub const wt_pending_connects_cap: usize = 4;
+
+/// The WebTransport state one QUIC connection holds.
+///
+/// What:
+/// - The client's SETTINGS reduced to what the binding reads, the client transport parameters that gate
+///   datagrams and reliable resets, the sessions live on this connection, and the data streams those
+///   sessions own.
+/// - The stream table exists for acknowledgement and loss recovery: a sent range names a stream id, and
+///   those paths run on the connection with no access to the worker pool, so the connection keeps its own
+///   view of the streams whose bytes are in flight.
+///
+/// Note:
+/// - Both tables are fixed arrays of pointers, paid once per eagerly allocated connection. The pool owns
+///   the storage behind them, and an entry is cleared when its session or stream ends, so a released
+///   slot is never reachable from here.
+/// - A WebTransport CONNECT may arrive before the client's SETTINGS; `settings_received` is what the
+///   serve path checks before it processes one (draft-ietf-webtrans-http3-16 7.1).
+pub const WebTransportState = struct {
+    /// The client's SETTINGS frame, decoded when its control stream arrives.
+    client_settings: h3.ClientSettings = .{},
+    /// Whether the client's SETTINGS have arrived.
+    settings_received: bool = false,
+    /// The client's max_datagram_frame_size: the largest DATAGRAM frame it accepts, 0 for none
+    /// (RFC 9221 3).
+    peer_datagram_frame_size: u64 = 0,
+    /// Whether the client advertised reset_stream_at, so a reliable reset may be sent to it
+    /// (draft-ietf-quic-reliable-stream-reset-09 3).
+    peer_reset_stream_at: bool = false,
+    /// The worker pool the sessions and streams on this connection came from, so a session can be given
+    /// back from a path that has only the connection (the pump reaping a closed session). Null until the
+    /// first session is attached, and never cleared: the pool outlives every connection on the worker.
+    pool: ?*wt_pool.Pool = null,
+    /// Live sessions, keyed by their CONNECT stream id (the pool owns the storage).
+    sessions: [wt_api.connection_session_cap]?*wt.Session = @splat(null),
+    /// Live data streams across every session of this connection (the pool owns the storage).
+    streams: [wt_api.connection_stream_cap]?*wt.Stream = @splat(null),
+    /// The next server-initiated bidirectional stream id (RFC 9000 2.1: 1 mod 4) and unidirectional id
+    /// (3 mod 4). A data stream takes an id only when the application opens one.
+    next_bidi_stream: u64 = 1,
+    next_uni_stream: u64 = 3,
+    /// Datagrams that arrived for a session this connection does not have, and were dropped (4.6).
+    dropped_datagrams: u64 = 0,
+    /// The type of each client unidirectional stream this connection classified (RFC 9114 6.2).
+    uni_types: [wt_uni_stream_types_cap]UniStreamType = @splat(.{}),
+    /// The first bytes of a client unidirectional stream whose type varint is still arriving.
+    uni_partial: [wt_uni_stream_types_cap]UniStreamPartial = @splat(.{}),
+    /// The client's control stream bytes so far, and how many are in use.
+    control: [wt_control_stream_bytes]u8 = undefined,
+    control_len: usize = 0,
+    /// WebTransport CONNECT streams waiting for the client's SETTINGS (see `wtIncomingConnect`): a server
+    /// MUST NOT process a WebTransport request before them (draft-16 7.1), and refusing the request
+    /// instead would cost the session when the SETTINGS packet is merely late.
+    pending_connects: [wt_pending_connects_cap]u64 = @splat(0),
+    pending_len: u8 = 0,
+
+    /// The session with this id, or null.
+    pub fn findSession(self: *const WebTransportState, session_id: u64) ?*wt.Session {
+        for (self.sessions) |entry| {
+            if (entry) |live| {
+                if (live.id == session_id) return live;
+            }
+        }
+
+        return null;
+    }
+
+    /// Track a session. False when the connection already holds as many as it can, which the caller
+    /// answers by refusing the CONNECT rather than by running a session it cannot rely on.
+    pub fn attachSession(self: *WebTransportState, live: *wt.Session) bool {
+        for (&self.sessions) |*entry| {
+            if (entry.* == null) {
+                entry.* = live;
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Stop tracking a session. Every stream of the session must already be detached.
+    pub fn detachSession(self: *WebTransportState, live: *wt.Session) void {
+        for (&self.sessions) |*entry| {
+            if (entry.* == live) entry.* = null;
+        }
+    }
+
+    /// The number of sessions this connection currently holds.
+    pub fn sessionCount(self: *const WebTransportState) usize {
+        var count: usize = 0;
+        for (self.sessions) |entry| {
+            if (entry != null) count += 1;
+        }
+
+        return count;
+    }
+
+    /// The data stream with this QUIC stream id, or null.
+    pub fn findStream(self: *const WebTransportState, stream_id: u64) ?*wt.Stream {
+        for (self.streams) |entry| {
+            if (entry) |live| {
+                if (live.id == stream_id) return live;
+            }
+        }
+
+        return null;
+    }
+
+    /// Track a data stream. False when the connection holds as many as it can.
+    pub fn attachStream(self: *WebTransportState, live: *wt.Stream) bool {
+        for (&self.streams) |*entry| {
+            if (entry.* == null) {
+                entry.* = live;
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Stop tracking a data stream.
+    pub fn detachStream(self: *WebTransportState, live: *wt.Stream) void {
+        for (&self.streams) |*entry| {
+            if (entry.* == live) entry.* = null;
+        }
+    }
+
+    /// Take the next server-initiated stream id of `kind`, advancing the counter.
+    pub fn takeStreamId(self: *WebTransportState, kind: stream_header.Kind) u64 {
+        return switch (kind) {
+            .bidi => blk: {
+                const id = self.next_bidi_stream;
+                self.next_bidi_stream += 4;
+
+                break :blk id;
+            },
+            .uni => blk: {
+                const id = self.next_uni_stream;
+                self.next_uni_stream += 4;
+
+                break :blk id;
+            },
+        };
+    }
+
+    /// The type of a client unidirectional stream, from the first bytes of the stream. The type is a
+    /// variable-length integer at offset 0 and can straddle two STREAM frames, so up to eight bytes are
+    /// remembered per stream until it resolves.
+    ///
+    /// Param:
+    /// stream_id - u64 (the client's unidirectional stream id)
+    /// offset - u64 (where these bytes sit in the stream: the type is only at offset 0)
+    /// data - []const u8 (the stream bytes just received)
+    ///
+    /// Return:
+    /// - ?u64 (the stream type, or null while it is still arriving)
+    pub fn uniStreamType(self: *WebTransportState, stream_id: u64, offset: u64, data: []const u8) ?u64 {
+        if (offset == 0) {
+            const type_vi = varint.read(data) catch {
+                self.holdPartial(stream_id, offset, data);
+
+                return null;
+            };
+
+            self.recordUniType(stream_id, type_vi.value);
+
+            return type_vi.value;
+        }
+
+        // A later frame: either the type is already known, or the held bytes plus these complete it.
+        for (self.uni_types) |entry| {
+            if (entry.stream_id == stream_id) return entry.stream_type;
+        }
+
+        for (&self.uni_partial) |*partial| {
+            if (partial.stream_id != stream_id) continue;
+
+            const room = partial.bytes.len - partial.len;
+            const copy = @min(room, data.len);
+            @memcpy(partial.bytes[partial.len..][0..copy], data[0..copy]);
+            partial.len += copy;
+
+            const type_vi = varint.read(partial.bytes[0..partial.len]) catch return null;
+            partial.len = 0;
+            self.recordUniType(stream_id, type_vi.value);
+
+            return type_vi.value;
+        }
+
+        return null;
+    }
+
+    /// Remember the first bytes of a stream whose type varint has not arrived whole.
+    fn holdPartial(self: *WebTransportState, stream_id: u64, offset: u64, data: []const u8) void {
+        for (&self.uni_partial) |*partial| {
+            if (partial.stream_id != stream_id) continue;
+
+            const room = partial.bytes.len - partial.len;
+            const copy = @min(room, data.len);
+            @memcpy(partial.bytes[partial.len..][0..copy], data[0..copy]);
+            partial.len += copy;
+
+            return;
+        }
+
+        for (&self.uni_partial) |*partial| {
+            if (partial.len != 0) continue;
+
+            partial.* = .{ .stream_id = stream_id, .offset = offset };
+            const copy = @min(partial.bytes.len, data.len);
+            @memcpy(partial.bytes[0..copy], data[0..copy]);
+            partial.len = copy;
+
+            return;
+        }
+    }
+
+    /// Store a resolved stream type, replacing the stream's held bytes.
+    fn recordUniType(self: *WebTransportState, stream_id: u64, stream_type: u64) void {
+        for (self.uni_partial, 0..) |partial, index| {
+            if (partial.stream_id == stream_id) self.uni_partial[index] = .{};
+        }
+
+        for (&self.uni_types) |*entry| {
+            if (entry.stream_id == stream_id) {
+                entry.stream_type = stream_type;
+
+                return;
+            }
+        }
+
+        for (&self.uni_types) |*entry| {
+            if (entry.stream_id != 0) continue;
+
+            entry.* = .{ .stream_id = stream_id, .stream_type = stream_type };
+
+            return;
+        }
+    }
+
+    /// Note a CONNECT stream that has to wait for the client's SETTINGS. False when the table is full,
+    /// which the caller answers by refusing the request.
+    pub fn notePendingConnect(self: *WebTransportState, stream_id: u64) bool {
+        for (self.pending_connects[0..self.pending_len]) |id| {
+            if (id == stream_id) return true;
+        }
+
+        if (self.pending_len == self.pending_connects.len) return false;
+
+        self.pending_connects[self.pending_len] = stream_id;
+        self.pending_len += 1;
+
+        return true;
+    }
+
+    /// Hand every waiting CONNECT stream id to `visit`, and clear the table. Called once the client's
+    /// SETTINGS arrive, which is the moment they can be processed.
+    pub fn takePendingConnects(self: *WebTransportState, comptime visit: anytype, context: anytype) void {
+        for (self.pending_connects[0..self.pending_len]) |id| visit(context, id);
+
+        self.pending_len = 0;
+    }
+
+    /// Accumulate the client's control stream and decode its SETTINGS frame once it is complete, which is
+    /// what tells this endpoint whether the client supports WebTransport and how much it allows
+    /// (RFC 9114 6.2.1, draft-ietf-webtrans-http3-16 5.5).
+    ///
+    /// Return:
+    /// - ?h3.ClientSettings (the settings, on the call that completed the frame; null otherwise)
+    pub fn feedControlStream(self: *WebTransportState, data: []const u8) ?h3.ClientSettings {
+        if (self.settings_received) return null;
+
+        const room = self.control.len - self.control_len;
+        const copy = @min(room, data.len);
+        @memcpy(self.control[self.control_len..][0..copy], data[0..copy]);
+        self.control_len += copy;
+
+        const type_vi = varint.read(self.control[0..self.control_len]) catch return null;
+
+        // RFC 9114 6.2.1 requires SETTINGS first. Any other frame means this endpoint never learns what the
+        // client supports, which the WebTransport checks then read as "not supported".
+        if (type_vi.value != @intFromEnum(h3.FrameType.settings)) {
+            self.settings_received = true;
+
+            return null;
+        }
+
+        var pos = type_vi.len;
+        const len_vi = varint.read(self.control[pos..self.control_len]) catch return null;
+        pos += len_vi.len;
+
+        const payload_len = std.math.cast(usize, len_vi.value) orelse return null;
+        if (pos + payload_len > self.control_len) return null;
+
+        self.client_settings = h3.parseClientSettings(self.control[pos..][0..payload_len]);
+        self.settings_received = true;
+
+        return self.client_settings;
+    }
+};
+
+/// One client unidirectional stream's resolved type.
+pub const UniStreamType = struct {
+    stream_id: u64 = 0,
+    stream_type: u64 = 0,
+};
+
+/// The first bytes of a client unidirectional stream whose type varint is still arriving.
+pub const UniStreamPartial = struct {
+    stream_id: u64 = 0,
+    offset: u64 = 0,
+    len: usize = 0,
+    bytes: [8]u8 = @splat(0),
+};
+
 /// One QUIC / HTTP-3 connection's state, keyed in the demux table by its Destination Connection ID.
 pub const Connection = struct {
     dcid: demux.ConnId,
@@ -216,6 +560,11 @@ pub const Connection = struct {
     // parses them (a minimal client that sends no transport parameters grants no large-body credit).
     client_max_stream_data: u64 = 0,
     client_max_data: u64 = 0,
+    // The client's per-stream send credit for the streams the server opens (RFC 9000 18.2 params 0x06 /
+    // 0x07), which is what bounds a WebTransport data stream the application opens until the client
+    // raises it with MAX_STREAM_DATA.
+    client_max_stream_data_bidi_remote: u64 = 0,
+    client_max_stream_data_uni: u64 = 0,
     // The largest UDP payload the client will accept (RFC 9000 transport parameter 0x03, max_udp_payload_size).
     // The send path never emits a datagram larger than this, so the client never has to drop one. Starts at
     // the QUIC minimum and is raised to the client's advertised value once the handshake parses it, so a
@@ -241,6 +590,9 @@ pub const Connection = struct {
     data_consumed: u64 = 0,
     // Large responses still being sent across packets, resumed as the client extends flow control.
     send_streams: [max_send_streams]SendStream = @splat(.{}),
+    // WebTransport: the client's settings and transport parameters, the sessions live on this
+    // connection, and the data streams whose bytes are in flight (see WebTransportState).
+    wt: WebTransportState = .{},
     // Loss detection and retransmission (RFC 9002). The power-of-two divisor the client used to
     // encode its ACK Delay fields, parsed from the ClientHello transport parameters (default 3,
     // RFC 9000 18.2, when the client advertises none).
@@ -388,6 +740,7 @@ pub const Connection = struct {
             .stream_id = info.stream_id,
             .offset = info.offset,
             .length = info.length,
+            .datagram = info.datagram,
             .in_flight = true,
         };
         self.sent_ranges_cursor += 1;
@@ -430,7 +783,19 @@ pub const Connection = struct {
                     entry.in_flight = false;
                     acked_bytes += entry.length;
                     self.bytes_in_flight -|= entry.length;
-                    if (self.findSendStream(entry.stream_id)) |stream| stream.unacked -|= entry.length;
+
+                    // The range belongs to an HTTP response stream (which only tallies what is
+                    // unacknowledged), a WebTransport data stream (which frees the confirmed prefix of its
+                    // send buffer, so the application can write again), or a DATAGRAM frame (which has no
+                    // stream to tell: it was never kept for a retransmission).
+                    if (entry.datagram) {
+                        // Nothing to retire beyond the in-flight tally above.
+                    } else if (self.findSendStream(entry.stream_id)) |stream| {
+                        stream.unacked -|= entry.length;
+                    } else if (self.wt.findStream(entry.stream_id)) |stream| {
+                        stream.onAcked(entry.offset, entry.length);
+                    }
+
                     break;
                 }
             }
@@ -456,9 +821,13 @@ pub const Connection = struct {
             entry.in_flight = false;
             self.bytes_in_flight -|= entry.length;
             lost_any = true;
-            if (self.findSendStream(entry.stream_id)) |stream| {
+            if (entry.datagram) {
+                // A lost datagram is gone (RFC 9221 5.2): no stream is rewound, so it is never resent.
+            } else if (self.findSendStream(entry.stream_id)) |stream| {
                 stream.unacked -|= entry.length;
                 if (entry.offset < stream.sent) stream.sent = entry.offset;
+            } else if (self.wt.findStream(entry.stream_id)) |stream| {
+                stream.onLost(entry.offset);
             }
         }
         if (lost_any) self.cc.onCongestionEvent();
@@ -527,9 +896,13 @@ pub const Connection = struct {
             entry.in_flight = false;
             self.bytes_in_flight -|= entry.length;
             resend = true;
-            if (self.findSendStream(entry.stream_id)) |stream| {
+            if (entry.datagram) {
+                // A Probe Timeout is not a retransmission request for a datagram (RFC 9221 5.2).
+            } else if (self.findSendStream(entry.stream_id)) |stream| {
                 stream.unacked -|= entry.length;
                 if (entry.offset < stream.sent) stream.sent = entry.offset;
+            } else if (self.wt.findStream(entry.stream_id)) |stream| {
+                stream.onLost(entry.offset);
             }
         }
 

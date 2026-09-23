@@ -379,3 +379,49 @@ pub fn runHttp3(io: std.Io, server_path: []const u8, port: u16) !void {
 
     if (!std.mem.eql(u8, body, "42")) return error.UnexpectedBody;
 }
+
+// --------------------------------------------------------- //
+
+/// What the WebTransport echo example answers with: the banner it writes on the unidirectional stream it
+/// opens per session, and the payloads this check sends on a data stream and in a datagram. Named here
+/// because they are the example's contract, not this check's choice.
+const webtransport_banner: []const u8 = "zix webtransport echo: write to a stream, or send a datagram\n";
+const webtransport_stream_payload: []const u8 = "zix webtransport runner stream";
+const webtransport_datagram_payload: []const u8 = "zix webtransport runner datagram";
+
+/// The path the example accepts sessions on. Every other one is answered 404.
+const webtransport_session_path: []const u8 = "/echo";
+
+/// WebTransport over HTTP/3: spawn the echo server, open one session with the hand-rolled QUIC client
+/// (an extended CONNECT on /echo carrying the draft-16 `webtransport-h3` token), then drive a data
+/// stream echo, a datagram echo, and the banner the server writes on the unidirectional stream it opens.
+///
+/// Note:
+/// - Same fixed bind moment as runHttp3, and for the same reason: a QUIC server binds a UDP socket with
+///   no accept to poll. Each answer is compared whole, so a short, padded, or reordered echo fails
+///   rather than passing on a shared prefix.
+pub fn runWebtransport(io: std.Io, server_path: []const u8, port: u16) !void {
+    var server_child = try common.spawnServer(io, server_path);
+    defer server_child.kill(io);
+
+    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1200), .awake);
+
+    // The session is open once the CONNECT is answered with 2xx; a refusal surfaces here instead.
+    var session = try http3_client.webtransportConnect(io, "127.0.0.1", port, webtransport_session_path);
+    defer session.close();
+
+    var banner_buf: [128]u8 = undefined;
+    const banner = try http3_client.webtransportBanner(&session, &banner_buf);
+
+    if (!std.mem.eql(u8, banner, webtransport_banner)) return error.UnexpectedBanner;
+
+    var stream_buf: [128]u8 = undefined;
+    const echoed = try http3_client.webtransportStream(&session, webtransport_stream_payload, &stream_buf);
+
+    if (!std.mem.eql(u8, echoed, webtransport_stream_payload)) return error.UnexpectedStreamEcho;
+
+    var datagram_buf: [128]u8 = undefined;
+    const datagram = try http3_client.webtransportDatagram(&session, webtransport_datagram_payload, &datagram_buf);
+
+    if (!std.mem.eql(u8, datagram, webtransport_datagram_payload)) return error.UnexpectedDatagramEcho;
+}

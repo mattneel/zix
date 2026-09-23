@@ -397,6 +397,15 @@ const checks = [_]Check{
             return checks_misc.runUdpTickrate(io, paths[0], paths[1]);
         }
     }.call },
+
+    // WebTransport over HTTP/3: an extended CONNECT session on /echo, a data stream echo, a datagram
+    // echo, and the banner the server writes on the unidirectional stream it opens. Appended last so
+    // the argv order of the existing checks stays stable.
+    .{ .label = "webtransport", .example = "http3_webtransport", .heavy = true, .run = &struct {
+        fn call(io: std.Io, paths: []const []const u8) anyerror!void {
+            return checks_http.runWebtransport(io, paths[0], 9089);
+        }
+    }.call },
 };
 
 /// Total argv server paths the checks table consumes (sum of every row's arity).

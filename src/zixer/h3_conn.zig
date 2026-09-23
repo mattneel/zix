@@ -378,6 +378,7 @@ pub const Conn = struct {
             conn.our_scid.slice(),
             MAX_IDLE_MS,
             h3_streams.MAX_STREAMS,
+            .{},
         ) orelse return;
 
         sink.send(flight_packet);

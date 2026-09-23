@@ -21,6 +21,8 @@ const peer_addr = @import("../../../utils/peer_addr.zig");
 const Config = @import("../config.zig");
 const Http3ServerConfig = Config.Http3ServerConfig;
 const core = @import("../core.zig");
+const h3 = @import("../h3.zig");
+const connection_module = @import("../connection.zig");
 const datagram = @import("../../datagram.zig");
 const packet = @import("../packet.zig");
 const protection = @import("../protection.zig");
@@ -45,6 +47,14 @@ const SentRangeInfo = @import("../connection.zig").SentRangeInfo;
 const max_sent_ranges = @import("../connection.zig").max_sent_ranges;
 const tls_handshake = @import("../../../tls/handshake.zig");
 const Logger = @import("../../../logger/logger.zig").Logger;
+
+const wt = @import("../webtransport/session.zig");
+const wt_capsule = @import("../webtransport/capsule.zig");
+const wt_datagram = @import("../webtransport/datagram.zig");
+const wt_draft = @import("../webtransport/draft.zig");
+const wt_pool = @import("../webtransport/pool.zig");
+const wt_stream_header = @import("../webtransport/stream_header.zig");
+const Webtransport = @import("../webtransport/Webtransport.zig");
 
 const log = std.log.scoped(.zix_http3);
 
@@ -456,6 +466,9 @@ pub fn workerLoop(comptime handler: core.HandlerFn, config: Http3ServerConfig, r
     var pool = openReassemblyPool(config) catch return;
     defer pool.deinit(config.allocator);
 
+    var wt_pool_handle = openWebtransportPool(config);
+    defer if (wt_pool_handle) |*opened| opened.deinit(config.allocator);
+
     var rx = datagram.RecvBatch.init(config.allocator, config.recv_batch, config.max_recv_buf) catch return;
     defer rx.deinit();
 
@@ -471,7 +484,7 @@ pub fn workerLoop(comptime handler: core.HandlerFn, config: Http3ServerConfig, r
 
         for (0..count) |i| {
             const dg = rx.get(i);
-            serveDatagram(handler, table, &pool, dg, &tx, fd, config, null);
+            serveDatagram(handler, table, &pool, if (wt_pool_handle) |*opened| opened else null, dg, &tx, fd, config, null);
         }
 
         // Flush once per recv batch: the SendBatch coalesces every reply in the batch into one flush.
@@ -483,7 +496,7 @@ pub fn workerLoop(comptime handler: core.HandlerFn, config: Http3ServerConfig, r
         // benchmark path (the EPOLL / URING workers carry the timeout wake for a total lull).
         const now_us = recovery.nowUs();
         if (now_us -| last_sweep_us >= maintenance_interval_us) {
-            sweepMaintenance(table, &tx, fd, config, now_us, null);
+            sweepMaintenance(handler, table, if (wt_pool_handle) |*opened| opened else null, &tx, fd, config, now_us, null);
             tx.flush(fd) catch {};
             last_sweep_us = now_us;
         }
@@ -529,6 +542,9 @@ pub fn runFallback(comptime handler: core.HandlerFn, config: Http3ServerConfig) 
     var pool = try openReassemblyPool(config);
     defer pool.deinit(config.allocator);
 
+    var wt_pool_handle = openWebtransportPool(config);
+    defer if (wt_pool_handle) |*opened| opened.deinit(config.allocator);
+
     const buf = try config.allocator.alloc(u8, config.max_recv_buf);
     defer config.allocator.free(buf);
 
@@ -547,13 +563,13 @@ pub fn runFallback(comptime handler: core.HandlerFn, config: Http3ServerConfig) 
         const msg = socket.receive(io, buf) catch continue;
 
         const dg = datagram.Datagram{ .data = msg.data, .from = datagram.ipToSockaddr6(msg.from) };
-        serveDatagram(handler, table, &pool, dg, &tx, NO_SOCKET, config, null);
+        serveDatagram(handler, table, &pool, if (wt_pool_handle) |*opened| opened else null, dg, &tx, NO_SOCKET, config, null);
 
         tx.flushPortable(socket, io);
 
         const now_us = recovery.nowUs();
         if (now_us -| last_sweep_us >= maintenance_interval_us) {
-            sweepMaintenance(table, &tx, NO_SOCKET, config, now_us, null);
+            sweepMaintenance(handler, table, if (wt_pool_handle) |*opened| opened else null, &tx, NO_SOCKET, config, now_us, null);
             tx.flushPortable(socket, io);
             last_sweep_us = now_us;
         }
@@ -565,13 +581,44 @@ pub fn runFallback(comptime handler: core.HandlerFn, config: Http3ServerConfig) 
 /// `stats` is non-null its request counter is bumped on a decrypted 1-RTT request (the epoll loop passes
 /// it, the recvmmsg loop passes null). `pool` is the worker's own request-stream reassembly pool,
 /// owned beside its connection table because a request with a body can span datagrams.
-pub fn serveDatagram(comptime handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.Pool, dg: datagram.Datagram, tx: *datagram.SendBatch, fd: std.posix.socket_t, config: Http3ServerConfig, stats: ?*WorkerStats) void {
+pub fn serveDatagram(comptime handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, dg: datagram.Datagram, tx: *datagram.SendBatch, fd: std.posix.socket_t, config: Http3ServerConfig, stats: ?*WorkerStats) void {
     if (stats) |st| st.conns = table.count;
 
-    switch (processDatagram(table, dg.data, config.cid_len, config.max_datagram_size, config.initial_window_packets)) {
+    var offset: usize = 0;
+    while (offset < dg.data.len) {
+        const bytes = dg.data[offset..];
+
+        // One datagram carries one or more packets back to back (RFC 9000 12.2), and real clients
+        // coalesce: a client acknowledging an Initial in the same datagram as its first 1-RTT data, or a
+        // server flight followed by application data. A long header says where its own packet ends; a
+        // short header has no length and therefore runs to the end of the datagram, so it is always the
+        // last packet in one.
+        var size = bytes.len;
+        if (bytes[0] & 0x80 != 0) {
+            const bounds = packet.longPacketBounds(bytes) orelse break;
+            size = bounds.end;
+        } else if (bytes.len < 1 + config.cid_len) {
+            break;
+        }
+
+        servePacket(handler, table, pool, wt_pool_ptr, bytes, tx, fd, dg.from, config, stats);
+
+        offset += size;
+
+        // What follows must look like a packet (the Fixed Bit is set on every QUIC packet): a client that
+        // pads its datagram past the last packet to reach the 1200-byte floor leaves bytes that do not,
+        // and they are not a packet to parse.
+        if (offset < dg.data.len and dg.data[offset] & 0x40 == 0) break;
+    }
+}
+
+/// Process one QUIC packet inside a datagram: demux and decrypt it, then drive the matching handshake or
+/// response step. `data` is the packet, not the whole datagram: a datagram may carry several.
+fn servePacket(comptime handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, data: []const u8, tx: *datagram.SendBatch, fd: std.posix.socket_t, from: std.posix.sockaddr.in6, config: Http3ServerConfig, stats: ?*WorkerStats) void {
+    switch (processDatagram(table, data, config.cid_len, config.max_datagram_size, config.initial_window_packets)) {
         .client_hello => |n| {
             logSystem(config, .INFO, "decrypted client Initial, parsed ClientHello ({d} bytes)", .{n});
-            sendServerHelloFD(table, dg.data, tx, fd, dg.from, config);
+            sendServerHelloFD(table, data, tx, fd, from, config);
         },
         .initial_opened => |pn| logSystem(config, .INFO, "decrypted client Initial, packet number {d} (ClientHello incomplete)", .{pn}),
         .parse_alert => logSystem(config, .INFO, "decrypted client Initial but ClientHello parse raised an alert", .{}),
@@ -581,7 +628,7 @@ pub fn serveDatagram(comptime handler: core.HandlerFn, table: *ConnTable, pool: 
             if (stats) |st| st.requests += 1;
 
             logSystem(config, .INFO, "decrypted client 1-RTT request (application keys correct, validated live)", .{});
-            sendResponseFD(handler, table, pool, dg.data, tx, fd, dg.from, config.cid_len, config, stats);
+            sendResponseFD(handler, table, pool, wt_pool_ptr, data, tx, fd, from, config.cid_len, config, stats);
         },
         else => {},
     }
@@ -849,6 +896,14 @@ fn sendServerHelloFD(table: *ConnTable, data: []const u8, tx: *datagram.SendBatc
         conn.client_max_stream_data = tp.initial_max_stream_data_bidi_local;
         conn.ack_delay_exponent = tp.ack_delay_exponent;
         conn.client_max_udp_payload = tp.max_udp_payload_size;
+
+        // The streams the server opens have their own credits (RFC 9000 18.2 params 0x06 / 0x07), and the
+        // two extension parameters are what allow a DATAGRAM frame and a reliable stream reset at all
+        // (RFC 9221 3, draft-ietf-quic-reliable-stream-reset-09 3).
+        conn.client_max_stream_data_bidi_remote = tp.initial_max_stream_data_bidi_remote;
+        conn.client_max_stream_data_uni = tp.initial_max_stream_data_uni;
+        conn.wt.peer_datagram_frame_size = tp.max_datagram_frame_size;
+        conn.wt.peer_reset_stream_at = tp.reset_stream_at;
     }
 
     // Choose our Source Connection ID (the client will use it as its Destination CID) and the fresh
@@ -902,6 +957,7 @@ fn sendServerHelloFD(table: *ConnTable, data: []const u8, tx: *datagram.SendBatc
         conn.our_scid.slice(),
         config.max_idle_ms,
         config.max_streams,
+        webtransportTransportExtensions(config),
     ) orelse {
         logSystem(config, .WARN, "Handshake flight not built", .{});
         return;
@@ -1175,6 +1231,10 @@ fn applyStreamCredit(conn: *Connection, payload: []const u8, stats: ?*WorkerStat
             p += max.len;
             if (conn.findSendStream(sid.value)) |stream| {
                 if (max.value > stream.stream_limit) stream.stream_limit = max.value;
+            } else if (conn.wt.findStream(sid.value)) |stream| {
+                // A WebTransport data stream has its own limit, seeded from the stream-credit transport
+                // parameter of its kind; without this a stream stalls at the handshake allowance.
+                stream.onStreamLimit(max.value);
             }
             if (stats) |st| st.max_stream_data_recv += 1;
             pos = p;
@@ -1271,19 +1331,7 @@ fn pumpStream(conn: *Connection, stream: *SendStream, tx: *datagram.SendBatch, f
         var pos: usize = 0;
 
         if (!conn.first_response_sent) {
-            payload[pos] = 0x1e; // HANDSHAKE_DONE
-            pos += 1;
-
-            // Server control stream (id 3): stream type 0x00 then an empty SETTINGS frame.
-            payload[pos] = 0x0a; // STREAM | LEN
-            pos += 1;
-            pos += varint.write(payload[pos..], 3);
-            pos += varint.write(payload[pos..], 3);
-            payload[pos] = 0x00;
-            payload[pos + 1] = 0x04;
-            payload[pos + 2] = 0x00;
-            pos += 3;
-
+            pos += buildConnectionPrologue(payload[pos..], config);
             conn.first_response_sent = true;
         }
 
@@ -1349,6 +1397,1348 @@ fn sealAndQueue(conn: *Connection, tx: *datagram.SendBatch, fd: std.posix.socket
     tx.commit(peer, reply.len);
 }
 
+// --------------------------------------------------------------- //
+// WebTransport over HTTP/3
+// --------------------------------------------------------------- //
+
+/// The decrypted 1-RTT payload one connection holds. A DATAGRAM frame has to fit it whole for the receive
+/// path to read it, which is what caps the frame size the server advertises (Server.run rejects a larger
+/// configured value rather than advertising something it cannot receive).
+pub const max_app_payload_buf: usize = connection_module.app_payload_buf_len;
+
+/// Open the worker's WebTransport pool, or null when the feature is off. A pool that cannot be allocated
+/// disables the feature with one error line instead of failing the server: an HTTP/3 server without
+/// WebTransport still serves every request.
+///
+/// Return:
+/// - ?wt_pool.Pool (the worker owns it and deinits it on the way out)
+pub fn openWebtransportPool(config: Http3ServerConfig) ?wt_pool.Pool {
+    if (!config.webtransport.enabled) return null;
+
+    return wt_pool.Pool.init(config.allocator, Webtransport.poolConfig(config.webtransport)) catch |err| {
+        logSystem(config, .ERROR, "webtransport pool allocation failed ({s}), the feature stays off", .{@errorName(err)});
+
+        return null;
+    };
+}
+
+/// Write the connection's one-time prologue into `out`: HANDSHAKE_DONE, then the server control stream
+/// (stream 3) opening with its SETTINGS frame. Returns the bytes written.
+///
+/// Note:
+/// - The SETTINGS frame is where a WebTransport-capable server advertises support, so this is the one
+///   place the feature becomes visible to the peer. The buffer it is built into is sized for the widest
+///   settings set (eight entries), which is why the caller passes one big enough.
+fn buildConnectionPrologue(out: []u8, config: Http3ServerConfig) usize {
+    var pos: usize = 0;
+    out[pos] = 0x1e; // HANDSHAKE_DONE
+    pos += 1;
+
+    var control_buf: [wt_settings_bytes]u8 = undefined;
+    const control_len = h3.writeServerControlStream(&control_buf, webtransportSettings(config)) orelse {
+        // The widest set could not fit: fall back to the empty SETTINGS the engine sent before the
+        // feature existed, rather than leaving the control stream unopened (RFC 9114 6.2.1).
+        control_buf[0] = 0x00;
+        control_buf[1] = 0x04;
+        control_buf[2] = 0x00;
+
+        if (!response.writeStreamFrame(out, &pos, 3, false, control_buf[0..3])) return pos;
+
+        return pos;
+    };
+
+    _ = response.writeStreamFrame(out, &pos, 3, false, control_buf[0..control_len]);
+
+    return pos;
+}
+
+/// The room the server control stream needs: the control stream type, the SETTINGS frame type and
+/// length, and eight entries at their widest encoding.
+const wt_settings_bytes: usize = 160;
+
+/// The HTTP/3 settings a WebTransport-capable server advertises. Every flag is off when the feature is
+/// off, so a plain HTTP/3 connection carries the same empty SETTINGS it carried before the feature
+/// existed.
+fn webtransportSettings(config: Http3ServerConfig) h3.ServerSettings {
+    const wt_config = config.webtransport;
+    if (!wt_config.enabled) return .{};
+
+    return .{
+        .enable_connect_protocol = true,
+        .h3_datagram = true,
+        .webtransport = true,
+        .wt_initial_max_streams_uni = wt_config.max_streams_uni,
+        .wt_initial_max_streams_bidi = wt_config.max_streams_bidi,
+        .wt_initial_max_data = wt_config.max_session_data,
+        .legacy_webtransport = wt_config.legacy_dialect,
+    };
+}
+
+/// The transport parameter extensions the handshake advertises for the feature. Both are WebTransport
+/// prerequisites: without them a client must not send a DATAGRAM frame, and a reliable reset is not
+/// something it can expect.
+fn webtransportTransportExtensions(config: Http3ServerConfig) flight.TransportExtensions {
+    const wt_config = config.webtransport;
+    if (!wt_config.enabled) return .{};
+
+    return .{
+        .max_datagram_frame_size = wt_config.max_datagram_frame_size,
+        .reset_stream_at = true,
+    };
+}
+
+/// The WebTransport streams one payload claimed, so the HTTP request loop leaves them alone: a
+/// WebTransport data stream is a client request stream with a different meaning, and a session's CONNECT
+/// stream is not an HTTP request to answer.
+const WtClaims = struct {
+    ids: [request.max_requests_per_packet]u64 = @splat(0),
+    len: usize = 0,
+
+    fn add(self: *WtClaims, stream_id: u64) void {
+        if (self.len < self.ids.len) {
+            self.ids[self.len] = stream_id;
+            self.len += 1;
+        }
+    }
+
+    fn has(self: *const WtClaims, stream_id: u64) bool {
+        for (self.ids[0..self.len]) |id| {
+            if (id == stream_id) return true;
+        }
+
+        return false;
+    }
+};
+
+/// One WebTransport call's engine context: what the application-facing `Session` and `Stream` methods
+/// reach when they need bytes on the wire, plus the connection state they read.
+///
+/// Note:
+/// - One of these is built per datagram, for the duration of the callbacks that datagram triggers, and
+///   the driver it hands out points at it. Nothing outlives the call: a session holds no pointer here.
+const WtCall = struct {
+    conn: *Connection,
+    pool: *wt_pool.Pool,
+    /// The worker's request pool, the same one an HTTP request with a body is assembled in: a CONNECT
+    /// that arrives before the client's SETTINGS waits there.
+    requests: *reassembly.Pool,
+    tx: *datagram.SendBatch,
+    fd: std.posix.socket_t,
+    peer: std.posix.sockaddr.in6,
+    config: Http3ServerConfig,
+    /// The monotonic time this datagram was handled, for the pool operations that reclaim a stale slot.
+    now_us: u64,
+
+    /// The vtable the application calls into. It lives in this call's own frame (one WtCall per datagram,
+    /// one datagram at a time per worker), so two workers never share a context pointer.
+    driver: wt.Driver,
+
+    /// The driver for this call, with `context` pointing back at it.
+    fn driverPtr(self: *WtCall) *const wt.Driver {
+        return &self.driver;
+    }
+
+    fn fromContext(context: *anyopaque) *WtCall {
+        return @ptrCast(@alignCast(context));
+    }
+
+    /// Open a server-initiated data stream: take a pool slot, an id, and a place in both tables, then
+    /// queue the header. The pump sends it at the end of this payload's processing.
+    fn openStream(context: *anyopaque, session: *wt.Session, kind: wt_stream_header.Kind) ?*wt.Stream {
+        const call = fromContext(context);
+        const live = call.pool.acquireStream() orelse return null;
+
+        var header_buf: [16]u8 = undefined;
+        const header_len = wt_stream_header.write(kind, &header_buf, session.id) orelse {
+            call.pool.releaseStream(live);
+
+            return null;
+        };
+
+        live.* = .{
+            .id = call.conn.wt.takeStreamId(kind),
+            .session_id = session.id,
+            .kind = kind,
+            .initiator = .server,
+            .buf = live.buf,
+            .driver = call.driverPtr(),
+            .send = .{ .open = true, .limit = call.peerStreamLimit(kind) },
+            .recv = .{ .limit = flight.initial_max_stream_data },
+        };
+        live.openWithHeader(header_buf[0..header_len]);
+
+        if (!call.conn.wt.attachStream(live)) {
+            call.pool.releaseStream(live);
+
+            return null;
+        }
+
+        session.attachStream(live);
+        session.flow.onOpenedStream(kind);
+
+        return live;
+    }
+
+    /// The peer's per-stream send limit for a server-initiated stream of `kind` (RFC 9000 18.2): a
+    /// bidirectional stream the server opens is the client's "remote" one, and its unidirectional limit
+    /// is a parameter of its own.
+    fn peerStreamLimit(self: *WtCall, kind: wt_stream_header.Kind) u64 {
+        return switch (kind) {
+            .bidi => self.conn.client_max_stream_data_bidi_remote,
+            .uni => self.conn.client_max_stream_data_uni,
+        };
+    }
+
+    /// Send one unreliable datagram. False when it cannot go now: the client did not negotiate
+    /// datagrams, the payload does not fit what it accepts, or the congestion window has no room. A
+    /// datagram is dropped rather than queued in that case, which is what "unreliable" means here
+    /// (RFC 9221 5.4).
+    fn sendDatagram(context: *anyopaque, session: *wt.Session, payload: []const u8) bool {
+        const call = fromContext(context);
+
+        if (call.conn.wt.peer_datagram_frame_size == 0) return false;
+        if (payload.len > wt_datagram.maxPayloadBytes(call.conn.wt.peer_datagram_frame_size, session.id)) return false;
+
+        var payload_buf: [max_app_payload_buf]u8 = undefined;
+        const h3_len = wt_datagram.writeHttp3(&payload_buf, session.id, payload) orelse return false;
+
+        var frame_buf: [max_app_payload_buf]u8 = undefined;
+        const frame_len = wt_datagram.writeFrame(&frame_buf, payload_buf[0..h3_len]) orelse return false;
+
+        // Congestion control applies to datagrams like any other frame (RFC 9221 5.4), so a full window
+        // drops this one instead of overrunning the path.
+        if (call.conn.bytes_in_flight + frame_len > call.conn.cc.congestion_window) return false;
+
+        // The range is tagged as a datagram: it counts as in flight and retires on acknowledgement, but
+        // the recovery paths never rewind it (RFC 9221 5.2).
+        sealAndQueue(call.conn, call.tx, call.fd, call.peer, frame_buf[0..frame_len], .{
+            .stream_id = session.id,
+            .offset = 0,
+            .length = @intCast(frame_len),
+            .datagram = true,
+        });
+
+        return true;
+    }
+
+    fn closeSession(context: *anyopaque, session: *wt.Session) void {
+        _ = fromContext(context);
+
+        var buf: [wt_capsule.max_known_value + 8]u8 = undefined;
+        const len = wt_capsule.writeCloseSession(&buf, session.close.code, session.close.message) orelse return;
+
+        queueOnConnectStream(session, buf[0..len]);
+        // A close finishes the CONNECT stream as well (6), which is what tells the peer the session is
+        // over even if the capsule itself is lost.
+        session.connect.send.fin = true;
+    }
+
+    fn drainSession(context: *anyopaque, session: *wt.Session) void {
+        _ = fromContext(context);
+
+        var buf: [8]u8 = undefined;
+        const len = wt_capsule.writeDrainSession(&buf) orelse return;
+
+        queueOnConnectStream(session, buf[0..len]);
+    }
+
+    /// Append capsule bytes to the CONNECT stream's send buffer. A capsule the buffer cannot hold is
+    /// dropped: the buffer is sized for the largest legal close capsule, so only a second close could
+    /// overflow it, and a second close is not a thing.
+    fn queueOnConnectStream(session: *wt.Session, bytes: []const u8) void {
+        _ = session.connect.write(bytes);
+    }
+
+    /// Ask the peer to stop sending on a stream (STOP_SENDING, RFC 9000 19.5).
+    fn stopReceiving(context: *anyopaque, stream: *wt.Stream, code: u32) void {
+        const call = fromContext(context);
+
+        var buf: [24]u8 = undefined;
+        var pos: usize = 0;
+        buf[pos] = 0x05; // STOP_SENDING
+        pos += 1;
+        pos += varint.write(buf[pos..], stream.id);
+        pos += varint.write(buf[pos..], wt_draft.encodeAppError(code));
+        sendControlPacket(call, buf[0..pos]);
+    }
+
+    /// Queue the reset of a stream's send half (4.4) and mark it sent.
+    fn resetStream(context: *anyopaque, stream: *wt.Stream) void {
+        const call = fromContext(context);
+
+        sendStreamReset(call, stream, wt_draft.encodeAppError(stream.send.reset.?.code));
+        stream.send.reset.?.sent = true;
+    }
+
+    /// Seal one small control frame into a packet of its own and queue it. The frame is not retransmitted
+    /// here: a reset is retried by the maintenance sweep while its stream is still tracked, and a
+    /// STOP_SENDING rides the next stream packet, the same best-effort a connection close already has.
+    fn sendControlPacket(call: *WtCall, frame_bytes: []const u8) void {
+        sealAndQueue(call.conn, call.tx, call.fd, call.peer, frame_bytes, null);
+    }
+};
+
+/// The WebTransport receive pass for one decrypted payload: datagrams and stream resets, then client
+/// unidirectional streams (control and WebTransport), then client bidirectional streams (session
+/// CONNECTs and WebTransport data streams). Runs before the HTTP request pass, which skips every stream
+/// this pass claims.
+fn webtransportIncoming(
+    conn: *Connection,
+    pool: *wt_pool.Pool,
+    requests: *reassembly.Pool,
+    payload: []const u8,
+    tx: *datagram.SendBatch,
+    fd: std.posix.socket_t,
+    peer: std.posix.sockaddr.in6,
+    config: Http3ServerConfig,
+    claims: *WtClaims,
+) void {
+    var call = WtCall{
+        .conn = conn,
+        .pool = pool,
+        .requests = requests,
+        .tx = tx,
+        .fd = fd,
+        .peer = peer,
+        .config = config,
+        .now_us = recovery.nowUs(),
+        .driver = .{
+            .context = undefined,
+            .open_stream = WtCall.openStream,
+            .send_datagram = WtCall.sendDatagram,
+            .close_session = WtCall.closeSession,
+            .drain_session = WtCall.drainSession,
+            .stop_receiving = WtCall.stopReceiving,
+            .reset_stream = WtCall.resetStream,
+        },
+    };
+    call.driver.context = &call;
+
+    wtIncomingFrames(&call, payload);
+
+    var uni_pieces: [request.max_requests_per_packet]request.UniPiece = undefined;
+    const uni_count = request.parseUniPieces(payload, &uni_pieces);
+    for (uni_pieces[0..uni_count]) |piece| wtIncomingUniStream(&call, piece, claims);
+
+    var pieces: [request.max_requests_per_packet]request.StreamPiece = undefined;
+    const count = request.parseStreamPieces(payload, &pieces);
+    for (pieces[0..count]) |piece| wtIncomingBidiStream(&call, piece, claims);
+}
+
+/// Read the non-STREAM frames a WebTransport connection cares about: DATAGRAM frames, and the stream
+/// resets a peer uses to end a data stream early.
+fn wtIncomingFrames(call: *WtCall, payload: []const u8) void {
+    var pos: usize = 0;
+    while (pos < payload.len) {
+        const type_vi = varint.read(payload[pos..]) catch break;
+
+        switch (type_vi.value) {
+            0x30, 0x31 => {
+                const parsed = frame.parseFrame(payload[pos..]) catch break;
+                wtIncomingDatagram(call, parsed.frame.datagram);
+                pos += parsed.len;
+            },
+            0x04 => { // RESET_STREAM: stream id, application error code, final size.
+                var p = pos + type_vi.len;
+                const id = varint.read(payload[p..]) catch break;
+                p += id.len;
+                const code = varint.read(payload[p..]) catch break;
+                p += code.len;
+                const final_size = varint.read(payload[p..]) catch break;
+                p += final_size.len;
+
+                wtIncomingReset(call, id.value, code.value, final_size.value);
+                pos = p;
+            },
+            0x24 => { // RESET_STREAM_AT: the same three fields, then the reliable size.
+                var p = pos + type_vi.len;
+                const id = varint.read(payload[p..]) catch break;
+                p += id.len;
+                const code = varint.read(payload[p..]) catch break;
+                p += code.len;
+                const final_size = varint.read(payload[p..]) catch break;
+                p += final_size.len;
+                const reliable = varint.read(payload[p..]) catch break;
+                p += reliable.len;
+
+                wtIncomingReset(call, id.value, code.value, final_size.value);
+                pos = p;
+            },
+            0x05 => { // STOP_SENDING: stream id, application error code.
+                var p = pos + type_vi.len;
+                const id = varint.read(payload[p..]) catch break;
+                p += id.len;
+                const code = varint.read(payload[p..]) catch break;
+                p += code.len;
+
+                wtIncomingStopSending(call, id.value, code.value);
+                pos = p;
+            },
+            else => {
+                const skipped = request.skipFrame(payload[pos..]) orelse break;
+                if (skipped == 0) break;
+                pos += skipped;
+            },
+        }
+    }
+}
+
+/// One DATAGRAM frame: route it to its session, or drop it (RFC 9297 2.1 allows dropping a datagram whose
+/// session does not exist, and 4.6 requires a limit rather than unbounded buffering).
+fn wtIncomingDatagram(call: *WtCall, data: []const u8) void {
+    const parsed = wt_datagram.parseHttp3(data) catch return;
+    const session = call.conn.wt.findSession(parsed.session_id) orelse {
+        call.conn.wt.dropped_datagrams += 1;
+
+        return;
+    };
+    if (!session.isOpen()) return;
+
+    const on_datagram = call.config.webtransport.handler.on_datagram orelse return;
+    var view = Webtransport.Session{ .inner = session, .driver = call.driverPtr() };
+    on_datagram(&view, parsed.payload);
+}
+
+/// One stream reset from the peer: charge the session limit for the final size (5.4), mark the receive
+/// half reset, tell the application, and retire the stream when nothing is left on it.
+fn wtIncomingReset(call: *WtCall, stream_id: u64, code: u64, final_size: u64) void {
+    // A reset of a session's CONNECT stream ends that session (6), and it is not a data stream, so it is
+    // checked first: the session id is the CONNECT stream id.
+    if (call.conn.wt.findSession(stream_id)) |session| {
+        wtCloseSession(call, session, .{ .code = 0, .message = "", .reason = .peer_reset });
+
+        return;
+    }
+
+    const live = call.conn.wt.findStream(stream_id) orelse return;
+    const session = call.conn.wt.findSession(live.session_id) orelse return;
+
+    live.onResetReceived(code, final_size);
+    session.flow.onResetFinalSize(final_size) catch {
+        wtFailSession(call, session, .flow_control_error, wt_draft.error_code.wt_flow_control_error);
+
+        return;
+    };
+
+    if (call.config.webtransport.handler.on_stream_reset) |on_reset| {
+        var view = Webtransport.Session{ .inner = session, .driver = call.driverPtr() };
+        var stream_view = Webtransport.Stream{ .inner = live, .driver = call.driverPtr() };
+        on_reset(&view, &stream_view);
+    }
+
+    wtRetireStream(call, session, live);
+}
+
+/// One STOP_SENDING from the peer: it will not read this stream, so the send half is reset with the same
+/// code (RFC 9000 3.5) and the application's writes stop being accepted.
+fn wtIncomingStopSending(call: *WtCall, stream_id: u64, code: u64) void {
+    const live = call.conn.wt.findStream(stream_id) orelse return;
+    if (live.send.reset != null) return;
+
+    live.recv.stopped = true;
+    live.resetSend(wt_draft.decodeAppError(code) orelse 0);
+
+    sendStreamReset(call, live, code);
+    live.send.reset.?.sent = true;
+}
+
+/// Queue the reset of a stream's send half. A peer that advertised reset_stream_at gets RESET_STREAM_AT
+/// with a reliable size covering the header, so the association survives the discard even when the
+/// payload does not (4.4); every other peer gets a plain RESET_STREAM.
+///
+/// Param:
+/// call - *WtCall
+/// live - *wt.Stream (its send.reset describes what is being reset)
+/// code - u64 (the HTTP/3 error code to carry; a WebTransport application error is mapped through
+///   wt_draft.encodeAppError first)
+fn sendStreamReset(call: *WtCall, live: *wt.Stream, code: u64) void {
+    queueStreamReset(call.conn, call.tx, call.fd, call.peer, live, code);
+}
+
+/// Build and queue one stream reset frame: RESET_STREAM_AT when the peer advertised the extension, so the
+/// header survives the discard (4.4), and a plain RESET_STREAM otherwise.
+fn queueStreamReset(conn: *Connection, tx: *datagram.SendBatch, fd: std.posix.socket_t, peer: std.posix.sockaddr.in6, live: *wt.Stream, code: u64) void {
+    const reset = live.send.reset orelse return;
+
+    var buf: [48]u8 = undefined;
+    var pos: usize = 0;
+
+    if (conn.wt.peer_reset_stream_at) {
+        buf[pos] = 0x24; // RESET_STREAM_AT
+        pos += 1;
+        pos += varint.write(buf[pos..], live.id);
+        pos += varint.write(buf[pos..], code);
+        pos += varint.write(buf[pos..], reset.reliable_size);
+        pos += varint.write(buf[pos..], reset.reliable_size);
+    } else {
+        buf[pos] = 0x04; // RESET_STREAM
+        pos += 1;
+        pos += varint.write(buf[pos..], live.id);
+        pos += varint.write(buf[pos..], code);
+        pos += varint.write(buf[pos..], live.totalBytes());
+    }
+
+    sealAndQueue(conn, tx, fd, peer, buf[0..pos], null);
+}
+
+/// Retry the stream resets this connection still owes. A reset frame is not tracked for acknowledgement,
+/// so a Probe Timeout is its retry: every stream whose reset went out and whose send half is not yet
+/// finished is reset again, which is the same best-effort the engine gives its other control frames.
+fn pumpWebtransportResets(conn: *Connection, tx: *datagram.SendBatch, fd: std.posix.socket_t) void {
+    for (conn.wt.streams) |entry| {
+        const live = entry orelse continue;
+        const reset = live.send.reset orelse continue;
+        if (!reset.sent) continue;
+        if (live.sendFinished()) continue;
+
+        queueStreamReset(conn, tx, fd, conn.peer_addr, live, wt_draft.encodeAppError(reset.code));
+    }
+
+    for (conn.wt.sessions) |entry| {
+        const session = entry orelse continue;
+        const reset = session.connect.send.reset orelse continue;
+        _ = reset;
+
+        queueStreamReset(conn, tx, fd, conn.peer_addr, &session.connect, wt_draft.error_code.wt_session_gone);
+    }
+}
+
+/// Release every WebTransport session a connection holds, telling the application each one ended because
+/// its connection did.
+///
+/// Note:
+/// - No per-stream reset is sent: the connection itself is gone, which is what the peer observes, so the
+///   only thing left to do is give the slots back and report the close.
+fn wtReleaseConnection(config: Http3ServerConfig, conn: *Connection, pool: *wt_pool.Pool) void {
+    for (&conn.wt.sessions) |*entry| {
+        const session = entry.* orelse continue;
+        entry.* = null;
+
+        while (session.streams) |live| {
+            _ = session.detachStream(live);
+            conn.wt.detachStream(live);
+            pool.releaseStream(live);
+        }
+
+        session.close_(.{ .code = 0, .message = "", .reason = .connection_closed });
+
+        if (config.webtransport.handler.on_close) |on_close| {
+            var view = Webtransport.Session{ .inner = session, .driver = null };
+            on_close(&view);
+        }
+
+        _ = pool.dropOrphans(session.id);
+        pool.releaseSession(session);
+    }
+
+    // A data stream with no session left (its session was already released) still holds a slot.
+    for (&conn.wt.streams) |*entry| {
+        const live = entry.* orelse continue;
+        entry.* = null;
+        pool.releaseStream(live);
+    }
+}
+
+/// One client unidirectional stream frame. The first byte(s) of the stream are its type (RFC 9114 6.2):
+/// the control stream carries the client's SETTINGS, the QPACK streams are ignored because this engine
+/// never uses the dynamic table, and 0x54 opens a WebTransport unidirectional data stream.
+fn wtIncomingUniStream(call: *WtCall, piece: request.UniPiece, claims: *WtClaims) void {
+    // The type is only on the wire once, at offset 0. A stream already classified needs no second look.
+    const stream_type = call.conn.wt.uniStreamType(piece.stream_id, piece.offset, piece.data) orelse return;
+
+    switch (stream_type) {
+        h3.control_stream => wtIncomingControlStream(call, piece),
+        h3.qpack_encoder_stream, h3.qpack_decoder_stream => {},
+        wt_draft.uni_stream_type => wtIncomingWtUniStream(call, piece, claims),
+        else => {},
+    }
+}
+
+/// The client's control stream: exactly one, SETTINGS first, and the SETTINGS frame is what tells this
+/// endpoint what the client supports (RFC 9114 6.2.1 / 6.2.3). The frames are small, so the parse works
+/// on the bytes as they arrive and stops once the SETTINGS frame is read.
+fn wtIncomingControlStream(call: *WtCall, piece: request.UniPiece) void {
+    // The stream type occupies the head of the first frame; what follows on this stream is the SETTINGS
+    // frame. The accumulator drops the type byte once it has seen it, because the parse below expects the
+    // frame to start at offset 0 of what it is given.
+    const type_len: usize = if (piece.offset == 0) 1 else 0;
+    if (piece.data.len <= type_len) return;
+
+    const settings = call.conn.wt.feedControlStream(piece.data[type_len..]) orelse return;
+
+    // The client's SETTINGS just landed, so the CONNECT requests that were waiting on them can be
+    // processed: their bytes are in the worker's request pool, and this is the moment the features they
+    // need are known.
+    wtProcessPendingConnects(call);
+
+    if (settings.malformed) {
+        logSystem(call.config, .WARN, "client SETTINGS are malformed, the connection is left to the peer's own error handling", .{});
+
+        return;
+    }
+
+    logSystem(call.config, .INFO, "client SETTINGS received (h3_datagram={}, webtransport_enabled={d}, legacy_max_sessions={d})", .{
+        settings.h3_datagram,
+        settings.wt_enabled,
+        settings.webtransport_max_sessions,
+    });
+}
+
+/// One WebTransport unidirectional data stream (4.2): type 0x54, then the session id, then the bytes.
+fn wtIncomingWtUniStream(call: *WtCall, piece: request.UniPiece, claims: *WtClaims) void {
+    const header = wt_stream_header.parse(.uni, piece.data) catch |err| switch (err) {
+        error.ZixTruncated => {
+            // The header is still arriving: hold the bytes until it is complete (4.6 allows buffering,
+            // and the pool bounds it).
+            wtBufferOrphan(call, piece.stream_id, .uni, 0, piece.data, piece.fin);
+            claims.add(piece.stream_id);
+
+            return;
+        },
+        error.ZixNotWebtransport, error.ZixIdError => return,
+    };
+
+    claims.add(piece.stream_id);
+    wtDeliverData(call, .uni, header.session_id, header.len, piece.stream_id, piece.offset, piece.fin, piece.data);
+}
+
+/// One client bidirectional stream frame: a session CONNECT, its capsules, a WebTransport data stream, or
+/// an HTTP request (which this pass leaves alone).
+fn wtIncomingBidiStream(call: *WtCall, piece: request.StreamPiece, claims: *WtClaims) void {
+    // A stream that is already a live session is its CONNECT stream: its bytes are capsules (3.2).
+    if (call.conn.wt.findSession(piece.stream_id)) |session| {
+        claims.add(piece.stream_id);
+        wtIncomingConnectStream(call, session, piece);
+
+        return;
+    }
+
+    // A stream that is already a live data stream is a continuation of its payload.
+    if (call.conn.wt.findStream(piece.stream_id)) |live| {
+        claims.add(piece.stream_id);
+        wtDeliverExisting(call, live, piece);
+
+        return;
+    }
+
+    // A new stream: the 0x41 signal value converts it from a request stream into a WebTransport data
+    // stream (4.3), and an extended CONNECT opens a session.
+    if (piece.offset != 0) return;
+
+    if (wt_stream_header.parse(.bidi, piece.data)) |header| {
+        claims.add(piece.stream_id);
+        wtDeliverData(call, .bidi, header.session_id, header.len, piece.stream_id, piece.offset, piece.fin, piece.data);
+
+        return;
+    } else |err| switch (err) {
+        error.ZixTruncated => {
+            wtBufferOrphan(call, piece.stream_id, .bidi, 0, piece.data, piece.fin);
+            claims.add(piece.stream_id);
+
+            return;
+        },
+        error.ZixNotWebtransport => {},
+        error.ZixIdError => {
+            // A session id that is not a client-initiated bidirectional stream id is H3_ID_ERROR (4.1).
+            call.conn.close_state = .draining;
+            claims.add(piece.stream_id);
+
+            return;
+        },
+    }
+
+    const decoded = piece.request orelse return;
+    if (!wtIsWebtransportConnect(decoded)) return;
+
+    claims.add(piece.stream_id);
+    wtIncomingConnect(call, piece, decoded);
+}
+
+/// Expand one request field the application will read into a slice of `scratch`, or return an empty
+/// slice when the field is absent or does not fit. A Huffman-coded field is decoded here; the scratch is
+/// one buffer carved into fixed ranges, because the fields are read once, at session establishment.
+fn wtExpandField(field: []const u8, is_huffman: bool, scratch: []u8, from: usize, to: usize) []const u8 {
+    if (field.len == 0) return "";
+
+    const room = scratch[from..to];
+    if (!is_huffman) {
+        if (field.len > room.len) return "";
+
+        @memcpy(room[0..field.len], field);
+
+        return room[0..field.len];
+    }
+
+    const decoded_len = huffman.decode(room, field) orelse return "";
+
+    return room[0..decoded_len];
+}
+
+/// Process the WebTransport CONNECT requests that arrived before the client's SETTINGS. Each one is
+/// already assembled in the worker's request pool (the same pool a request with a body uses), so this
+/// reads the bytes back, decodes the request, and runs the normal accept path on it.
+fn wtProcessPendingConnects(call: *WtCall) void {
+    call.conn.wt.takePendingConnects(wtProcessPendingConnect, call);
+}
+
+fn wtProcessPendingConnect(call: *WtCall, stream_id: u64) void {
+    for (call.requests.slots) |*slot| {
+        if (!slot.active or slot.stream_id != stream_id) continue;
+        if (!slot.cid.eql(&call.conn.dcid)) continue;
+
+        const bytes = slot.assembledMutable();
+        const decoded = request.decodeAssembledRequest(bytes, true) orelse {
+            call.requests.release(slot);
+
+            return;
+        };
+
+        // The pool slot is released only after the accept path has read what it needs: the response head
+        // it queues comes from these same bytes.
+        wtIncomingConnect(call, .{
+            .stream_id = stream_id,
+            .offset = 0,
+            .fin = true,
+            .data = bytes,
+            .request = decoded,
+        }, decoded);
+        call.requests.release(slot);
+
+        return;
+    }
+}
+
+/// Whether a decoded request is a WebTransport session request: an extended CONNECT (RFC 9220) whose
+/// `:protocol` token this endpoint accepts (draft-16 3.2 / 9.1).
+fn wtIsWebtransportConnect(decoded: request.DecodedRequest) bool {
+    if (!std.mem.eql(u8, decoded.method, "CONNECT")) return false;
+    if (decoded.protocol.len == 0) return false;
+    if (!decoded.protocol_huffman) return wt_draft.dialectForToken(decoded.protocol) != null;
+
+    // A Huffman-coded token is expanded here: the values are short and this runs once per CONNECT.
+    var scratch: [32]u8 = undefined;
+    const decoded_len = huffman.decode(&scratch, decoded.protocol) orelse return false;
+
+    return wt_draft.dialectForToken(scratch[0..decoded_len]) != null;
+}
+
+/// Establish (or refuse) a WebTransport session for one extended CONNECT request.
+fn wtIncomingConnect(call: *WtCall, piece: request.StreamPiece, decoded: request.DecodedRequest) void {
+    const config = call.config.webtransport;
+
+    // The token, expanded if the client Huffman-coded it.
+    var token_scratch: [32]u8 = undefined;
+    const token = if (decoded.protocol_huffman)
+        token_scratch[0 .. huffman.decode(&token_scratch, decoded.protocol) orelse return]
+    else
+        decoded.protocol;
+
+    const dialect = wt_draft.dialectForToken(token) orelse return;
+    if (dialect == .draft07 and !config.legacy_dialect) return;
+
+    // draft-16 7.1: the server MUST NOT process a WebTransport request before the client's SETTINGS
+    // arrive, because the settings are what pin the version and the required features. The request is
+    // held instead of refused: a client sends its SETTINGS and its CONNECT in one flight, and the two can
+    // arrive in either order, so refusing would cost the session for a packet that is merely late. The
+    // held stream is re-processed the moment the SETTINGS land (wtIncomingControlStream).
+    if (!call.conn.wt.settings_received) {
+        switch (call.requests.feed(call.now_us, &call.conn.dcid, piece.stream_id, piece.offset, piece.data, piece.fin)) {
+            .ready, .waiting => {
+                if (!call.conn.wt.notePendingConnect(piece.stream_id)) {
+                    wtResetRequestStream(call, piece.stream_id, h3.Http3Error.request_rejected);
+                }
+            },
+            // The pool is full, so this request cannot be held: it is refused with the code for "not
+            // processed in any way" (RFC 9114 8.1) rather than answered against half a request.
+            .refused => wtResetRequestStream(call, piece.stream_id, h3.Http3Error.request_rejected),
+        }
+
+        return;
+    }
+
+    // 3.1: a WebTransport connection requires HTTP/3 datagrams on both sides. Without the client's
+    // SETTINGS_H3_DATAGRAM=1 and a transport parameter granting datagrams, the request is malformed.
+    if (!call.conn.wt.client_settings.h3_datagram or call.conn.wt.peer_datagram_frame_size == 0) {
+        wtResetRequestStream(call, piece.stream_id, h3.Http3Error.message_error);
+
+        return;
+    }
+
+    // 5.2: the server limits how many sessions a connection may have, and 5.1: without flow control only
+    // one session at a time is allowed.
+    if (call.conn.wt.sessionCount() >= config.max_sessions_per_connection) {
+        wtRejectConnect(call, piece.stream_id, decoded, 429);
+
+        return;
+    }
+
+    const session = call.pool.acquireSession() orelse {
+        wtRejectConnect(call, piece.stream_id, decoded, 503);
+
+        return;
+    };
+
+    session.* = .{ .id = piece.stream_id, .dialect = dialect };
+    session.flow.declareLocal(config.max_session_data, config.max_streams_bidi, config.max_streams_uni);
+    session.flow.declarePeer(
+        call.conn.wt.client_settings.wt_initial_max_data,
+        call.conn.wt.client_settings.wt_initial_max_streams_bidi,
+        call.conn.wt.client_settings.wt_initial_max_streams_uni,
+    );
+
+    if (!call.conn.wt.attachSession(session)) {
+        call.pool.releaseSession(session);
+        wtRejectConnect(call, piece.stream_id, decoded, 503);
+
+        return;
+    }
+    call.conn.wt.pool = call.pool;
+
+    // The application decides: a null return accepts, a status refuses. The request fields the
+    // application routes on are expanded here, because a client is free to Huffman-code any of them and
+    // the decode leaves those bytes compressed.
+    var field_scratch: [512]u8 = undefined;
+    var view = Webtransport.Session{
+        .inner = session,
+        .driver = call.driverPtr(),
+        .request = .{
+            .path = wtExpandField(decoded.path, decoded.path_huffman, &field_scratch, 0, 192),
+            .authority = wtExpandField(decoded.authority, decoded.authority_huffman, &field_scratch, 192, 384),
+            .protocol = token,
+            .origin = wtExpandField(decoded.origin, decoded.origin_huffman, &field_scratch, 384, 512),
+            .dialect = dialect,
+            .datagram_capable = call.conn.wt.peer_datagram_frame_size != 0,
+        },
+    };
+
+    if (config.handler.on_session) |on_session| {
+        if (on_session(&view)) |status| {
+            call.conn.wt.detachSession(session);
+            call.pool.releaseSession(session);
+            wtRejectConnect(call, piece.stream_id, decoded, status);
+
+            return;
+        }
+    }
+
+    // Accepted: queue the 2xx response head on the CONNECT stream, which stays open for capsules until
+    // the session ends (6).
+    var head_buf: [32]u8 = undefined;
+    const head_len = response.buildRequestStreamContent(&head_buf, 200, .identity, "") orelse {
+        call.conn.wt.detachSession(session);
+        call.pool.releaseSession(session);
+        wtRejectConnect(call, piece.stream_id, decoded, 500);
+
+        return;
+    };
+    session.openConnect(head_buf[0..head_len]);
+
+    // A client may open streams and send datagrams before it sees the response (4.6), so anything it
+    // buffered against this session is delivered now.
+    wtReplayOrphans(call, session);
+
+    logSystem(call.config, .INFO, "webtransport session {d} open ({s})", .{ session.id, if (dialect == .draft16) "draft-16" else "draft-07" });
+}
+
+/// Refuse a session request with an HTTP status, on the request stream, as an ordinary HTTP response
+/// (3.2 allows any status, including 405 for a resource that does not serve WebTransport and 403 for a
+/// disallowed origin).
+fn wtRejectConnect(call: *WtCall, stream_id: u64, decoded: request.DecodedRequest, status: u16) void {
+    _ = decoded;
+
+    sendSingleResponse(call, stream_id, status);
+}
+
+/// Send one small headers-only response on a request stream, with FIN: the shape a WebTransport CONNECT
+/// that the server will not accept gets, and the shape the request path itself uses for a small answer
+/// (RFC 9114 7.2.1 / 7.2.2).
+fn sendSingleResponse(call: *WtCall, stream_id: u64, status: u16) void {
+    var content: [160]u8 = undefined;
+    const len = response.buildRequestStreamContent(&content, status, .identity, "") orelse return;
+
+    var payload: [256]u8 = undefined;
+    var pos: usize = 0;
+    if (!response.writeStreamFrame(&payload, &pos, stream_id, true, content[0..len])) return;
+
+    sealAndQueue(call.conn, call.tx, call.fd, call.peer, payload[0..pos], null);
+}
+
+/// Reset a request stream with an HTTP/3 error code: the request was not processed (RFC 9114 8.1).
+fn wtResetRequestStream(call: *WtCall, stream_id: u64, code: h3.Http3Error) void {
+    var buf: [24]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x04; // RESET_STREAM
+    pos += 1;
+    pos += varint.write(buf[pos..], stream_id);
+    pos += varint.write(buf[pos..], @intFromEnum(code));
+    pos += varint.write(buf[pos..], 0);
+    WtCall.sendControlPacket(call, buf[0..pos]);
+}
+
+/// Deliver the payload of a WebTransport data stream frame to a live stream, creating the stream when it
+/// is new. The header bytes are already consumed by the caller.
+fn wtDeliverData(call: *WtCall, kind: wt_stream_header.Kind, session_id: u64, header_len: usize, stream_id: u64, offset: u64, fin: bool, data: []const u8) void {
+    const session = call.conn.wt.findSession(session_id) orelse {
+        // The session does not exist yet: hold the bytes (4.6), or reject the stream when there is no
+        // room to hold them.
+        wtBufferOrphan(call, stream_id, kind, session_id, data, fin);
+
+        return;
+    };
+    if (!session.isOpen()) {
+        wtResetStreamForSession(call, stream_id, kind, session_id, wt_draft.error_code.wt_session_gone);
+
+        return;
+    }
+
+    var live = call.conn.wt.findStream(stream_id) orelse blk: {
+        const slot = call.pool.acquireStream() orelse {
+            wtResetStreamForSession(call, stream_id, kind, session_id, wt_draft.error_code.wt_buffered_stream_rejected);
+
+            return;
+        };
+
+        slot.* = .{
+            .id = stream_id,
+            .session_id = session_id,
+            .kind = kind,
+            .initiator = .client,
+            .buf = slot.buf,
+            .driver = call.driverPtr(),
+            // A bidirectional stream the client opened is also this endpoint's to write on (RFC 9000 2.1),
+            // so its send half is open from the start: that is what lets the application answer on it. The
+            // credit is the client's initial_max_stream_data_bidi_local (0x05), the limit it granted for
+            // streams this endpoint sends on locally. A client-opened unidirectional stream has no send
+            // half here at all.
+            .send = if (kind == .bidi)
+                .{ .open = true, .limit = call.conn.client_max_stream_data }
+            else
+                .{},
+            .recv = .{ .limit = flight.initial_max_stream_data },
+        };
+
+        if (!call.conn.wt.attachStream(slot)) {
+            call.pool.releaseStream(slot);
+            wtResetStreamForSession(call, stream_id, kind, session_id, wt_draft.error_code.wt_buffered_stream_rejected);
+
+            return;
+        }
+
+        session.attachStream(slot);
+        session.flow.onStreamOpened(kind) catch {
+            wtFailSession(call, session, .flow_control_error, wt_draft.error_code.wt_flow_control_error);
+
+            return;
+        };
+
+        break :blk slot;
+    };
+
+    const payload = data[header_len..];
+    session.onStreamData(payload.len) catch {
+        wtFailSession(call, session, .flow_control_error, wt_draft.error_code.wt_flow_control_error);
+
+        return;
+    };
+
+    const payload_offset = offset + header_len;
+    live.onReceived(payload_offset, payload.len, fin);
+
+    if (call.config.webtransport.handler.on_stream) |on_stream| {
+        var view = Webtransport.Session{ .inner = session, .driver = call.driverPtr() };
+        var stream_view = Webtransport.Stream{
+            .inner = live,
+            .driver = call.driverPtr(),
+            .chunk = payload,
+            .chunk_offset = payload_offset - wt_stream_header.headerLen(kind, session_id),
+        };
+        on_stream(&view, &stream_view);
+    }
+
+    // The peer's limit is extended as it consumes the stream, so a stream longer than the handshake
+    // allowance keeps flowing: a WebTransport data stream has no reassembly slot, so nothing else in the
+    // engine replenishes its credit.
+    if (live.replenish(flight.initial_max_stream_data)) |limit| {
+        var buf: [24]u8 = undefined;
+        var pos: usize = 0;
+        buf[pos] = 0x11; // MAX_STREAM_DATA
+        pos += 1;
+        pos += varint.write(buf[pos..], live.id);
+        pos += varint.write(buf[pos..], limit);
+        WtCall.sendControlPacket(call, buf[0..pos]);
+    }
+
+    wtRetireIfDone(call, session, live);
+}
+
+/// Deliver a continuation frame of a stream this connection already tracks.
+fn wtDeliverExisting(call: *WtCall, live: *wt.Stream, piece: request.StreamPiece) void {
+    const session = call.conn.wt.findSession(live.session_id) orelse return;
+    if (!session.isOpen()) return;
+
+    session.onStreamData(piece.data.len) catch {
+        wtFailSession(call, session, .flow_control_error, wt_draft.error_code.wt_flow_control_error);
+
+        return;
+    };
+
+    live.onReceived(piece.offset, piece.data.len, piece.fin);
+
+    if (call.config.webtransport.handler.on_stream) |on_stream| {
+        var view = Webtransport.Session{ .inner = session, .driver = call.driverPtr() };
+        var stream_view = Webtransport.Stream{
+            .inner = live,
+            .driver = call.driverPtr(),
+            .chunk = piece.data,
+            .chunk_offset = piece.offset - wt_stream_header.headerLen(live.kind, live.session_id),
+        };
+        on_stream(&view, &stream_view);
+    }
+
+    wtRetireIfDone(call, session, live);
+}
+
+/// One CONNECT stream frame: its DATA frames carry the session's capsules (RFC 9297 3), and its FIN or
+/// reset ends the session (6).
+fn wtIncomingConnectStream(call: *WtCall, session: *wt.Session, piece: request.StreamPiece) void {
+
+    // The H3 frames on this stream: DATA frames hold capsules, and anything else on it is not something
+    // this binding sends or expects.
+    var pos: usize = 0;
+    while (pos < piece.data.len) {
+        const type_vi = varint.read(piece.data[pos..]) catch break;
+
+        switch (type_vi.value) {
+            0x00 => { // DATA: capsules (RFC 9297 3.1)
+                const len_vi = varint.read(piece.data[pos + type_vi.len ..]) catch break;
+                const header = pos + type_vi.len + len_vi.len;
+                const payload_len: usize = std.math.cast(usize, len_vi.value) orelse break;
+                if (header + payload_len > piece.data.len) break;
+
+                wtIncomingCapsules(call, session, piece.data[header..][0..payload_len]);
+                pos = header + payload_len;
+            },
+            0x01 => { // HEADERS: trailers close the request body, so the session is being finished.
+                break;
+            },
+            else => break,
+        }
+    }
+
+    if (piece.fin) {
+        wtCloseSession(call, session, .{ .code = 0, .message = "", .reason = .peer_fin });
+    }
+}
+
+/// Apply the capsules one CONNECT-stream DATA frame carried (4.7 / 5.6 / 6).
+fn wtIncomingCapsules(call: *WtCall, session: *wt.Session, payload: []const u8) void {
+    const outcome = session.capsules.feed(payload, WtCapsuleVisit.visit, WtCapsuleVisit{ .call = call, .session = session });
+
+    if (outcome.refused) {
+        wtFailSession(call, session, .flow_control_error, wt_draft.error_code.wt_flow_control_error);
+    }
+}
+
+/// The capsule visitor's context: the call it belongs to, and the session the capsule applies to.
+const WtCapsuleVisit = struct {
+    call: *WtCall,
+    session: *wt.Session,
+
+    /// Apply one capsule this binding defines to its session. Returns false when the capsule broke a rule
+    /// the session has to fail on (5.6.2 / 5.6.4).
+    fn visit(self: WtCapsuleVisit, capsule_value: wt_capsule.Capsule) bool {
+        const call = self.call;
+        const session = self.session;
+
+        switch (capsule_value.type) {
+            wt_draft.capsule.close_session => {
+                const closed = wt_capsule.parseCloseSession(capsule_value.value) catch {
+                    wtFailSession(call, session, .protocol_error, @intFromEnum(h3.Http3Error.message_error));
+
+                    return false;
+                };
+                wtCloseSession(call, session, .{ .code = closed.code, .message = closed.message, .reason = .peer_close });
+
+                return false;
+            },
+            wt_draft.capsule.drain_session => {
+                session.onDrain();
+
+                return true;
+            },
+            wt_draft.capsule.max_data => {
+                const value = wt_capsule.parseFlowControl(capsule_value.value) catch return false;
+                session.flow.onMaxData(value) catch return false;
+
+                return true;
+            },
+            wt_draft.capsule.max_streams_bidi => {
+                const value = wt_capsule.parseStreamCount(capsule_value.value) catch return false;
+                session.flow.onMaxStreams(.bidi, value) catch return false;
+
+                return true;
+            },
+            wt_draft.capsule.max_streams_uni => {
+                const value = wt_capsule.parseStreamCount(capsule_value.value) catch return false;
+                session.flow.onMaxStreams(.uni, value) catch return false;
+
+                return true;
+            },
+            // WT_DATA_BLOCKED and WT_STREAMS_BLOCKED are reports the peer is blocked: this endpoint answers
+            // them by extending its own limits, which it does anyway as it consumes what arrives (5.6.3).
+            wt_draft.capsule.data_blocked, wt_draft.capsule.streams_blocked_bidi, wt_draft.capsule.streams_blocked_uni => return true,
+            else => return true,
+        }
+    }
+};
+
+/// Hold a data stream's first bytes until its session exists (4.6). Past the buffer limit the stream is
+/// rejected with WT_BUFFERED_STREAM_REJECTED, which is what stops a peer from parking streams on a
+/// connection that will never establish their session.
+fn wtBufferOrphan(call: *WtCall, stream_id: u64, kind: wt_stream_header.Kind, session_id: u64, data: []const u8, fin: bool) void {
+    _ = call.pool.bufferOrphan(session_id, stream_id, kind, data, fin) orelse {
+        wtResetStreamForSession(call, stream_id, kind, session_id, wt_draft.error_code.wt_buffered_stream_rejected);
+    };
+}
+
+/// Deliver everything buffered for a session that has just been established.
+fn wtReplayOrphans(call: *WtCall, session: *wt.Session) void {
+    call.pool.drainOrphans(session.id, wtReplayOrphan, WtReplay{ .call = call, .session = session });
+}
+
+/// The replay visitor: one buffered stream's bytes, delivered as if they had just arrived.
+const WtReplay = struct {
+    call: *WtCall,
+    session: *wt.Session,
+
+    fn visit(self: WtReplay, orphan: *wt_pool.Orphan) void {
+        // The buffered bytes are the stream's own start, so the header is already in them and the payload
+        // begins after it. A header that never completed cannot be replayed and is dropped.
+        const header = wt_stream_header.parse(orphan.kind, orphan.buf[0..orphan.len]) catch return;
+
+        wtDeliverData(self.call, orphan.kind, orphan.session_id, header.len, orphan.stream_id, 0, orphan.fin, orphan.buf[0..orphan.len]);
+    }
+};
+
+fn wtReplayOrphan(context: WtReplay, orphan: *wt_pool.Orphan) void {
+    context.visit(orphan);
+}
+
+/// End a session: report it to the application, reset every stream it owns with WT_SESSION_GONE (6), and
+/// give the slots back to the pool.
+fn wtCloseSession(call: *WtCall, session: *wt.Session, info: wt.CloseInfo) void {
+    if (!session.isOpen()) return;
+
+    session.close_(info);
+
+    // A clean end of this endpoint's side of the CONNECT stream is a FIN, whatever ended the session: a
+    // peer that reset the stream or sent a close capsule still sees this side finished, and the FIN is
+    // what carries any close capsule this endpoint queued (6).
+    session.connect.send.fin = true;
+
+    // 6: every stream of the session is reset (both directions) with WT_SESSION_GONE, so the peer learns
+    // the streams are gone rather than waiting on them.
+    while (session.streams) |live| {
+        _ = session.detachStream(live);
+        call.conn.wt.detachStream(live);
+
+        if (!live.recv.stopped) {
+            live.recv.stopped = true;
+            var stop_buf: [24]u8 = undefined;
+            var stop_pos: usize = 0;
+            stop_buf[stop_pos] = 0x05;
+            stop_pos += 1;
+            stop_pos += varint.write(stop_buf[stop_pos..], live.id);
+            stop_pos += varint.write(stop_buf[stop_pos..], wt_draft.error_code.wt_session_gone);
+            WtCall.sendControlPacket(call, stop_buf[0..stop_pos]);
+        }
+
+        if (live.send.open and live.send.reset == null) {
+            live.resetSend(0);
+            sendStreamReset(call, live, wt_draft.error_code.wt_session_gone);
+            live.send.reset.?.sent = true;
+        }
+
+        call.pool.releaseStream(live);
+    }
+
+    if (call.config.webtransport.handler.on_close) |on_close| {
+        var view = Webtransport.Session{ .inner = session, .driver = call.driverPtr() };
+        on_close(&view);
+    }
+
+    _ = call.pool.dropOrphans(session.id);
+    call.conn.wt.detachSession(session);
+    call.pool.releaseSession(session);
+}
+
+/// Fail a session: close it with the error code the rule that was broken maps to (5.6.2 / 5.6.4), which
+/// the CONNECT stream carries to the peer.
+fn wtFailSession(call: *WtCall, session: *wt.Session, reason: wt.CloseReason, code: u64) void {
+    if (!session.isOpen()) return;
+
+    // A session error travels as a reset of the CONNECT stream carrying the error code: that is what ends
+    // the session for the peer, and it is the code a client prints (5.6.2 / 5.6.4 / 6).
+    var buf: [24]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x04; // RESET_STREAM
+    pos += 1;
+    pos += varint.write(buf[pos..], session.id);
+    pos += varint.write(buf[pos..], code);
+    pos += varint.write(buf[pos..], session.connect.send.high_water);
+    WtCall.sendControlPacket(call, buf[0..pos]);
+
+    wtCloseSession(call, session, .{ .code = 0, .message = "", .reason = reason });
+}
+
+/// Retire a stream whose two halves are both finished: its slot goes back to the pool, so a long-lived
+/// session does not leak a slot per stream it ever used.
+fn wtRetireIfDone(call: *WtCall, session: *wt.Session, live: *wt.Stream) void {
+
+    // A client-opened bidirectional stream the application never wrote to is finished on the send side as
+    // soon as its receive side ends: without that FIN the stream would stay half-open forever.
+    if (live.initiator == .client and live.send.open and live.send.queued == 0 and !live.send.fin and live.recv.fin) {
+        live.send.fin = true;
+    }
+
+    if (!live.finished()) return;
+
+    // The stream may still owe the peer bytes (a FIN or a reset not yet acknowledged), in which case the
+    // pump keeps it and this waits: only a fully acknowledged stream is retired.
+    if (!live.sendFinished() and live.send.open) return;
+
+    wtRetireStream(call, session, live);
+}
+
+/// Give a stream's slot back: detached from both tables first, so nothing can reach a released slot.
+fn wtRetireStream(call: *WtCall, session: *wt.Session, live: *wt.Stream) void {
+    _ = session.detachStream(live);
+    call.conn.wt.detachStream(live);
+    call.pool.releaseStream(live);
+}
+
+/// Reset a stream that belongs to no session, or to a closed one: the code is the HTTP/3 error the peer
+/// sees, and the stream is not tracked (there is nothing to track it against).
+fn wtResetStreamForSession(call: *WtCall, stream_id: u64, kind: wt_stream_header.Kind, session_id: u64, code: u64) void {
+    _ = kind;
+    _ = session_id;
+
+    var buf: [48]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x04;
+    pos += 1;
+    pos += varint.write(buf[pos..], stream_id);
+    pos += varint.write(buf[pos..], code);
+    pos += varint.write(buf[pos..], 0);
+    WtCall.sendControlPacket(call, buf[0..pos]);
+}
+
+/// Pump every WebTransport stream this connection holds: the CONNECT stream of each session, and every
+/// data stream with bytes to send. Runs after the HTTP response pump, so a packet carries both.
+fn pumpWebtransport(conn: *Connection, tx: *datagram.SendBatch, fd: std.posix.socket_t, peer: std.posix.sockaddr.in6, config: Http3ServerConfig) void {
+    if (!config.webtransport.enabled) return;
+
+    var ack_pending: ?u64 = null;
+    var max_streams_pending: ?u64 = null;
+    var max_data_pending: ?u64 = null;
+
+    for (conn.wt.sessions) |entry| {
+        const session = entry orelse continue;
+
+        // The CONNECT stream: the response head, then capsules, then the FIN that ends the session. A
+        // closed session still pumps this stream, because its close capsule and FIN are what the peer
+        // reads as the end of the session (6).
+        if (session.connect.send.queued != 0 or session.connect.send.fin or session.connect.send.outstanding_len != 0) {
+            pumpWtStream(conn, &session.connect, tx, fd, peer, &ack_pending, &max_streams_pending, &max_data_pending, config);
+        }
+    }
+
+    var index: usize = 0;
+    while (index < conn.wt.streams.len) : (index += 1) {
+        const live = conn.wt.streams[index] orelse continue;
+
+        pumpWtStream(conn, live, tx, fd, peer, &ack_pending, &max_streams_pending, &max_data_pending, config);
+    }
+
+    // A session whose CONNECT stream is fully acknowledged has nothing left to say: its slot goes back to
+    // the pool here, which is the one place a closed session is reaped after its close capsule went out.
+    if (conn.wt.pool) |pool| {
+        for (&conn.wt.sessions) |*entry| {
+            const session = entry.* orelse continue;
+            if (session.state != .closed) continue;
+            if (!session.connect.sendFinished()) continue;
+            if (session.streams != null) continue;
+
+            entry.* = null;
+            _ = pool.dropOrphans(session.id);
+            pool.releaseSession(session);
+        }
+    }
+}
+
+/// Send as much of one WebTransport stream as flow control and the congestion window permit. The stream's
+/// bytes are already in its own buffer (the header was queued when it opened), so this only frames them.
+fn pumpWtStream(conn: *Connection, live: *wt.Stream, tx: *datagram.SendBatch, fd: std.posix.socket_t, peer: std.posix.sockaddr.in6, ack_pending: *?u64, max_streams_pending: *?u64, max_data_pending: *?u64, config: Http3ServerConfig) void {
+    const session = conn.wt.findSession(live.session_id);
+    const end = live.send.acked + live.send.queued;
+
+    // The session data limit applies to Stream Body bytes only (5.4): a CONNECT stream's capsules are
+    // excluded, and a data stream's header was charged by the opening write, so what is left is the
+    // payload this stream still has to send.
+    const is_connect_stream = if (session) |open_session| live.id == open_session.id else false;
+    var limit = end;
+    if (!is_connect_stream) {
+        if (session) |open_session| {
+            if (open_session.flow.enabled) {
+                const remaining = open_session.flow.peer_max_data -| open_session.flow.data_sent;
+                limit = @min(end, live.send.sent + remaining);
+            }
+        }
+    }
+
+    limit = @min(limit, live.send.limit);
+    if (limit <= live.send.sent) return;
+
+    const dgram: usize = @intCast(conn.sendDatagramSize(config.max_datagram_size, max_send_datagram_size));
+    const chunk_budget = dgram - per_packet_frame_reserve;
+
+    var payload: [max_send_datagram_size]u8 = undefined;
+    while (live.send.sent < limit) {
+        const ready = live.sendable();
+        if (ready == 0) break;
+
+        const chunk = @min(chunk_budget, ready);
+        const is_last = live.send.fin and (live.send.sent + chunk == end);
+
+        var pos: usize = 0;
+        if (ackTake(ack_pending)) |largest| pos += response.buildAck(payload[pos..], largest);
+        if (maxStreamsTake(max_streams_pending)) |granted| pos += response.buildMaxStreams(payload[pos..], granted);
+        if (maxDataTake(max_data_pending)) |granted| pos += response.buildMaxData(payload[pos..], granted);
+
+        // STREAM frame: type OFF | LEN (| FIN), id, offset, length, then the bytes.
+        payload[pos] = 0x0e | @as(u8, if (is_last) 0x01 else 0x00);
+        pos += 1;
+        pos += varint.write(payload[pos..], live.id);
+        pos += varint.write(payload[pos..], live.send.sent);
+        pos += varint.write(payload[pos..], chunk);
+
+        const from = @as(usize, @intCast(live.send.sent - live.send.acked));
+        @memcpy(payload[pos..][0..chunk], live.buf[from..][0..chunk]);
+        pos += chunk;
+
+        sealAndQueue(conn, tx, fd, peer, payload[0..pos], .{
+            .stream_id = live.id,
+            .offset = @intCast(live.send.sent),
+            .length = @intCast(chunk),
+        });
+
+        live.onSent(chunk);
+        if (!is_connect_stream) {
+            if (session) |open_session| open_session.flow.onDataSent(chunk);
+        }
+    }
+}
+
 /// Build and send the HTTP/3 responses for the 1-RTT payload captured on the connection. A connection
 /// multiplexes many requests, each on its own client bidi stream, and one packet can coalesce several:
 /// a small response goes out in one packet, a large one is registered as a send stream and fragmented
@@ -1388,7 +2778,7 @@ fn writeAccessRecord(
     );
 }
 
-fn sendResponseFD(handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.Pool, data: []const u8, tx: *datagram.SendBatch, fd: std.posix.socket_t, peer: std.posix.sockaddr.in6, cid_len: usize, config: Http3ServerConfig, stats: ?*WorkerStats) void {
+fn sendResponseFD(handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, data: []const u8, tx: *datagram.SendBatch, fd: std.posix.socket_t, peer: std.posix.sockaddr.in6, cid_len: usize, config: Http3ServerConfig, stats: ?*WorkerStats) void {
     if (data.len < 1 + cid_len) return;
 
     const dcid = demux.ConnId.fromSlice(data[1 .. 1 + cid_len]);
@@ -1443,15 +2833,24 @@ fn sendResponseFD(handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.
     // repeat them. If this datagram carried no request, the prologue alone is the bare-ACK packet.
     if (conn.ack.have_largest) plen += response.buildAckRanges(pbuf[plen..], conn.ack.largest_pn, conn.ack.received_mask);
     if (!conn.first_response_sent) {
-        pbuf[plen] = 0x1e; // HANDSHAKE_DONE
-        plen += 1;
-        _ = response.writeStreamFrame(&pbuf, &plen, 3, false, &[_]u8{ 0x00, 0x04, 0x00 }); // control: SETTINGS
+        plen += buildConnectionPrologue(pbuf[plen..], config);
         conn.first_response_sent = true;
     }
     if (maxStreamsTake(&max_streams_pending)) |granted| plen += response.buildMaxStreams(pbuf[plen..], granted);
     if (maxDataTake(&max_data_pending)) |granted| plen += response.buildMaxData(pbuf[plen..], granted);
 
+    // WebTransport first: the pass claims every stream whose bytes are not an HTTP request (a session's
+    // CONNECT stream, a WebTransport data stream), and the loop below skips them. A stream it holds for a
+    // session that does not exist yet is claimed too, so the request path never answers a stream that is
+    // waiting for its session.
+    var claims = WtClaims{};
+    if (wt_pool_ptr) |wt_pool_handle| {
+        if (config.webtransport.enabled) webtransportIncoming(conn, wt_pool_handle, pool, payload_view, tx, fd, peer, config, &claims);
+    }
+
     for (pieces[0..count]) |piece| {
+        if (claims.has(piece.stream_id)) continue;
+
         // A retransmit of a request already being streamed: leave its progress, the pump continues it.
         if (conn.findSendStream(piece.stream_id) != null) continue;
 
@@ -1558,6 +2957,10 @@ fn sendResponseFD(handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.
     for (&conn.send_streams) |*stream| {
         if (stream.active) _ = pumpStream(conn, stream, tx, fd, peer, &ack_pending, &max_streams_pending, &max_data_pending, config, stats);
     }
+
+    // WebTransport streams last: they are pumped from their own buffers, with the same congestion window,
+    // loss ring, and flow control as the HTTP response streams above.
+    pumpWebtransport(conn, tx, fd, peer, config);
 }
 
 /// Append a response STREAM frame (with FIN) to the coalesced packet, sealing the full packet and
@@ -1602,18 +3005,40 @@ fn resumeStreams(conn: *Connection, tx: *datagram.SendBatch, fd: std.posix.socke
 /// reclaimed instead of pinned for the worker's life. Without this, a lost tail leaves a connection
 /// wedged (bytes stuck in flight, window collapsed) and the slot never frees, which is what collapsed
 /// EPOLL static-h3 across bench runs. Leaves retransmitted packets queued in `tx`, the caller flushes.
-pub fn sweepMaintenance(table: *ConnTable, tx: *datagram.SendBatch, fd: std.posix.socket_t, config: Http3ServerConfig, now_us: u64, stats: ?*WorkerStats) void {
+pub fn sweepMaintenance(comptime handler: core.HandlerFn, table: *ConnTable, wt_pool_ptr: ?*wt_pool.Pool, tx: *datagram.SendBatch, fd: std.posix.socket_t, config: Http3ServerConfig, now_us: u64, stats: ?*WorkerStats) void {
+    // The handler is comptime here for the same reason serveDatagram takes it: the WebTransport sessions a
+    // dying connection held are reported to the application, which is the only notice it gets.
+    _ = handler;
+
     const max_idle_us: u64 = @as(u64, config.max_idle_ms) * 1000; // ms to us
 
     for (0..ConnTable.slot_capacity) |slot| {
         const conn = table.at(slot) orelse continue;
 
+        // A WebTransport session can have bytes to send with no incoming packet to carry them (an
+        // application that pushes to its client), so the sweep pumps first: the same flush the response
+        // path gives an HTTP response, on a time basis instead of a packet basis.
+        if (config.webtransport.enabled and conn.wt.sessionCount() != 0) {
+            pumpWebtransport(conn, tx, fd, conn.peer_addr, config);
+        }
+
         const result = conn.onMaintenance(now_us, max_idle_us);
-        if (result.resend) resumeStreams(conn, tx, fd, config, stats);
+        if (result.resend) {
+            resumeStreams(conn, tx, fd, config, stats);
+            // A Probe Timeout is also the retry for a stream reset that never arrived: the reset frame is
+            // not tracked for acknowledgement, so a stream still holding a sent reset is resent here.
+            if (config.webtransport.enabled) pumpWebtransportResets(conn, tx, fd);
+        }
         if (result.idle) {
             // The connection is going away with whatever it was still sending, so any static cache
-            // pin it holds has to come back now or the entry is pinned for the life of the process.
+            // pin it has to come back now or the entry is pinned for the life of the process.
             conn.releaseAllStaticPins();
+
+            // The WebTransport sessions on it end with it. Their slots go back to the worker pool and the
+            // application is told, which is the only notice it gets for a connection that simply went away.
+            if (wt_pool_ptr) |wt_pool_handle| {
+                if (config.webtransport.enabled) wtReleaseConnection(config, conn, wt_pool_handle);
+            }
 
             _ = table.remove(&conn.dcid);
         }

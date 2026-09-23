@@ -69,6 +69,7 @@ pub fn addSteps(
         .{ "example-udp_client_tickrate", "examples/udp_client_tickrate.zig", "udp" },
         .{ "example-http3_basic", "examples/tls/http3_basic.zig", "http3" },
         .{ "example-http3_static", "examples/tls/http3_static.zig", "http3" },
+        .{ "example-http3_webtransport", "examples/tls/http3_webtransport.zig", "http3" },
         .{ "example-webrtc_datachannel_echo", "examples/webrtc/webrtc_datachannel_echo.zig", "webrtc" },
         .{ "example-webrtc_native_pair", "examples/webrtc/webrtc_native_pair.zig", "webrtc" },
         .{ "example-webrtc_signaling", "examples/webrtc/webrtc_signaling.zig", "webrtc" },

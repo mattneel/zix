@@ -10,6 +10,7 @@ const std = @import("std");
 const Logger = @import("../../logger/logger.zig").Logger;
 const Tls = @import("../../tls/Tls.zig");
 const reassembly = @import("reassembly.zig");
+const Webtransport = @import("webtransport/Webtransport.zig");
 
 /// The dispatch model, shared with the TCP engines and the UDP raw path (ADR-050). `.ASYNC` runs a
 /// single-worker recv with internal CID demux. `.EPOLL` / `.URING` run one SO_REUSEPORT worker per
@@ -126,6 +127,10 @@ pub const Http3ServerConfig = struct {
     /// descriptor budget. One slot holds one file plus its .br and .gz siblings. A full table serves
     /// no file rather than an unsafe one, so the request falls through to 404.
     public_dir_cache_max_entries: u32 = 256,
+    /// WebTransport over HTTP/3 (zix.Webtransport): off by default, and free when off. Turning it on
+    /// advertises the settings and transport parameters a client needs, accepts extended CONNECT
+    /// requests, and allocates the worker pool the sessions and data streams come from.
+    webtransport: Webtransport.Config = .{},
 };
 
 // --------------------------------------------------------------- //

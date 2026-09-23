@@ -83,6 +83,9 @@ pub fn workerLoopEpoll(comptime handler: core.HandlerFn, config: Http3ServerConf
     var pool = common.openReassemblyPool(config) catch return;
     defer pool.deinit(config.allocator);
 
+    var wt_pool_handle = common.openWebtransportPool(config);
+    defer if (wt_pool_handle) |*opened| opened.deinit(config.allocator);
+
     var rx = datagram.RecvBatch.init(config.allocator, config.recv_batch, config.max_recv_buf) catch return;
     defer rx.deinit();
 
@@ -124,7 +127,7 @@ pub fn workerLoopEpoll(comptime handler: core.HandlerFn, config: Http3ServerConf
             stats.datagrams += count;
             for (0..count) |i| {
                 const dg = rx.get(i);
-                common.serveDatagram(handler, table, &pool, dg, &tx, fd, config, &stats);
+                common.serveDatagram(handler, table, &pool, if (wt_pool_handle) |*opened| opened else null, dg, &tx, fd, config, &stats);
             }
 
             stats.packets += tx.count;
@@ -136,7 +139,7 @@ pub fn workerLoopEpoll(comptime handler: core.HandlerFn, config: Http3ServerConf
         // most once per interval however often readiness wakes the worker. Flush what the resend queued.
         const now_us = recovery.nowUs();
         if (now_us -| last_sweep_us >= common.maintenance_interval_us) {
-            common.sweepMaintenance(table, &tx, fd, config, now_us, &stats);
+            common.sweepMaintenance(handler, table, if (wt_pool_handle) |*opened| opened else null, &tx, fd, config, now_us, &stats);
             tx.flush(fd) catch {};
             last_sweep_us = now_us;
         }

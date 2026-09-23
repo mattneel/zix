@@ -47,6 +47,36 @@ __**Fix:**__
 
 ## X.Y.Z (YYYY-MM-DD)
 
+### __**New Features:**__
+
+#### New Module: `zix.Webtransport` (WebTransport over HTTP/3)
+
+WebTransport over HTTP/3 as a feature of `zix.Http3` (ADR-069), served on the QUIC connection the engine already owns. Turns on with `Http3ServerConfig.webtransport`, and an ordinary HTTP/3 request keeps being served on the same connection.
+
+- **Two dialects on the wire, both accepted.** draft-ietf-webtrans-http3-16 (token `webtransport-h3`, `SETTINGS_WT_ENABLED` 0x2c7cf000, session-level flow control, `RESET_STREAM_AT` on a stream reset) and the deployed draft-07 (token `webtransport`, `SETTINGS_ENABLE_WEBTRANSPORT` 0x2b603742, `SETTINGS_WEBTRANSPORT_MAX_SESSIONS` 0xc671706a) that browsers and aioquic still send. The server advertises both codepoints in one SETTINGS frame, and the CONNECT `:protocol` token picks the session's dialect.
+- **Public API `zix.Webtransport`:** `Config` on the HTTP/3 server, `Handler` with five optional callbacks (`on_session`, `on_stream`, `on_stream_reset`, `on_datagram`, `on_close`), and two handles, `Session` (`openBidi`, `openUni`, `sendDatagram`, `close`, `drain`, `streamsAvailable`, `closeInfo`) and `Stream` (`read`, `write`, `finish`, `reset`, `stop`). A handler never names a stream id, a frame, or a capsule.
+- **Wire:** extended CONNECT over HTTP/3 (RFC 9220) opens the session, the capsule protocol (RFC 9297 3) carries close and drain plus the draft-16 flow control capsules, HTTP/3 datagrams (RFC 9297 2) ride QUIC DATAGRAM frames (RFC 9221) keyed by the quarter stream id, and a data stream is a QUIC stream that opens with the type 0x54 (unidirectional) or the signal value 0x41 (bidirectional) followed by the session id. A draft-16 reset uses `RESET_STREAM_AT` (draft-ietf-quic-reliable-stream-reset-09) with a reliable size covering the stream header, so the session association survives the discarded payload.
+- **Codepoints:** capsules `WT_CLOSE_SESSION` 0x2843, `WT_DRAIN_SESSION` 0x78ae, `WT_MAX_DATA` 0x190B4D3D, `WT_DATA_BLOCKED` 0x190B4D41, `WT_MAX_STREAMS` 0x190B4D3F / 0x190B4D40, `WT_STREAMS_BLOCKED` 0x190B4D43 / 0x190B4D44; error codes `WT_SESSION_GONE` 0x170d7b68, `WT_BUFFERED_STREAM_REJECTED` 0x3994bd84, `WT_FLOW_CONTROL_ERROR` 0x045d4487; application error codes map into the reserved range 0x52e4a40fa8db to 0x52e5ac983162 while skipping every HTTP/3 grease codepoint.
+- **Worker-owned, fixed capacity.** Sessions, data streams with their send buffers, and pre-session stream buffers come from a pool allocated once per worker, so the receive path allocates nothing and the pool refuses instead of growing. `Webtransport.capacityError` reports the field that outgrows the compile-time ceilings (`connection_session_cap` 8 sessions, `connection_stream_cap` 32 streams per connection, and the pool maxima) rather than silently truncating the feature.
+- **Refusals are protocol answers, not drops.** A session ceiling is answered 429 and a full pool 503 on the request stream; a pre-session stream past the buffer is reset with `WT_BUFFERED_STREAM_REJECTED`; a session flow control violation closes the session with `WT_FLOW_CONTROL_ERROR`; and every stream of an ending session is reset with `WT_SESSION_GONE`.
+- **Example:** [examples/tls/http3_webtransport.zig](examples/tls/http3_webtransport.zig) on 127.0.0.1:9089, built as `zig build example-http3_webtransport`: it accepts sessions on `/echo`, echoes every data-stream chunk and every datagram, opens one unidirectional stream per session with a banner, and prints the session lifecycle on stderr.
+- **Runner:** `zig build test-runner-webtransport` spawns that example and drives it end to end with the hand-rolled HTTP/3 client (extended CONNECT answered 2xx, the banner on the unidirectional stream, a bidirectional data-stream echo, and a datagram echo). The step is also part of `test-runner-all`.
+- **Docs:** [`docs/hld-webtransport-en.md`](docs/hld-webtransport-en.md) / [`docs/hld-webtransport-id.md`](docs/hld-webtransport-id.md) and [`docs/lld-webtransport-en.md`](docs/lld-webtransport-en.md) / [`docs/lld-webtransport-id.md`](docs/lld-webtransport-id.md), plus ADR-069.
+- **Not in this pass:** the capsule-based WebTransport over HTTP/2 variant, 0-RTT sessions, keying-material exporters, priority signalling, and a GOAWAY-initiated session drain. See the HLD's Not Yet Wired table.
+
+<br>
+
+### __**Fixed:**__
+
+#### HTTP/3 over QUIC
+
+Two pre-existing defects in the engine that the WebTransport work surfaced, both hit by a real client rather than by the in-tree one.
+
+- **A long-header packet is bounded by its own Length field, not by the end of the datagram (`src/udp/http3/protection.zig`).** The AEAD read its tag past the packet: a client that writes anything after its Initial (a coalesced packet, or the padding aioquic adds to reach the 1200-byte datagram floor) authenticated the wrong bytes and failed, so the handshake never started. `packet.longPacketBounds` now supplies the packet end and is shared with the coalesced-packet walk, so the same arithmetic decides both. A captured aioquic Initial (a 478-byte Length field inside a 1200-byte datagram) failed before and opens now, and aioquic completes the QUIC / TLS handshake against the engine and opens a session.
+- **Every packet a datagram carries is served, not only the first (`src/udp/http3/dispatch/common.zig`).** `serveDatagram` read the first packet of a datagram and stopped, so a 1-RTT packet coalesced after an Initial or a Handshake packet was silently dropped. It now walks the packets of one datagram (RFC 9000 12.2), with `servePacket` as the per-packet step, which is what a client that coalesces its first flight depends on.
+
+<br>
+
 __**Update:**__
 - Introduce `zix.utils.charsets` from `src/utils/charsets.zig`:
     - Covered from `alphabet`, `ALPHABET`, `ALPHANUMERIC`, `NUMERIC_STRING`, `punctuation`, `ALPHANUMERIC_PUNCTUATION`, `base32`, and `base64`.

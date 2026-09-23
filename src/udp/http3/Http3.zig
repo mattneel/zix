@@ -26,6 +26,9 @@ pub const ContentEncoding = core.ContentEncoding;
 pub const ServerConfig = Config.Http3ServerConfig;
 /// The dispatch model, shared with the rest of the engine family (ADR-050).
 pub const DispatchModel = Config.DispatchModel;
+/// WebTransport over HTTP/3: the application surface (config, callbacks, Session, Stream) and the
+/// wire-level building blocks under it. Configured on Http3ServerConfig.webtransport.
+pub const Webtransport = @import("webtransport/Webtransport.zig");
 /// The comptime router, mirroring zix.Http1 / zix.Http2.
 pub const Router = router.Router;
 /// A single route entry for the router.

@@ -155,6 +155,20 @@ Layer HTTP/3 (QUIC) adalah pure-Zig dari RFC, jadi tiap modul membawa worked exa
 | `udp/http3/config.zig` / `server.zig` | `refAllDecls` + perilaku: field config wajib dan default, `Tls.Context` null ditolak saat run |
 | `udp/http3/static.zig` | `refAllDecls` + perilaku: content-encoding hanya memetakan yang bisa dikirim jalur respons, serve menolak ketika caching mati (body harus hidup lebih lama dari handler, jadi hanya bisa dari cache), respons diisi dari byte cache dan pin DITAHAN, body tetap terbaca setelah frame handler hilang, sibling `.br` dipilih dan dinamai, traversal dan file hilang ditolak, tepat satu pin ditahan dan `releasePin` mengembalikannya, pin yang dilepas membuat entry bisa di-reclaim, body in-flight kebal terhadap file yang ditulis ulang di tempat |
 
+### zix.Webtransport
+
+WebTransport over HTTP/3 adalah fitur `zix.Http3` (`Http3ServerConfig.webtransport`), jadi modul-modul binding ini pure-Zig dari draft-nya sendiri: masing-masing membawa codepoint, layout RFC, dan byte stream yang dibuat khusus sebagai test in-file. Round trip live digerakkan end to end oleh client native yang hand-rolled dari primitive HTTP/3 di `test-runner-webtransport` / `test-runner-all`.
+
+| Modul | Cakupan |
+| :- | :- |
+| `udp/http3/webtransport/draft.zig` | `refAllDecls` + perilaku: kedua upgrade token memilih dialect-nya dan token tak dikenal tidak memilih keduanya, codepoint draft-16 terhadap registrasi IANA (setting, stream type dan signal value, error code, capsule type), pasangan draft-07 deployed yang masih diterima, pemetaan application error di kedua ujung rentang dan melalui sapuan menyeluruh bahwa tidak ada nilai hasil encode yang merupakan codepoint grease terreservasi, codepoint terreservasi di dalam rentang yang tidak membawa application error, dan klasifikasi capsule flow control |
+| `udp/http3/webtransport/capsule.zig` | `refAllDecls` + perilaku: framing capsule RFC 9297 3.2, application code dan message pada capsule close dengan pemotongan di batas karakter UTF-8, capsule flow control yang mengencode dan mendekode satu varint, reader streaming yang menyerahkan capsule yang terbelah antar datagram, melewati capsule tak dikenal tanpa membuffernya, melewati capsule dikenal yang kebesaran, capsule yang ditolak menghentikan reader, dan panjang deklarasi raksasa yang mengonsumsi persis yang dideklarasikannya sambil membuffer nol |
+| `udp/http3/webtransport/datagram.zig` | `refAllDecls` + perilaku: bentuk frame RFC 9221 4 (kedua tipe, datagram kosong, panjang melewati buffer, header terpotong), ukuran frame terencode yang dihitung limit peer, limit yang membatasi setiap pengiriman, quarter stream id RFC 9297 2.1 yang membawa session, HTTP/3 datagram yang round trip melewatinya, dan anggaran payload yang mengurangi kedua lapisan overhead framing |
+| `udp/http3/webtransport/stream_header.zig` | `refAllDecls` + perilaku: layout 0x54 / 0x41 untuk kedua kind dengan session id satu dan dua byte, stream yang dibuka dengan protokol lain ditolak, aturan session id untuk stream bidirectional yang diinisiasi client, reliable reset size yang mencakup header, dan ruang stream id tempat stream data bisa hidup |
+| `udp/http3/webtransport/session.zig` | `refAllDecls` + perilaku: send buffer mengambil sebanyak yang bisa dan melaporkan back pressure, stream panjang memakai ulang satu buffer di seluruh pengakuan, loss yang memundurkan offset terkirim tanpa mengganggu antrean, reset yang selalu mencakup header stream, receive side yang mengisi ulang kredit sebelum kering, flow control yang hanya aktif ketika kedua endpoint mendeklarasikan, limit data session yang ditegakkan dan ditagih, jumlah stream masuk yang dibatasi per kind, membuka stream yang menghormati limit peer, aturan monotonik untuk `WT_MAX_DATA` dan `WT_MAX_STREAMS`, endpoint yang menaikkan limitnya sendiri saat peer menghabiskannya, session yang berakhir dengan informasi close peer, stream yang attach dan detach, dan session id yang merupakan stream id CONNECT-nya |
+| `udp/http3/webtransport/pool.zig` | `refAllDecls` + perilaku: slot dibagikan, ditolak melewati kapasitas, dan didaur ulang; setiap slot stream membawa send buffer-nya sendiri; tabel orphan menahan himpunan terbatas stream pra-session; stream yang dibuffer diputar ulang hanya ke session-nya; buffer konfigurasi yang sangat kecil dinaikkan ke ukuran yang bisa menahan header stream; dan pool kosong yang menolak setiap akuisisi |
+| `udp/http3/webtransport/Webtransport.zig` | `refAllDecls` + perilaku: config default yang tidak menawarkan apa pun sampai diaktifkan, config yang melewati tabel koneksi ditolak dengan nama field yang melewatinya, sizing pool yang mengikuti limit yang diiklankan, dan kosakata stream kind serta dialect yang dilihat aplikasi |
+
 ### zix.Webrtc
 
 Setiap lapis WebRTC ditulis dari RFC-nya sendiri, jadi setiap berkas membawa test-nya di dalam
@@ -410,6 +424,18 @@ yang akan dibingkai engine, termasuk pin cache yang dikembalikannya.
 | Router menjaga path ber-route di depan fallback static | handler ber-route menang atas file yang akan menutupinya |
 | Router 404 untuk path static ketika caching mati | file-nya ada, tapi engine ini tidak punya sumber body yang aman tanpa cache |
 | Router menyajikan body multi-paket yang hidup lebih lama dari panggilan dispatch | body 64 KiB terbaca utuh setelah Context hilang |
+
+#### `webtransport_test.zig`
+
+Jalur WebTransport over HTTP/3 yang hanya bekerja ketika bagian-bagiannya sepakat: decode request yang harus mengenali session request, codec SETTINGS yang dibaca client sebelum mengirimnya, dan transport parameter yang menjadi fondasi fiturnya. Byte-nya dibangun tangan dari primitive publik yang sama yang dipakai peer, jadi yang diuji adalah kontrak wire, bukan decode yang digerakkan encoder yang berbagi kesalahan yang sama.
+
+| Tes | Yang diverifikasi |
+| :- | :- |
+| Decode request melaporkan token yang dipakai membuka session WebTransport | byte persis sebuah extended CONNECT (`:method CONNECT`, `:scheme`, `:authority`, `:path`, dan `:protocol` di bawah literal name) ter-decode menjadi token, dan token itu menyebut dialect-nya |
+| Token protokol yang Huffman-coded tetap menyebut dialect-nya | decode membiarkan nilainya dalam coding saat kedatangannya, jadi layer yang mengenali session request memperluasnya sebelum mencocokkan |
+| Protokol pada request yang bukan CONNECT adalah malformed | `:protocol` hanya memperluas CONNECT (RFC 9220 4), dan GET yang membawa token WebTransport tidak pernah dibaca sebagai session request |
+| Setting yang diiklankan server WebTransport adalah yang dibutuhkan client | ketiga support flag yang diperiksa client, limit session draft-16, dan pasangan deployed supaya client draft-07 juga melihat dukungan |
+| Transport parameter WebTransport ter-parse dari client hello | `max_datagram_frame_size` (0x20) dan `reset_stream_at` (0x1d) ter-parse di samping limit flow control yang dibaca jalur respons |
 
 ### tests/integration/webrtc/
 
@@ -734,6 +760,20 @@ Dukungan QUERY RFC 10008 lewat permukaan publik `zix.Http1`.
 | Field static disimpan apa adanya | ketiganya round-trip |
 | Penyajian static butuh caching, berbeda dari engine lain | mengunci asimetri yang disengaja: di Http3 ttl 0 mematikan penyajian static sepenuhnya, karena body respons hidup lebih lama dari handler-nya |
 
+#### `webtransport_test.zig`
+
+Permukaan `zix.Webtransport` yang diandalkan aplikasi dan peer, digerakkan lewat handle yang benar-benar dipegang pemanggil: hook engine di sini adalah kontrak layer dispatch (buka stream, kirim datagram, tutup session) yang diimplementasikan di atas worker pool, sehingga session dan stream bergerak seperti koneksi menggerakkannya, tanpa socket.
+
+| Tes | Yang diverifikasi |
+| :- | :- |
+| Config server HTTP/3 membawa fiturnya mati dan tidak memakan biaya selama itu | default-nya nonaktif, dan config yang mati tidak mengiklankan apa pun |
+| Config melewati plafon koneksi ditolak dengan field yang melewatinya | `capacityError` menyebut field-nya, dan plafonnya sendiri diterima |
+| Sizing pool yang diminta sebuah config adalah window yang dipakai stream untuk menulis | config pool yang dipetakan sebuah `Config` membawa ukuran send buffer stream |
+| Token yang dikirim client adalah dialect yang diucapkan session-nya | token `:protocol` pada CONNECT menentukan draft-16 atau draft-07, dan token tak dikenal tidak menentukan keduanya |
+| Stream adalah write window, FIN menutupnya, dan hanya pengakuan yang menyelesaikannya | kontrak tulis / back pressure, aturan FIN, dan predikat send-finished |
+| Session menegakkan limit data yang diiklankannya dan menaikkannya saat peer menghabiskannya | limit data session menolak yang melewatinya dan sebuah capsule menaikkannya |
+| Datagram diframe dengan quarter stream id session-nya dan dibatasi limit peer | layout HTTP/3 datagram dan anggaran payload terhadap ukuran frame yang diiklankan |
+
 ### tests/behaviour/webrtc/
 
 #### `session_test.zig`
@@ -1028,6 +1068,21 @@ Batas-batas di mana engine harus menolak alih-alih menyerahkan body yang tidak b
 | Byte selamat dari pemotongan ke file lebih pendek | bentuk berbahaya: file menyusut saat respons masih dikirim |
 | Menolak setiap path tidak aman sebelum menyentuh disk | traversal, absolut, dan kosong |
 | Byte di-snapshot sekali dan dipakai ulang antar request | satu salinan menopang respons konkuren, dan masing-masing menahan pin sendiri |
+
+#### `webtransport_test.zig`
+
+Batas-batas `zix.Webtransport` di permukaan publiknya, dan input hostile yang bebas dikirim peer: aliran capsule yang mendeklarasikan lebih dari yang ditahan reader, application error di kedua ujung rentangnya, send window yang pembukuannya penuh, pool di slot terakhirnya, dan session yang sudah berakhir.
+
+| Tes | Yang diverifikasi |
+| :- | :- |
+| Reader capsule menahan nilai sampai limitnya dan melewati satu byte di atasnya | `max_known_value` persis capsule terbesar yang didefinisikan binding, satu byte lebih dilewati di tempat, dan capsule di belakangnya tetap tiba |
+| Nilai capsule yang satu byte lebih pendek dari panjangnya tidak dikirim | panjang yang dideklarasikan adalah yang dipercaya reader, jadi capsule yang pendek masih dianggap sedang tiba |
+| Pemetaan application error mencakup kedua ujung 32-bit tanpa jatuh di codepoint grease | `0` dan `0xffffffff` memetakan ke ujung rentang application error, dan error code framing tidak ter-decode sebagai salah satunya |
+| Reset peer melaporkan application code hanya ketika membawanya | kode di luar rentang aplikasi terbaca sebagai reset tanpa application code |
+| Stream yang daftar rentang terkirimnya penuh tidak ditawari byte lagi | daftarnya terbatas, dan daftar penuh menghentikan pump alih-alih mengirim byte yang tidak lagi bisa dipertanggungjawabkannya |
+| Reset mencakup minimal header dari kind yang diresetnya | reset reliabel mengirimkan header, atau peer tidak bisa tahu stream itu milik session mana |
+| Pool menolak di atas slot terakhirnya dan tabel pra-session tidak menahan yang ditolaknya | pool satu slot menolak session kedua alih-alih melayaninya dari slot session pertama |
+| Session tertutup menolak stream dan datagram serta memotong pesan close-nya | session tertutup tidak membuka apa pun, tidak mengirim apa pun, dan melaporkan pesan tidak lebih panjang dari limitnya |
 
 ### tests/edge/webrtc/
 
