@@ -1,0 +1,65 @@
+# A Fly.io deployment for the WebTransport demo, with a certificate browsers already trust.
+#
+# Two things here are not how a Fly app is usually configured, and both are required:
+#
+# - The services carry no `handlers`. Fly's edge proxy terminates TLS for any service that has them, which
+#   turns the connection into plaintext inside their network. QUIC cannot survive that: the handshake has
+#   to reach this process and end here, and starting from a WebTransport endpoint the browser never sends a
+#   cleartext byte. With no handlers the proxy is a wire.
+# - Port 80 is passed through as well, to certbot's standalone responder. A certificate the edge holds is
+#   no use to a QUIC server - the handshake needs the private key - so the certificate is issued to this
+#   machine. That is also why the app cannot live on a *.fly.dev hostname: nobody but Fly can issue a
+#   certificate for a name they own, and this app has to hold the key.
+#
+# The UDP listener binds a numeric address: Fly requires UDP on `fly-global-services`, which
+# deploy/entrypoint.sh resolves before starting the server. Set DOMAIN and ACME_EMAIL as secrets.
+
+app = "zix-webtransport-demo"
+primary_region = "mia"
+
+[build]
+  dockerfile = "deploy/Dockerfile"
+
+[env]
+  # One origin: the page is HTTPS/1.1 on TCP, the session is HTTP/3 on UDP, both inside on 9444.
+  ZIX_PAGE_IP = "0.0.0.0"
+  ZIX_PAGE_PORT = "9444"
+  ZIX_SESSION_PORT = "9444"
+
+[[mounts]]
+  source = "certs"
+  destination = "/data"
+
+# The page and the WebTransport session: one external port, both protocols passed straight through.
+[[services]]
+  internal_port = 9444
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 443
+
+[[services]]
+  internal_port = 9444
+  protocol = "udp"
+
+  [[services.ports]]
+    port = 443
+
+# ACME HTTP-01: certbot's standalone responder binds 80 inside the machine and the proxy passes the
+# challenge through untouched.
+[[services]]
+  internal_port = 80
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 80
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# Stopping idle machines keeps an idle demo close to free; it wakes on the next request.
+[experimental]
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
