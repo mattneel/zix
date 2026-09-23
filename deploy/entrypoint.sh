@@ -26,7 +26,9 @@ if [ -n "$DOMAIN" ]; then
     # request entirely - then act on a certificate that was never written.
     if [ ! -f "$STATE/certificates/$DOMAIN.crt" ]; then
         echo "[entrypoint] requesting a certificate for $DOMAIN through a DNS-01 challenge"
-        if ! (cd "$STATE" && lego run --accept-tos --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN"); then
+        # lego's own Spaceship provider wrote nothing the validators could see, while a record written to the
+        # zone through the API appears within seconds. exec hands the challenge to that proven path.
+        if ! (cd "$STATE" && EXEC_PATH=/app/acme-dns-hook.sh lego run --accept-tos --email "$ACME_EMAIL" --dns exec --domains "$DOMAIN"); then
             echo "[entrypoint] WARNING: the certificate request failed; serving the development certificate"
             acme_ok=no
         fi
@@ -39,7 +41,7 @@ if [ -n "$DOMAIN" ]; then
         (
             while :; do
                 sleep 12h
-                (cd "$STATE" && lego run --accept-tos --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN" --renew-days 30) || true
+                (cd "$STATE" && EXEC_PATH=/app/acme-dns-hook.sh lego run --accept-tos --email "$ACME_EMAIL" --dns exec --domains "$DOMAIN" --renew-days 30) || true
             done
         ) &
 

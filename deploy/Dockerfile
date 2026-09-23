@@ -16,7 +16,7 @@ RUN zig build example-webtransport_tasks --prefix /out
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl openssl postgresql tcpdump \
+    && apt-get install -y --no-install-recommends ca-certificates curl jq openssl postgresql tcpdump \
     && rm -rf /var/lib/apt/lists/*
 # lego rather than certbot: it has a Spaceship DNS provider, and a DNS-01 challenge needs nothing inbound -
 # no port 80 through a proxy, no HTTP surface on a machine whose whole point is that TLS ends inside it.
@@ -28,5 +28,6 @@ COPY --from=build /out/bin/zix-example-webtransport_tasks-x86_64-linux-debug /ap
 # ZIX_KEY to the ACME files once it has them.
 COPY --from=build /src/examples/certs /app/examples/certs
 COPY deploy/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY deploy/acme-dns-hook.sh /app/acme-dns-hook.sh
+RUN chmod +x /app/entrypoint.sh /app/acme-dns-hook.sh
 ENTRYPOINT ["/app/entrypoint.sh"]
