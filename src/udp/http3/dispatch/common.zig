@@ -1195,7 +1195,24 @@ fn takeReadyRequest(pool: *reassembly.Pool, now_us: u64, cid: *const demux.ConnI
 
             return .{ .serve = decoded };
         },
-        .waiting => |slot| return .{ .hold = slot },
+        .waiting => |slot| {
+            // A CONNECT request is complete once its header block is: RFC 9114 4.4 keeps the stream open
+            // after the headers, which is exactly what a WebTransport session needs (its CONNECT stream
+            // carries capsules until the session ends). Waiting for FIN would hold every session request
+            // forever, and the ones the packet-level pass could not decode on arrival - because the
+            // client's QPACK encoder had state the decode needed - would never be dispatched at all.
+            // The decode returns null until the header block is whole, so a genuinely partial request
+            // still waits.
+            if (request.decodeAssembledRequest(slot.assembledMutable(), true)) |decoded| {
+                if (std.mem.eql(u8, decoded.method, "CONNECT")) {
+                    held.* = slot;
+
+                    return .{ .serve = decoded };
+                }
+            }
+
+            return .{ .hold = slot };
+        },
         .refused => return if (piece.request) |head| .{ .overloaded = head } else .{ .hold = null },
     }
 }
@@ -1565,9 +1582,12 @@ fn buildConnectionPrologue(out: []u8, config: Http3ServerConfig, control_stream_
     pos += 1;
 
     var control_buf: [wt_settings_bytes]u8 = undefined;
-    const control_len = h3.writeServerControlStream(&control_buf, webtransportSettings(config)) orelse {
+    const advertised = webtransportSettings(config);
+    logSystem(config, .INFO, "http3: advertising settings enabled={} connect_protocol={} datagram={} wt={} legacy={} uni={d} bidi={d} data={d}", .{ config.webtransport.enabled, advertised.enable_connect_protocol, advertised.h3_datagram, advertised.webtransport, advertised.legacy_webtransport, advertised.wt_initial_max_streams_uni, advertised.wt_initial_max_streams_bidi, advertised.wt_initial_max_data });
+    const control_len = h3.writeServerControlStream(&control_buf, advertised) orelse {
         // The widest set could not fit: fall back to the empty SETTINGS the engine sent before the
         // feature existed, rather than leaving the control stream unopened (RFC 9114 6.2.1).
+        logSystem(config, .WARN, "http3: the WebTransport settings did not fit {d} bytes, falling back to empty SETTINGS", .{wt_settings_bytes});
         control_buf[0] = 0x00;
         control_buf[1] = 0x04;
         control_buf[2] = 0x00;
@@ -1856,6 +1876,53 @@ fn webtransportIncoming(
     var pieces: [request.max_requests_per_packet]request.StreamPiece = undefined;
     const count = request.parseStreamPieces(payload, &pieces);
     for (pieces[0..count]) |piece| wtIncomingBidiStream(&call, piece, claims);
+}
+
+/// Accept a WebTransport session request that the *HTTP request pass* assembled rather than the
+/// packet-level pass above.
+///
+/// Why this exists: the packet-level pass only sees a CONNECT whose header block it can decode out of
+/// the bytes of one packet (`piece.request`). A client that has already sent a request on the same
+/// connection - fetching the page, for instance - leaves its QPACK encoder with state that a later
+/// header block refers to, so the decode is not ready when the packet that opens the CONNECT stream
+/// arrives. Left alone, that stream is claimed by nobody and the request path answers the CONNECT as an
+/// ordinary HTTP request, and no session is ever created. The request pool has the bytes assembled by
+/// then, so the accept path runs here with the decoded request instead.
+fn webtransportAcceptAssembled(
+    conn: *Connection,
+    pool: *wt_pool.Pool,
+    requests: *reassembly.Pool,
+    tx: *datagram.SendBatch,
+    fd: std.posix.socket_t,
+    peer: std.posix.sockaddr.in6,
+    config: Http3ServerConfig,
+    piece: request.StreamPiece,
+    decoded: request.DecodedRequest,
+) void {
+    var call = WtCall{
+        .conn = conn,
+        .pool = pool,
+        .requests = requests,
+        .tx = tx,
+        .fd = fd,
+        .peer = peer,
+        .config = config,
+        .now_us = recovery.nowUs(),
+        .driver = .{
+            .context = undefined,
+            .open_stream = WtCall.openStream,
+            .send_datagram = WtCall.sendDatagram,
+            .close_session = WtCall.closeSession,
+            .drain_session = WtCall.drainSession,
+            .stop_receiving = WtCall.stopReceiving,
+            .reset_stream = WtCall.resetStream,
+        },
+    };
+    call.driver.context = &call;
+
+    logSystem(config, .INFO, "webtransport: session request on stream {d} was assembled from the request pool", .{piece.stream_id});
+
+    wtIncomingConnect(&call, piece, decoded);
 }
 
 /// Read the non-STREAM frames a WebTransport connection cares about: DATAGRAM frames, and the stream
@@ -2181,7 +2248,13 @@ fn wtIncomingBidiStream(call: *WtCall, piece: request.StreamPiece, claims: *WtCl
     }
 
     const decoded = piece.request orelse return;
-    if (!wtIsWebtransportConnect(decoded)) return;
+    if (!wtIsWebtransportConnect(decoded)) {
+        if (std.mem.eql(u8, decoded.method, "CONNECT")) {
+            logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} is not a session request (protocol={s}, huffman={}, dialect={s})", .{ piece.stream_id, decoded.protocol, decoded.protocol_huffman, if (decoded.protocol_huffman) "(huffman)" else "plain" });
+        }
+
+        return;
+    }
 
     claims.add(piece.stream_id);
     wtIncomingConnect(call, piece, decoded);
@@ -2262,12 +2335,25 @@ fn wtIncomingConnect(call: *WtCall, piece: request.StreamPiece, decoded: request
     // The token, expanded if the client Huffman-coded it.
     var token_scratch: [32]u8 = undefined;
     const token = if (decoded.protocol_huffman)
-        token_scratch[0 .. huffman.decode(&token_scratch, decoded.protocol) orelse return]
+        token_scratch[0 .. huffman.decode(&token_scratch, decoded.protocol) orelse
+            {
+                logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} has an undecodable :protocol", .{piece.stream_id});
+
+                return;
+            }]
     else
         decoded.protocol;
 
-    const dialect = wt_draft.dialectForToken(token) orelse return;
-    if (dialect == .draft07 and !config.legacy_dialect) return;
+    const dialect = wt_draft.dialectForToken(token) orelse {
+        logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} names an unknown dialect ({s})", .{ piece.stream_id, token });
+
+        return;
+    };
+    if (dialect == .draft07 and !config.legacy_dialect) {
+        logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} is draft-07 and legacy dialing is off", .{piece.stream_id});
+
+        return;
+    }
 
     // draft-16 7.1: the server MUST NOT process a WebTransport request before the client's SETTINGS
     // arrive, because the settings are what pin the version and the required features. The request is
@@ -2278,12 +2364,18 @@ fn wtIncomingConnect(call: *WtCall, piece: request.StreamPiece, decoded: request
         switch (call.requests.feed(call.now_us, &call.conn.dcid, piece.stream_id, piece.offset, piece.data, piece.fin)) {
             .ready, .waiting => {
                 if (!call.conn.wt.notePendingConnect(piece.stream_id)) {
+                    logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} held but the table is full", .{piece.stream_id});
                     wtResetRequestStream(call, piece.stream_id, h3.Http3Error.request_rejected);
+                } else {
+                    logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} held until the client's SETTINGS arrive", .{piece.stream_id});
                 }
             },
             // The pool is full, so this request cannot be held: it is refused with the code for "not
             // processed in any way" (RFC 9114 8.1) rather than answered against half a request.
-            .refused => wtResetRequestStream(call, piece.stream_id, h3.Http3Error.request_rejected),
+            .refused => {
+                logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} could not be held (request pool full)", .{piece.stream_id});
+                wtResetRequestStream(call, piece.stream_id, h3.Http3Error.request_rejected);
+            },
         }
 
         return;
@@ -2292,6 +2384,7 @@ fn wtIncomingConnect(call: *WtCall, piece: request.StreamPiece, decoded: request
     // 3.1: a WebTransport connection requires HTTP/3 datagrams on both sides. Without the client's
     // SETTINGS_H3_DATAGRAM=1 and a transport parameter granting datagrams, the request is malformed.
     if (!call.conn.wt.client_settings.h3_datagram or call.conn.wt.peer_datagram_frame_size == 0) {
+        logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} refused: h3_datagram={} peer_datagram_frame_size={d}", .{ piece.stream_id, call.conn.wt.client_settings.h3_datagram, call.conn.wt.peer_datagram_frame_size });
         wtResetRequestStream(call, piece.stream_id, h3.Http3Error.message_error);
 
         return;
@@ -2300,12 +2393,14 @@ fn wtIncomingConnect(call: *WtCall, piece: request.StreamPiece, decoded: request
     // 5.2: the server limits how many sessions a connection may have, and 5.1: without flow control only
     // one session at a time is allowed.
     if (call.conn.wt.sessionCount() >= config.max_sessions_per_connection) {
+        logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} refused: {d} sessions already live", .{ piece.stream_id, call.conn.wt.sessionCount() });
         wtRejectConnect(call, piece.stream_id, decoded, 429);
 
         return;
     }
 
     const session = call.pool.acquireSession() orelse {
+        logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} refused: no session slot in the pool", .{piece.stream_id});
         wtRejectConnect(call, piece.stream_id, decoded, 503);
 
         return;
@@ -2320,6 +2415,7 @@ fn wtIncomingConnect(call: *WtCall, piece: request.StreamPiece, decoded: request
     );
 
     if (!call.conn.wt.attachSession(session)) {
+        logSystem(call.config, .INFO, "webtransport: CONNECT on stream {d} refused: the connection holds no free session slot", .{piece.stream_id});
         call.pool.releaseSession(session);
         wtRejectConnect(call, piece.stream_id, decoded, 503);
 
@@ -2346,6 +2442,7 @@ fn wtIncomingConnect(call: *WtCall, piece: request.StreamPiece, decoded: request
 
     if (config.handler.on_session) |on_session| {
         if (on_session(&view)) |status| {
+            logSystem(call.config, .INFO, "webtransport: the application refused the session on stream {d} with {d}", .{ piece.stream_id, status });
             call.conn.wt.detachSession(session);
             call.pool.releaseSession(session);
             wtRejectConnect(call, piece.stream_id, decoded, status);
@@ -3028,6 +3125,21 @@ fn sendResponseFD(handler: core.HandlerFn, table: *ConnTable, pool: *reassembly.
                 continue;
             },
         };
+
+        // A WebTransport session request is not an HTTP request: an extended CONNECT opens a session
+        // instead of being answered (RFC 9220, draft-ietf-webtrans-http3 3.2). The packet-level pass
+        // handles the ones it can decode on arrival; this is the path for a CONNECT whose header block
+        // had to be assembled first. Without it the request path answers the CONNECT and the session is
+        // never created.
+        if (config.webtransport.enabled) {
+            if (wt_pool_ptr) |wt_pool_handle| {
+                if (wtIsWebtransportConnect(decoded)) {
+                    webtransportAcceptAssembled(conn, wt_pool_handle, pool, tx, fd, peer, config, piece, decoded);
+
+                    continue;
+                }
+            }
+        }
 
         var req = buildRequest(conn, &ae_scratch, decoded);
         var res = core.Response{};
