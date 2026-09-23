@@ -31,9 +31,17 @@ const tasks = @import("durable_tasks");
 
 // --------------------------------------------------------- //
 
-const IP: []const u8 = "127.0.0.1";
+/// The bind address, ports, certificate paths and database URL. Defaults keep the development loop exactly
+/// as it is; each has an environment override because a deployment gives the process its interface and its
+/// certificate from outside. Fly.io, for one, requires a UDP listener to bind the `fly-global-services`
+/// address rather than loopback, and needs a certificate a browser already trusts.
+var IP: []const u8 = "127.0.0.1";
+var PAGE_IP: []const u8 = "127.0.0.1";
 /// The session's port: HTTP/3 over QUIC, where the WebTransport binding lives.
-const PORT: u16 = 9444;
+var PORT: u16 = 9444;
+/// The page's port: HTTPS/1.1 over TCP. It defaults to the session's port, because a session shares its
+/// page's origin; a deployment that terminates both behind one external port overrides both.
+var PAGE_PORT: u16 = 9444;
 /// The page's port: HTTPS/1.1 over TCP. It is deliberately *not* the QUIC port. A browser that is told to
 /// force QUIC for an origin sends every request to that origin over QUIC, so a page served there cannot
 /// reload while the server is being rebuilt — and the development loop is exactly a rebuild followed by a
@@ -42,10 +50,10 @@ const PORT: u16 = 9444;
 
 /// Where the durable store lives. Every example in this repository points at a fixed local database; this
 /// is the one it points at.
-const DSN: []const u8 = "postgres://zix:zix@127.0.0.1:5432/zix_dev";
+var DSN: []const u8 = "postgres://zix:zix@127.0.0.1:5432/zix_dev";
 // Demo fixtures. For a real domain, point CERT / KEY at your certbot files.
-const CERT: []const u8 = "examples/certs/ecdsa_p256_cert.pem";
-const KEY: []const u8 = "examples/certs/ecdsa_p256_key.pem";
+var CERT: []const u8 = "examples/certs/ecdsa_p256_cert.pem";
+var KEY: []const u8 = "examples/certs/ecdsa_p256_key.pem";
 
 /// The path a session is accepted on.
 const SESSION_PATH: []const u8 = "/tasks";
@@ -139,7 +147,13 @@ var current_io: std.Io = undefined;
 
 // --------------------------------------------------------- //
 
-fn page(req: *zix.Http1.Request, res: *zix.Http1.Response, _: *zix.Http1.Context) !void {
+fn page(req: *zix.Http1.Request, res: *zix.Http1.Response, ctx: *zix.Http1.Context) !void {
+    if (std.mem.eql(u8, req.path(), "/favicon.ico")) {
+        _ = ctx;
+
+        return sendText(res, "");
+    }
+
     const path = req.path();
 
     // The version the development loop polls: it changes exactly when the bytes this server serves change.
@@ -199,6 +213,36 @@ fn preparePage() void {
 fn root(_: *const zix.Http3.Request, res: *zix.Http3.Response, _: *zix.Http3.Context) !void {
     res.content_type = "text/html; charset=utf-8";
     res.send(served_page[0..served_page_len]);
+}
+
+/// A browser asks for the favicon on the page's own origin, which is this HTTP/3 listener: answering it
+/// with no content keeps the console clean and, on a demo, is the whole requirement.
+fn favicon(_: *const zix.Http3.Request, res: *zix.Http3.Response, _: *zix.Http3.Context) !void {
+    res.status = 204;
+    res.send("");
+}
+
+/// The version the development loop polls, on the HTTP/3 listener: it changes exactly when the bytes this
+/// server serves change.
+fn devloopVersion(_: *const zix.Http3.Request, res: *zix.Http3.Response, _: *zix.Http3.Context) !void {
+    var body_buf: [24]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{x}\n", .{served_version}) catch return;
+
+    res.content_type = "text/plain";
+    res.send(body);
+}
+
+/// The browser's own report, on the HTTP/3 listener: it says it rendered the changed behaviour and
+/// finished a durable action. A prefix route, so the mark the harness waits for travels in the path.
+fn devloopVerified(req: *const zix.Http3.Request, res: *zix.Http3.Response, _: *zix.Http3.Context) !void {
+    const path = req.path;
+
+    if (std.mem.startsWith(u8, path, "/verified/")) {
+        std.debug.print("[devloop] verified {s}\n", .{path["/verified/".len..]});
+    }
+
+    res.content_type = "text/plain";
+    res.send("ok\n");
 }
 
 // --------------------------------------------------------- //
@@ -571,6 +615,18 @@ fn writeLine(stream: *const zix.Webtransport.Stream, line: []const u8) void {
 
 pub fn main(process: std.process.Init) !void {
     current_io = process.io;
+
+    // Environment overrides, read before anything uses these. `fly-global-services` is Fly.io's name for
+    // the address a UDP listener must bind; ZIX_PAGE_IP stays separate because the TCP page listener binds
+    // wherever the platform routes its TCP, which is not that address.
+    if (process.environ_map.get("ZIX_SESSION_IP")) |value| IP = value;
+    if (process.environ_map.get("ZIX_PAGE_IP")) |value| PAGE_IP = value;
+    if (process.environ_map.get("ZIX_SESSION_PORT")) |value| PORT = std.fmt.parseInt(u16, value, 10) catch PORT;
+    if (process.environ_map.get("ZIX_PAGE_PORT")) |value| PAGE_PORT = std.fmt.parseInt(u16, value, 10) catch PAGE_PORT;
+    if (process.environ_map.get("ZIX_CERT")) |value| CERT = value;
+    if (process.environ_map.get("ZIX_KEY")) |value| KEY = value;
+    if (process.environ_map.get("DATABASE_URL")) |value| DSN = value;
+
     preparePage();
     served_version = std.hash.Fnv1a_64.hash(served_page[0..served_page_len]);
 
@@ -609,16 +665,23 @@ pub fn main(process: std.process.Init) !void {
 
     var page_server = zix.Http1.Server.init(page, .{
         .io = process.io,
-        .ip = IP,
-        .port = PORT,
+        .ip = PAGE_IP,
+        .port = PAGE_PORT,
         .tls = &page_tls,
         .dispatch_model = if (builtin.os.tag == .linux) .URING else .ASYNC,
         .workers = 1,
     });
     defer page_server.deinit();
 
+    // Every route the page uses must exist on both listeners. Once a browser learns this origin speaks
+    // HTTP/3 it fetches the page - and everything the page fetches - over QUIC, so an endpoint that lives
+    // only on the TCP side answers 404 and the development loop never reports. That is exactly what
+    // happened when the page started being served over HTTP/3.
     const Routes = zix.Http3.Router(&[_]zix.Http3.Route{
         .{ .path = "/", .handler = root },
+        .{ .path = "/favicon.ico", .handler = favicon },
+        .{ .path = "/devloop/version", .handler = devloopVersion },
+        .{ .path = "/verified", .handler = devloopVerified, .kind = .PREFIX },
     });
 
     var tasks_server = zix.Http3.Server.init(Routes.dispatch, .{

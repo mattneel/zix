@@ -174,6 +174,10 @@ def launch_browser(chrome_path: Path, tag: str) -> subprocess.Popen:
             "--disable-renderer-backgrounding",
             "--ignore-certificate-errors",
             f"--ignore-certificate-errors-spki-list={SPKI}",
+            # Both switches are needed and neither is optional for a local certificate: the pin covers
+            # the QUIC handshake's own certificate check, and forcing QUIC is what makes the browser use
+            # HTTP/3 for this origin instead of falling back to TCP (where a dial can only fail). This is
+            # Chromium's documented local WebTransport setup (chromium.org/quic/playing-with-quic).
             f"--origin-to-force-quic-on=127.0.0.1:{QUIC_PORT}",
             f"--user-data-dir=/tmp/dev-loop-profile-{tag}",
             f"https://127.0.0.1:{PAGE_PORT}/?devloop",
@@ -193,6 +197,16 @@ def close_browser(browser: subprocess.Popen | None) -> None:
         browser.kill()
 
 
+def kill_strays() -> None:
+    """Kill any demo process this run did not start.
+
+    A stale instance holds the QUIC port, the new server fails to bind it, keeps running anyway and answers
+    the page over TCP - so the browser is served the previous build and the measurement reads as a slow
+    build rather than as a wrong one.
+    """
+    subprocess.run(["pkill", "-f", SERVER.name], capture_output=True)
+
+
 class Server:
     def __init__(self, log_path: Path):
         self.log_path = log_path
@@ -203,9 +217,19 @@ class Server:
         log = self.log_path.open("ab")
         self.process = subprocess.Popen([str(SERVER)], cwd=ROOT, stdout=log, stderr=log)
 
+        # Ready means both listeners are up - not that the process printed its banner. The server keeps
+        # running when the QUIC bind fails, and it prints its banner anyway, so a banner-only check is
+        # happy to measure a stale instance still holding the port: every request is then answered by the
+        # previous build. That wrong answer cost hours, so a bind failure is fatal here.
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            if "page https://" in self.log_path.read_text(errors="ignore"):
+            text = self.log_path.read_text(errors="ignore")
+            if "bind failed" in text:
+                raise RuntimeError(
+                    "the server could not bind its port: a stale instance is still holding it. "
+                    "Every measurement would come from that one."
+                )
+            if text.count("listening on") >= 2:
                 return (time.monotonic() - started) * 1000
             time.sleep(0.01)
 
@@ -214,12 +238,15 @@ class Server:
     def stop(self) -> None:
         if self.process is None:
             return
+        # Reap by name as well as by handle: a process this run did not start still holds the QUIC port,
+        # and the next start would silently serve from it.
         self.process.terminate()
         try:
             self.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.process.kill()
         self.process = None
+        kill_strays()
 
     def wait_for(self, needle: str, offset: int, timeout: float, started: float, fail_on: str = "") -> float:
         """Wait for the browser's success report, and stop early when it reports a failure instead."""
@@ -279,6 +306,12 @@ def main() -> int:
     parser.add_argument("--json", default="")
     parser.add_argument("--chrome", default=str(CHROME))
     parser.add_argument(
+        "--keep-slow-ms",
+        type=float,
+        default=5000,
+        help="keep the server log of an iteration whose verification took longer than this",
+    )
+    parser.add_argument(
         "--fresh-browser",
         action="store_true",
         help="launch a browser per iteration instead of keeping one open (a page reload cannot always re-dial "
@@ -297,6 +330,9 @@ def main() -> int:
 
     if not SERVER.exists():
         raise SystemExit(f"{SERVER} is missing: run `zig build example-webtransport_tasks` first")
+
+    kill_strays()
+    time.sleep(0.5)
 
     log_path = Path("/tmp/dev-loop-server.log")
     log_path.write_text("")
@@ -355,12 +391,6 @@ def main() -> int:
                 log_path.write_text("")
                 time.sleep(0.2)
 
-                if args.fresh_browser:
-                    server.start()
-                    browser = launch_browser(chrome_path, f"{kind}{iteration}-{os.getpid()}")
-                    time.sleep(1.5)
-                    server.stop()
-
                 # The stopwatch starts here, at the file write, exactly as a developer experiences it.
                 started = time.monotonic()
                 editor.apply(kind, mark)
@@ -384,10 +414,25 @@ def main() -> int:
 
                 token, page_mark = EXPECTED[kind](mark)
                 success = f"verified {token}/{page_mark}"
-                total = server.wait_for(success, fresh, args.timeout, started, fail_on="verified none/none")
+                # --fresh-browser launches here, after the restart: the browser's first load is already the
+                # new build, so it verifies without the reload this mode exists to avoid. Browser startup is
+                # inside the measured total, which is why these numbers are reported separately.
+                if args.fresh_browser:
+                    browser = launch_browser(chrome_path, f"{kind}{iteration}-{os.getpid()}")
+                    time.sleep(1.2)
 
+                total = server.wait_for(success, fresh, args.timeout, started, fail_on="verified none/none")
                 if args.fresh_browser:
                     close_browser(browser)
+
+                # The log is truncated at the top of every iteration, so an odd number leaves no evidence
+                # behind it. Keep the ones that are slow: a 16-second verification is a different event from
+                # a 1.2-second one and the log is the only place it can be seen.
+                verify_ms = total - build_ms - restart_ms
+                if verify_ms > args.keep_slow_ms:
+                    kept = Path(f"/tmp/devloop-slow-{kind}-{iteration + 1}.log")
+                    kept.write_bytes(log_path.read_bytes())
+                    print(f"  kept the log of a {verify_ms:.0f}ms verification at {kept}")
 
                 measured["build"].append(build_ms)
                 measured["restart"].append(restart_ms)

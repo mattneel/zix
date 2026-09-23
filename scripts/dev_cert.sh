@@ -78,6 +78,17 @@ Trust the CA once, then restart the browser. Any one of these is enough for the 
 
 Run the demo from a directory where $stage/*.pem is the demo's own cert path, then open
 https://127.0.0.1:9444/ and press "open session".
+
+If the session still will not open, the browser is refusing the QUIC handshake's certificate. Chromium
+applies its production certificate rules to QUIC even on loopback, and the local-development escapes do
+not reach it: a click-through, --ignore-certificate-errors, and a CA trusted in the system or browser
+store all still fail with "46: certificate unknown". The documented way to run a local WebTransport
+server is to name the certificate by its SPKI (https://www.chromium.org/quic/playing-with-quic/). A
+certificate that chains to a publicly trusted CA needs none of this.
+
+  SPKI of this leaf: $(openssl x509 -in "$out/leaf.pem" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | openssl base64)
+
+  chrome --origin-to-force-quic-on=127.0.0.1:9444 --ignore-certificate-errors-spki-list=<that value> --user-data-dir=zix-chrome-profile https://127.0.0.1:9444/
 EOF
 
 if [ "$trust" = yes ]; then
