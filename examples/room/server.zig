@@ -82,12 +82,17 @@ var room_wasm: []const u8 = &.{};
 /// snapshots off the wire, so this is where that property lives.
 var filtered: std.ArrayList(u8) = .empty;
 
-/// One participant's host-side view. Sources are 1..max_sources and are the routing key for a session; the
-/// only per-participant state the host keeps is what it has already sent and where it is looking.
+/// One participant's host-side view. Sources are 1..max_sources and are what the room and the other players
+/// see; the only per-participant state the host keeps is what it has already sent and where it is looking.
 const Participant = struct {
     source: u32 = 0,
-    /// The session that holds this source, so a reconnect lands on the same participant or a fresh one.
-    session_id: u64 = 0,
+    /// Which connection holds this source.
+    ///
+    /// Not `Session.id()`: that is the CONNECT stream id (Webtransport.zig), which is unique within one
+    /// connection and repeats across connections, so every client of a host seats itself as session 0. The
+    /// session's own address is stable for as long as it lives and distinct per connection, and `onClose`
+    /// clears the entry, so a recycled slot is never mistaken for the session that used it before.
+    session_key: usize = 0,
     /// The id of the session's control stream; a later stream is a request for the run log.
     control_stream: u64 = 0,
     /// Bytes of the participant-facing (INPUT-only) stream already delivered.
@@ -250,7 +255,7 @@ fn onStreamReset(session: *zix.Webtransport.Session, stream: *const zix.Webtrans
 }
 
 fn onClose(session: *zix.Webtransport.Session) void {
-    const p = find(session.id()) orelse return;
+    const p = find(sessionKey(session)) orelse return;
     if (p.joined) {
         _ = room_host.leave(p.source);
         // A reactive room folds the leave into the next tick straight away. A scheduled room must not: the
@@ -264,9 +269,14 @@ fn onClose(session: *zix.Webtransport.Session) void {
     p.* = .{};
 }
 
-fn find(session_id: u64) ?*Participant {
+/// The key a participant is held under: the live session's address, not its id. See `Participant`.
+fn sessionKey(session: *zix.Webtransport.Session) usize {
+    return @intFromPtr(session.inner);
+}
+
+fn find(key: usize) ?*Participant {
     for (participants[1..]) |*p| {
-        if (p.joined and p.session_id == session_id) return p;
+        if (p.joined and p.session_key == key) return p;
     }
 
     return null;
@@ -275,7 +285,8 @@ fn find(session_id: u64) ?*Participant {
 /// Seat a session the way gkz's host does: the lowest free source, a JOIN that enters the log as an input (so
 /// replaying the log reconstructs the roster), and then the backlog a late join needs.
 fn seat(session: *zix.Webtransport.Session) ?*Participant {
-    if (find(session.id())) |p| return p;
+    const key = sessionKey(session);
+    if (find(key)) |p| return p;
 
     var taken: [max_sources]u32 = undefined;
     var n: usize = 0;
@@ -287,15 +298,15 @@ fn seat(session: *zix.Webtransport.Session) ?*Participant {
     }
 
     const source = room_host.nextSource(taken[0..n]) orelse {
-        log("session {d}: the room is full", .{session.id()});
+        log("connection 0x{x}: the room is full", .{sessionKey(session)});
 
         return null;
     };
     const p = &participants[source];
-    p.* = .{ .source = source, .joined = true, .session_id = session.id() };
+    p.* = .{ .source = source, .joined = true, .session_key = key };
     if (!room_host.isMember(source)) _ = room_host.join(source);
     room_host.appendLog() catch {};
-    log("session {d}: seated as source {d}", .{ session.id(), source });
+    log("connection 0x{x}: seated as source {d}", .{ key, source });
 
     return p;
 }
