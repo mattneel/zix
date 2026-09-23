@@ -112,7 +112,7 @@ berdiri:
   handshake selesai (RFC 9000 17.2.1), dan momen handshake selesai adalah momen Finished terverifikasi.
   Prologue sekali pakai (HANDSHAKE_DONE lalu SETTINGS stream control) karena itu keluar pada giliran yang
   sama, bukan menunggu paket 1-RTT pertama dari client: client berhak menunggu konfirmasi sebelum mengirim
-  data 1-RTT apa pun, dan Chromium memang menunggu — ia menahan SETTINGS, CONNECT, dan setiap request
+  data 1-RTT apa pun, dan Chromium memang menunggu: ia menahan SETTINGS, CONNECT, dan setiap request
   sampai konfirmasi tiba. aioquic dan client in-tree mengirim 1-RTT lebih awal, jadi server yang hanya
   membalas 1-RTT terlihat benar sampai sebuah browser menyambung ke sana.
 - **Client yang menyerah menyebut alasannya.** Kegagalan handshake datang sebagai CONNECTION_CLOSE di dalam
@@ -365,25 +365,25 @@ rujukan untuk satu aksi:
 - **At-least-once, dinetralkan revisi.** Setiap perubahan state mengambil revisi berikutnya milik tenant di
   transaksi yang sama dan baris outbox membawanya; dispatcher menandai baris terpublikasi hanya setelah
   feed menerimanya, jadi crash di antaranya memutar ulang event, dan view yang sudah menerapkan revisi N
-  mengabaikan apa pun ≤ N.
+  mengabaikan apa pun <= N.
 - **View membangun ulang dari database.** Sebuah subscription dijawab snapshot berevisi, yang juga dipakai
   reconnect, reload, server yang restart, atau cursor yang tertinggal dari ring feed untuk menyinkronkan
   ulang.
 
 Mutasi durable menumpang stream bidirectional yang reliabel. Datagram tetap untuk apa yang memang cocok:
-state transient yang boleh hilang — halaman memakainya hanya untuk typing hint.
+state transient yang boleh hilang: halaman memakainya hanya untuk typing hint.
 
 Yang *bukan* demo ini, dan yang dibutuhkan sebuah produk sebagai gantinya: identitasnya adalah dropdown
 yang dikirim halaman pada setiap subscription, jadi otorisasinya adalah pencarian baris pada tabel yang
 di-seed, bukan principal terautentikasi yang bisa dipercaya telah dibangun oleh transport; dan schema dibuat
 saat start serta tabel demo di-truncate agar satu run mulai bersih, bukan diterapkan lewat migrasi dengan
 riwayat yang dibutuhkan deployment nyata. Keduanya adalah pekerjaan framework di sekitar jalur ini, bukan
-bagian dari jalur itu: invarian slice-nya sendiri — satu transaksi per langkah, lease dengan token,
-idempotensi lewat unique key, dan outbox dengan revisi — tidak bergantung pada keduanya.
+bagian dari jalur itu: invarian slice-nya sendiri: satu transaksi per langkah, lease dengan token,
+idempotensi lewat unique key, dan outbox dengan revisi: tidak bergantung pada keduanya.
 
 Demo ini menyajikan halamannya lewat TCP di 9445 dan session lewat QUIC di 9444, dan bentuk itu berbeda dari
-contoh lain dengan sengaja. Browser yang diminta memaksa QUIC untuk sebuah origin — yang dibutuhkan sertifikat
-self-signed — mengirim *setiap* request ke origin itu lewat QUIC, dan halaman yang dilayani di sana tidak bisa
+contoh lain dengan sengaja. Browser yang diminta memaksa QUIC untuk sebuah origin: yang dibutuhkan sertifikat
+self-signed: mengirim *setiap* request ke origin itu lewat QUIC, dan halaman yang dilayani di sana tidak bisa
 reload saat server sedang dibangun ulang: reload-nya, dan poll versi yang memicunya, gagal dengan handshake.
 Melayani halaman lewat TCP menjaga reload tetap bebas dari siklus hidup server QUIC, yang persis itulah yang
 diukur development loop di bawah, sementara session tetap menuju port QUIC.
@@ -392,7 +392,7 @@ diukur development loop di bawah, sementara session tetap menuju port QUIC.
 
 `scripts/dev_loop_bench.py` mengukur loop yang benar-benar dijalani developer pada slice ini: dari suntingan
 sumber sampai *browser* memperlihatkan perubahannya. Ini pengukuran yang berbeda dari benchmark runtime di
-atas, dan perbedaannya justru intinya — runtime yang cepat tidak mengatakan apa pun tentang berapa lama
+atas, dan perbedaannya justru intinya: runtime yang cepat tidak mengatakan apa pun tentang berapa lama
 sebuah save menjadi terlihat.
 
 Stopwatch mulai pada penulisan file dan berakhir saat browser melapor kembali, jadi ia mencakup hal yang
@@ -407,7 +407,7 @@ Tiga suntingan diukur, masing-masing dengan observabelnya sendiri:
 
 Mekanismenya kecil dan berguna diketahui saat membaca angkanya: server menyajikan halaman dengan token
 disubstitusi, mengekspos `/devloop/version` (hash dari byte yang persis disajikan) dan `/verified` (laporan
-browser); halaman — dibuka sekali dengan `?devloop` — mem-poll versi, me-reload dirinya saat berubah, lalu
+browser); halaman: dibuka sekali dengan `?devloop`: mem-poll versi, me-reload dirinya saat berubah, lalu
 dial, subscribe, mengirim aksi durable, menunggu patch completion, dan baru melapor ketika perubahan yang
 menjadi asal build-nya terlihat di DOM. Satu instance Chromium tetap terbuka antar iterasi, jadi satu iterasi
 membayar reload dan reconnect, bukan startup browser, dan skrip memulihkan working tree dari salinan di
@@ -440,7 +440,7 @@ halaman HTTPS/1.1 tetapi meninggalkan session gagal dengan `certificate unknown`
 `http3_webtransport` dengan aioquic (handshake, extended CONNECT, echo stream bidirectional, echo
 datagram, dan stream unidirectional yang dibuka server) dan melaporkan satu baris PASS/FAIL per
 pemeriksaan. Echo bidirectional dibaca dari byte stream mentah, karena lapisan HTTP/3 aioquic hanya
-mengklasifikasikan data stream masuk sebagai WebTransport ketika peer mengirim ulang stream header 0x41 —
+mengklasifikasikan data stream masuk sebagai WebTransport ketika peer mengirim ulang stream header 0x41 : 
 yang dilarang draft pada arah server dari stream yang dibuka client (draft-ietf-webtrans-http3-16 4.3),
 sehingga echo yang konforman tidak pernah sampai ke event WebTransport lapisan itu.
 

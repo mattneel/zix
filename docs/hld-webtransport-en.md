@@ -111,7 +111,7 @@ the transport handshake. One property of that handshake decides whether a sessio
   handshake is complete (RFC 9000 17.2.1), and the moment it is complete is the moment the Finished
   verifies. The one-time prologue (HANDSHAKE_DONE, then the control stream's SETTINGS) therefore leaves in
   that same turn rather than waiting for the client's first 1-RTT packet: a client is entitled to wait for
-  the confirmation before it sends any 1-RTT data, and Chromium does — it holds its SETTINGS, its CONNECT,
+  the confirmation before it sends any 1-RTT data, and Chromium does: it holds its SETTINGS, its CONNECT,
   and every request until the confirmation lands. aioquic and the in-tree client send 1-RTT early, which
   is why a server that only replies to 1-RTT looks correct until a browser connects to it.
 - **A client that gives up says why.** A handshake failure arrives as a CONNECTION_CLOSE inside a
@@ -363,25 +363,25 @@ as the reference for one:
 - **At least once, made harmless by revisions.** Every state change allocates the tenant's next revision
   in the same transaction and the outbox row carries it; the dispatcher marks a row published only after
   the feed took it, so a crash in between replays the event, and a view that already applied revision N
-  drops anything ≤ N.
+  drops anything <= N.
 - **The view rebuilds from the database.** A subscription answers with a revisioned snapshot, which is
   also what a reconnect, a reload, a restarted server, or a cursor that fell behind the feed's ring all
   use to resynchronize.
 
-Durable mutations ride reliable bidirectional streams. Datagrams stay what they are good for — replaceable
-transient state — which the page uses for its typing hint and nothing else.
+Durable mutations ride reliable bidirectional streams. Datagrams stay what they are good for: replaceable
+transient state: which the page uses for its typing hint and nothing else.
 
 What the demo is *not*, and what a product needs instead: the identity is a dropdown the page sends with
 each subscription, so authorization is a row lookup against a seeded table rather than an authenticated
 principal the transport can be trusted to have established; and the schema is created on startup and the
 demo's tables are truncated so a run starts clean, rather than applied by migrations with the history a real
 deployment needs. Both are framework work around this path, not part of the path: the slice's own invariants
-— one transaction per step, a lease with a token, idempotency by unique key, and an outbox with revisions —
+:  one transaction per step, a lease with a token, idempotency by unique key, and an outbox with revisions : 
 do not depend on either.
 
 The demo serves its page over TCP on 9445 and the session over QUIC on 9444, which is not the same shape as
-the other examples on purpose. A browser told to force QUIC for an origin — what a self-signed certificate
-needs — sends *every* request to that origin over QUIC, and a page served there cannot reload while the
+the other examples on purpose. A browser told to force QUIC for an origin: what a self-signed certificate
+needs: sends *every* request to that origin over QUIC, and a page served there cannot reload while the
 server is being rebuilt: its reload, and the version poll that triggers it, fail with the handshake. Serving
 the page on TCP keeps the reload independent of the QUIC server's lifecycle, which is exactly what the
 development loop below measures, while the session still goes to the QUIC port.
@@ -390,7 +390,7 @@ development loop below measures, while the session still goes to the QUIC port.
 
 `scripts/dev_loop_bench.py` measures the loop a developer actually lives in on this slice: a source edit until
 the *browser* shows the change. It is a different measurement from the runtime benchmark above, and the
-distinction is the point — a fast runtime says nothing about how long a save takes to become visible.
+distinction is the point: a fast runtime says nothing about how long a save takes to become visible.
 
 The stopwatch starts at the file write and ends when the browser reports back, so it includes what a
 compiler-only number leaves out: the build, the server restart, the page reload, and the reconnection the
@@ -404,7 +404,7 @@ session makes afterwards. Three edits are measured, each with its own observable
 
 The mechanism is small and worth knowing when reading the numbers: the server serves the page with the
 token substituted, exposes `/devloop/version` (a hash of exactly those bytes) and `/verified` (the browser's
-report); the page — opened once with `?devloop` — polls the version, reloads itself when it changes, and then
+report); the page: opened once with `?devloop`: polls the version, reloads itself when it changes, and then
 dials, subscribes, submits a durable action, waits for the completion patch, and only reports when the change
 it was built from is visible in the DOM. One Chromium instance stays open across iterations, so an iteration
 pays reload and reconnection rather than browser startup, and the script restores the working tree from an
@@ -437,7 +437,7 @@ what makes the browser load the page over HTTP/3 as well.
 example with aioquic (handshake, extended CONNECT, bidirectional stream echo, datagram echo, and the
 server-opened unidirectional stream) and reports one PASS/FAIL line per check. It reads the bidirectional
 echo from the raw stream bytes, because aioquic's HTTP/3 layer only classifies incoming stream data as
-WebTransport when the peer re-sends the 0x41 stream header — which the draft forbids on the server's
+WebTransport when the peer re-sends the 0x41 stream header: which the draft forbids on the server's
 direction of a client-initiated stream (draft-ietf-webtrans-http3-16 4.3), so a conformant echo never
 reaches that layer's WebTransport event.
 
