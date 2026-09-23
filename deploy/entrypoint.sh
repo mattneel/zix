@@ -24,7 +24,7 @@ if [ -n "$DOMAIN" ]; then
     # The guard tests for the certificate, not its directory: lego creates the storage directories before the
     # challenge is solved, so a failed attempt leaves the directory behind and a later boot would skip the
     # request entirely - then act on a certificate that was never written.
-    if [ ! -f "$STATE/certificates/$DOMAIN.crt" ]; then
+    if [ ! -f "$STATE/.lego/certificates/$DOMAIN.crt" ]; then
         echo "[entrypoint] requesting a certificate for $DOMAIN through a DNS-01 challenge"
         # lego's own Spaceship provider wrote nothing the validators could see, while a record written to the
         # zone through the API appears within seconds. exec hands the challenge to that proven path.
@@ -52,9 +52,9 @@ if [ -n "$DOMAIN" ]; then
         # the leaf is taken out of the chain and the key converted, the form the bundled certificate uses.
         # Only reachable with the certificate in hand, so a failure here means a broken volume rather than a
         # missing challenge, and the machine should still come up on the development certificate.
-        if openssl x509 -in "$STATE/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem" 2>/dev/null; then
-            openssl ec -in "$STATE/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
-                || cp "$STATE/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
+        if openssl x509 -in "$STATE/.lego/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem" 2>&1; then
+            openssl ec -in "$STATE/.lego/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
+                || cp "$STATE/.lego/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
 
             export ZIX_CERT="$STATE/serving-cert.pem"
             export ZIX_KEY="$STATE/serving-key.pem"
@@ -109,6 +109,12 @@ if [ -z "${DATABASE_URL:-}" ]; then
     export DATABASE_URL="postgres://zix:zix@127.0.0.1:5432/zix_dev"
     pgbin=$(ls -d /usr/lib/postgresql/*/bin | head -1)
     pgdata=/data/pg
+
+    # The volume outlives the image: user ids are assigned when an image is built, so adding a package that
+    # brings its own users renumbers the ones already there, and files written by an earlier image end up
+    # owned by a uid that now names something else. The data directory is the database user's, whenever it
+    # was created.
+    chown -R postgres:postgres "$pgdata" 2>/dev/null || true
 
     if [ -f "$pgdata/postmaster.pid" ]; then
         # The platform stops and starts machines routinely, and an abrupt stop leaves this behind, after which
