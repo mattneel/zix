@@ -21,7 +21,10 @@ if [ -n "$DOMAIN" ]; then
     # self-signed certificate and says so is diagnosable, and one that crash-loops cannot even be shelled
     # into to find out why.
     echo "[entrypoint] acme client: $(command -v lego || echo missing) $(lego --version 2>/dev/null | head -1)"
-    if [ ! -d "$STATE/certificates/$DOMAIN" ]; then
+    # The guard tests for the certificate, not its directory: lego creates the storage directories before the
+    # challenge is solved, so a failed attempt leaves the directory behind and a later boot would skip the
+    # request entirely - then act on a certificate that was never written.
+    if [ ! -f "$STATE/certificates/$DOMAIN.crt" ]; then
         echo "[entrypoint] requesting a certificate for $DOMAIN through a DNS-01 challenge"
         if ! (cd "$STATE" && lego run --accept-tos --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN"); then
             echo "[entrypoint] WARNING: the certificate request failed; serving the development certificate"
@@ -42,12 +45,22 @@ if [ -n "$DOMAIN" ]; then
 
         # The server reads one certificate and a SEC1 key. lego writes the leaf chain and a PKCS#8 key, so
         # the leaf is taken out of the chain and the key converted, the form the bundled certificate uses.
-        openssl x509 -in "$STATE/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem"
-        openssl ec -in "$STATE/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
-            || cp "$STATE/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
+        # Only reachable with the certificate in hand, so a failure here means a broken volume rather than a
+        # missing challenge, and the machine should still come up on the development certificate.
+        if openssl x509 -in "$STATE/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem" 2>/dev/null; then
+            openssl ec -in "$STATE/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
+                || cp "$STATE/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
 
-        export ZIX_CERT="$STATE/serving-cert.pem"
-        export ZIX_KEY="$STATE/serving-key.pem"
+            export ZIX_CERT="$STATE/serving-cert.pem"
+            export ZIX_KEY="$STATE/serving-key.pem"
+        else
+            echo "[entrypoint] WARNING: the issued certificate could not be read; serving the development one"
+            export ZIX_CERT="$STATE/cert.pem"
+            export ZIX_KEY="$STATE/key.pem"
+        fi
+    else
+        export ZIX_CERT="$STATE/cert.pem"
+        export ZIX_KEY="$STATE/key.pem"
     fi
 else
     # No domain, so no certificate authority will issue for this name. Mint one for the app's own hostname
