@@ -48,12 +48,12 @@ if [ -n "$DOMAIN" ]; then
             done
         ) &
 
-        # A single certificate: zix's PEM reader takes one block, so a chain (leaf plus intermediate) fails
-        # with ZixInvalidPem and the process exits. The intermediate is therefore not served, which leaves a
-        # strict client unable to build a path to the authority - the limit is in the server, not the
-        # deployment, and serving a chain is the fix on that side.
-        # missing challenge, and the machine should still come up on the development certificate.
-        if openssl x509 -in "$STATE/.lego/certificates/$DOMAIN.crt" -out "$STATE/serving-cert.pem" 2>&1; then
+        # The whole chain goes out. An end-entity alone leaves any client that does not already hold the
+        # intermediate unable to build a path to the authority, which a strict client reports as a missing
+        # issuer. zix presents every block of the document, so the file is copied rather than reduced.
+        # openssl reads the first certificate, so this still fails loudly on an unreadable one.
+        if openssl x509 -in "$STATE/.lego/certificates/$DOMAIN.crt" -noout 2>&1; then
+            cp "$STATE/.lego/certificates/$DOMAIN.crt" "$STATE/serving-cert.pem"
             openssl ec -in "$STATE/.lego/certificates/$DOMAIN.key" -out "$STATE/serving-key.pem" >/dev/null 2>&1 \
                 || cp "$STATE/.lego/certificates/$DOMAIN.key" "$STATE/serving-key.pem"
 

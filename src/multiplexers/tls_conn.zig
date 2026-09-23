@@ -61,7 +61,10 @@ pub const Transport = struct {
     pub fn init(fd: posix.fd_t, ctx: *const Tls.Context) Transport {
         return .{
             .fd = fd,
-            .tls = session.Session.init(ctx.cert_der, ctx.signing_key, ctx.alpn),
+            // The chain the context loaded, or the single certificate it was built with: a context assembled
+            // by hand (a test fixture) has no chain to speak of, and a session that is handed none would
+            // present an empty Certificate message.
+            .tls = session.Session.init(if (ctx.certificate_chain.len > 0) ctx.certificate_chain else &.{ctx.cert_der}, ctx.signing_key, ctx.alpn),
             .ep_data = @intCast(fd),
         };
     }

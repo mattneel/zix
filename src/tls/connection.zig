@@ -38,7 +38,8 @@ const ccs_record = [_]u8{ 20, 0x03, 0x03, 0x00, 0x01, 0x01 };
 /// Inputs the caller supplies to drive one server handshake. The cert + key select the identity,
 /// the ephemeral secret + random are freshly generated per connection (or trace values in tests).
 pub const HandshakeOptions = struct {
-    certificate_der: []const u8,
+    /// The certificates to present, end-entity first, then any intermediates.
+    certificate_chain: []const []const u8,
     /// ECDSA P-256 or Ed25519 signing identity (certificate.SigningKey). Its scheme must be one the
     /// client offered in signature_algorithms, else serverHandshake aborts (Layer C selection).
     signing_key: certificate.SigningKey,
@@ -394,7 +395,7 @@ fn completeHandshake(opts: HandshakeOptions, hello: *const handshake.ClientHello
         transcript.update(cert_request);
     }
 
-    const cert_msg = certificate.buildCertificate(flight.buf[flight.len..], opts.certificate_der);
+    const cert_msg = certificate.buildCertificate(flight.buf[flight.len..], opts.certificate_chain);
     flight.len += cert_msg.len;
     transcript.update(cert_msg);
 
@@ -624,7 +625,7 @@ test "zix tls: connection, server flight from RFC 8448 ClientHello" {
 
     var out: [4096]u8 = undefined;
     const result = try serverHandshake(.{
-        .certificate_der = &dummy_der,
+        .certificate_chain = &.{&dummy_der},
         .signing_key = .{ .ecdsa_p256 = key_pair },
         .ephemeral_secret = ephemeral_secret,
         .server_random = server_random,
@@ -744,7 +745,7 @@ test "zix tls: connection, serverHandshake negotiates secp256r1 from a P-256-onl
 
     var out: [4096]u8 = undefined;
     const result = try serverHandshake(.{
-        .certificate_der = &dummy_der,
+        .certificate_chain = &.{&dummy_der},
         .signing_key = .{ .ecdsa_p256 = key_pair },
         .ephemeral_secret = ephemeral_secret,
         .server_random = server_random,
@@ -825,7 +826,7 @@ test "zix tls: connection, mTLS server requests + verifies a client certificate 
 
     var out: [4096]u8 = undefined;
     var result = try serverHandshake(.{
-        .certificate_der = cert_der,
+        .certificate_chain = &.{cert_der},
         .signing_key = .{ .ecdsa_p256 = key_pair },
         .ephemeral_secret = ephemeral_secret,
         .server_random = server_random,
@@ -837,7 +838,7 @@ test "zix tls: connection, mTLS server requests + verifies a client certificate 
     var transcript = result.connection.handshake_transcript;
 
     var client_cert_msg_buf: [600]u8 = undefined;
-    const client_cert_msg = certificate.buildCertificate(&client_cert_msg_buf, cert_der);
+    const client_cert_msg = certificate.buildCertificate(&client_cert_msg_buf, &.{cert_der});
     transcript.update(client_cert_msg);
     const transcript_through_cert = transcript.current();
 
@@ -898,7 +899,7 @@ test "zix tls: connection, mTLS rejects a tampered client CertificateVerify" {
 
     var out: [4096]u8 = undefined;
     var result = try serverHandshake(.{
-        .certificate_der = cert_der,
+        .certificate_chain = &.{cert_der},
         .signing_key = .{ .ecdsa_p256 = key_pair },
         .ephemeral_secret = ephemeral_secret,
         .server_random = server_random,
@@ -907,7 +908,7 @@ test "zix tls: connection, mTLS rejects a tampered client CertificateVerify" {
 
     var transcript = result.connection.handshake_transcript;
     var client_cert_msg_buf: [600]u8 = undefined;
-    const client_cert_msg = certificate.buildCertificate(&client_cert_msg_buf, cert_der);
+    const client_cert_msg = certificate.buildCertificate(&client_cert_msg_buf, &.{cert_der});
     transcript.update(client_cert_msg);
 
     // sign the WRONG transcript (not folding the client Certificate) so the binding fails.
@@ -954,7 +955,7 @@ test "zix tls: connection, mTLS verifies a coalesced client auth flight (one rec
 
     var out: [4096]u8 = undefined;
     var result = try serverHandshake(.{
-        .certificate_der = cert_der,
+        .certificate_chain = &.{cert_der},
         .signing_key = .{ .ecdsa_p256 = key_pair },
         .ephemeral_secret = ephemeral_secret,
         .server_random = server_random,
@@ -966,7 +967,7 @@ test "zix tls: connection, mTLS verifies a coalesced client auth flight (one rec
     var flight_buf: [1024]u8 = undefined;
     var flight = wire.Writer{ .buf = &flight_buf };
 
-    const client_cert_msg = certificate.buildCertificate(flight.buf[flight.len..], cert_der);
+    const client_cert_msg = certificate.buildCertificate(flight.buf[flight.len..], &.{cert_der});
     flight.len += client_cert_msg.len;
     transcript.update(client_cert_msg);
     const transcript_through_cert = transcript.current();
@@ -1136,7 +1137,7 @@ test "zix tls: connection, HelloRetryRequest round trip (RFC 8446 4.1.4)" {
     const key_pair = try EcdsaP256.KeyPair.fromSecretKey(try EcdsaP256.SecretKey.fromBytes(scalar));
     const dummy_der = [_]u8{ 0x30, 0x03, 0x01, 0x02, 0x03 };
     const opts = HandshakeOptions{
-        .certificate_der = &dummy_der,
+        .certificate_chain = &.{&dummy_der},
         .signing_key = .{ .ecdsa_p256 = key_pair },
         .ephemeral_secret = @splat(0x99),
         .server_random = @splat(0x55),

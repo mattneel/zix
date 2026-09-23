@@ -139,16 +139,39 @@ pub fn buildEncryptedExtensions(buf: []u8, original_dcid: []const u8, source_cid
     return buf[0..p];
 }
 
-/// Build and seal the server Handshake flight into a Handshake packet (RFC 9001 4).
+/// The largest CRYPTO frame payload one Handshake packet carries. A path of twelve hundred bytes is the
+/// QUIC minimum every peer must support, and the packet header, the length and the AEAD tag come out of it.
+const crypto_chunk: usize = 1100;
+
+/// The most Handshake packets one flight is split across. A chain of a leaf plus three intermediates is
+/// about seven kilobytes of DER, so eight packets carry it with room to spare.
+pub const max_flight_packets: usize = 8;
+
+/// The buffer one flight needs: every packet at its largest, plus the frame header they each add.
+pub const max_flight_bytes: usize = max_flight_packets * (crypto_chunk + 64);
+
+/// A built flight: the sealed packets in order, each one a CRYPTO frame at its own offset. The peer
+/// reassembles them into the crypto stream, so the order and the offsets are what make the chain readable.
+pub const Flight = struct {
+    packets: [max_flight_packets][]const u8 = @splat(&.{}),
+    len: usize = 0,
+};
+
+/// Build and seal the server Handshake flight into the Handshake packets that carry it (RFC 9001 4).
+///
+/// The flight is however large the certificate chain makes it. A chain of a leaf plus its intermediates is
+/// several kilobytes, which is more than one Handshake packet carries, so it is split across as many packets
+/// as it needs: each holds a CRYPTO frame at its own offset, and the peer reassembles them in order. A single
+/// certificate is one short packet, so the shape is the same either way.
 ///
 /// Param:
-/// out - []u8 (destination for the sealed Handshake packet)
+/// out - []u8 (destination for the sealed packets, back to back; max_flight_bytes covers any flight)
 /// server_keys - crypto.AesKeys (the server Handshake key / iv / hp)
 /// server_traffic - crypto.Secret (the server handshake-traffic secret, for the Finished key)
 /// dcid - []const u8 (the client's Source Connection ID, our reply Destination CID)
 /// scid - []const u8 (our Source Connection ID)
 /// transcript - *ks.Transcript (through ClientHello + ServerHello, continued by this flight)
-/// cert_der - []const u8 (the server certificate DER from the TLS context)
+/// chain - []const []const u8 (the certificates from the TLS context, end-entity first)
 /// signing_key - certificate.SigningKey (the certificate's signing key)
 /// original_dcid - []const u8 (the client's first Initial DCID, for the transport parameter)
 /// source_cid - []const u8 (our SCID, for the transport parameter)
@@ -158,7 +181,7 @@ pub fn buildEncryptedExtensions(buf: []u8, original_dcid: []const u8, source_cid
 ///   need them are off)
 ///
 /// Return:
-/// - []const u8 (the sealed Handshake packet), or null on a builder / signing error
+/// - Flight (the sealed packets), or null on a builder / signing error
 pub fn buildHandshakeFlight(
     out: []u8,
     server_keys: crypto.AesKeys,
@@ -166,15 +189,15 @@ pub fn buildHandshakeFlight(
     dcid: []const u8,
     scid: []const u8,
     transcript: *ks.Transcript,
-    cert_der: []const u8,
+    chain: []const []const u8,
     signing_key: certificate.SigningKey,
     original_dcid: []const u8,
     source_cid: []const u8,
     max_idle_ms: u64,
     max_streams: u64,
     ext: TransportExtensions,
-) ?[]const u8 {
-    var flight: [4096]u8 = undefined;
+) ?Flight {
+    var flight: [16384]u8 = undefined;
     var fp: usize = 0;
 
     var ee_buf: [512]u8 = undefined;
@@ -183,8 +206,8 @@ pub fn buildHandshakeFlight(
     fp += ee.len;
     transcript.update(ee);
 
-    var cert_buf: [2048]u8 = undefined;
-    const cert = certificate.buildCertificate(&cert_buf, cert_der);
+    var cert_buf: [16384]u8 = undefined;
+    const cert = certificate.buildCertificate(&cert_buf, chain);
     @memcpy(flight[fp..][0..cert.len], cert);
     fp += cert.len;
     transcript.update(cert);
@@ -202,17 +225,34 @@ pub fn buildHandshakeFlight(
     fp += finished.len;
     transcript.update(finished);
 
-    // Wrap the whole flight in a CRYPTO frame at offset 0 (RFC 9000 19.6).
-    var frame_buf: [4200]u8 = undefined;
-    var cfp: usize = 0;
-    frame_buf[cfp] = 0x06;
-    cfp += 1;
-    cfp += varint.write(frame_buf[cfp..], 0);
-    cfp += varint.write(frame_buf[cfp..], fp);
-    @memcpy(frame_buf[cfp..][0..fp], flight[0..fp]);
-    cfp += fp;
+    // Wrap the flight in CRYPTO frames, one per packet, each at the offset it belongs at (RFC 9000 19.6).
+    var built: Flight = .{};
+    var at = out;
+    var offset: u64 = 0;
+    var packet_number: u32 = 0;
 
-    return protection.sealHandshake(out, server_keys, dcid, scid, 0, frame_buf[0..cfp]) catch null;
+    while (offset < fp) {
+        if (built.len == max_flight_packets) return null;
+
+        const take = @min(crypto_chunk, fp - @as(usize, @intCast(offset)));
+        var frame_buf: [crypto_chunk + 16]u8 = undefined;
+        var cfp: usize = 0;
+        frame_buf[cfp] = 0x06;
+        cfp += 1;
+        cfp += varint.write(frame_buf[cfp..], offset);
+        cfp += varint.write(frame_buf[cfp..], take);
+        @memcpy(frame_buf[cfp..][0..take], flight[@intCast(offset)..][0..take]);
+        cfp += take;
+
+        const sealed = protection.sealHandshake(at, server_keys, dcid, scid, packet_number, frame_buf[0..cfp]) catch return null;
+        built.packets[built.len] = sealed;
+        built.len += 1;
+        at = at[sealed.len..];
+        offset += take;
+        packet_number += 1;
+    }
+
+    return built;
 }
 
 // --------------------------------------------------------------- //

@@ -50,9 +50,10 @@ const certificate_verify_content_len = 64 + certificate_verify_context.len + 1 +
 
 // --------------------------------------------------------------- //
 
-/// Build the Certificate message (RFC 8446 4.4.2): empty request_context, one end-entity entry
-/// holding the DER, empty entry extensions. Returns the wire slice.
-pub fn buildCertificate(buf: []u8, der: []const u8) []const u8 {
+/// Build the Certificate message (RFC 8446 4.4.2): empty request_context, one entry per certificate in
+/// `ders`, empty entry extensions. The entries are presented in the order given, so the end-entity comes
+/// first and the intermediates after it. Returns the wire slice.
+pub fn buildCertificate(buf: []u8, ders: []const []const u8) []const u8 {
     var w = Writer{ .buf = buf };
 
     w.writeU8(@intFromEnum(handshake.HandshakeType.CERTIFICATE));
@@ -61,10 +62,12 @@ pub fn buildCertificate(buf: []u8, der: []const u8) []const u8 {
     w.writeU8(0); // empty certificate_request_context
 
     const list = w.placeU24();
-    const entry = w.placeU24();
-    w.writeBytes(der);
-    w.patchU24(entry);
-    w.writeU16(0); // empty entry extensions
+    for (ders) |der| {
+        const entry = w.placeU24();
+        w.writeBytes(der);
+        w.patchU24(entry);
+        w.writeU16(0); // empty entry extensions
+    }
     w.patchU24(list);
 
     w.patchU24(header);
@@ -280,11 +283,36 @@ const rsa_fixture_pkcs8_pem =
     \\-----END PRIVATE KEY-----
 ;
 
+test "zix tls: certificate, a chain is presented end-entity first then intermediates (4.4.2)" {
+    const end_entity = [_]u8{ 0x30, 0x03, 0x01, 0x02, 0x03 };
+    const intermediate = [_]u8{ 0x30, 0x02, 0x0a, 0x0b };
+
+    var buf: [64]u8 = undefined;
+    const msg = buildCertificate(&buf, &.{ &end_entity, &intermediate });
+
+    var r = Reader{ .buf = msg };
+    try std.testing.expectEqual(@as(u8, 11), try r.readU8());
+    _ = try r.readU24();
+    try std.testing.expectEqual(@as(u8, 0), try r.readU8());
+    const list_len = try r.readU24();
+
+    const first_len = try r.readU24();
+    try std.testing.expectEqualSlices(u8, &end_entity, try r.readBytes(first_len));
+    try std.testing.expectEqual(@as(u16, 0), try r.readU16());
+
+    const second_len = try r.readU24();
+    try std.testing.expectEqualSlices(u8, &intermediate, try r.readBytes(second_len));
+    try std.testing.expectEqual(@as(u16, 0), try r.readU16());
+
+    // The list length counts both entries and both empty extension blocks: 3 + 5 + 2 + 3 + 4 + 2.
+    try std.testing.expectEqual(@as(usize, 19), list_len);
+}
+
 test "zix tls: certificate, Certificate message wraps the DER (4.4.2)" {
     const der = [_]u8{ 0x30, 0x03, 0x01, 0x02, 0x03 };
 
     var buf: [64]u8 = undefined;
-    const msg = buildCertificate(&buf, &der);
+    const msg = buildCertificate(&buf, &.{&der});
 
     var r = Reader{ .buf = msg };
     try std.testing.expectEqual(@as(u8, 11), try r.readU8());
@@ -452,7 +480,7 @@ test "zix tls: certificate, parseEndEntityCertificate recovers the DER + empty l
     const der = [_]u8{ 0x30, 0x05, 0x01, 0x02, 0x03, 0x04 };
 
     var buf: [64]u8 = undefined;
-    const msg = buildCertificate(&buf, &der);
+    const msg = buildCertificate(&buf, &.{&der});
 
     const recovered = try parseEndEntityCertificate(msg[4..]); // strip the 4-octet handshake header
     try std.testing.expectEqualSlices(u8, &der, recovered.?);

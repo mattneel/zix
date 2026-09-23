@@ -70,8 +70,16 @@ fn secureRandom(buf: []u8) void {
 
 /// One TLS server connection's resumable state. The handshake inputs (cert / key / alpn) are borrowed
 /// from the Tls.Context and must outlive the session.
+/// The most certificates one session presents: an end-entity plus the intermediates a public authority
+/// needs.
+const max_chain = 4;
+
 pub const Session = struct {
-    cert_der: []const u8,
+    /// The chain this session presents, held here rather than borrowed. A caller with a single certificate
+    /// passes a one-element literal, which does not outlive the call it is made in; the entries point at the
+    /// context's DER bytes, which do.
+    chain_storage: [max_chain][]const u8 = @splat(&.{}),
+    chain_len: usize = 0,
     signing_key: certificate.SigningKey,
     alpn_prefs: []const extensions.Alpn,
 
@@ -88,20 +96,28 @@ pub const Session = struct {
     rbuf: [max_record]u8 = undefined,
     rlen: usize = 0,
 
-    /// Initialize a session for a freshly accepted connection. cert_der / signing_key / alpn_prefs are
+    /// Initialize a session for a freshly accepted connection. cert_chain / signing_key / alpn_prefs are
     /// borrowed (typically from the Tls.Context).
-    pub fn init(cert_der: []const u8, signing_key: certificate.SigningKey, alpn_prefs: []const extensions.Alpn) Session {
-        var self = Session{ .cert_der = cert_der, .signing_key = signing_key, .alpn_prefs = alpn_prefs };
+    pub fn init(cert_chain: []const []const u8, signing_key: certificate.SigningKey, alpn_prefs: []const extensions.Alpn) Session {
+        var self = Session{ .signing_key = signing_key, .alpn_prefs = alpn_prefs };
         secureRandom(&self.ephemeral);
         secureRandom(&self.server_random);
         secureRandom(&self.pss_salt);
 
+        self.chain_len = @min(cert_chain.len, self.chain_storage.len);
+        @memcpy(self.chain_storage[0..self.chain_len], cert_chain[0..self.chain_len]);
+
         return self;
+    }
+
+    /// The chain to present, in the order it was given: end-entity first.
+    pub fn chain(self: *const Session) []const []const u8 {
+        return self.chain_storage[0..self.chain_len];
     }
 
     fn handshakeOptions(self: *const Session) Tls.HandshakeOptions {
         return .{
-            .certificate_der = self.cert_der,
+            .certificate_chain = self.chain(),
             .signing_key = self.signing_key,
             .ephemeral_secret = self.ephemeral,
             .server_random = self.server_random,
@@ -335,7 +351,7 @@ test "zix tls: resumable session drives a full 1.3 handshake + app data, sans I/
     var cert_buf: [512]u8 = undefined;
     const cert_der = try std.fmt.hexToBytes(&cert_buf, fixture_cert_hex);
 
-    var session = Session.init(cert_der, .{ .ecdsa_p256 = server_key }, &.{.H2});
+    var session = Session.init(&.{cert_der}, .{ .ecdsa_p256 = server_key }, &.{.H2});
 
     // Client phase 1: ClientHello (offering ALPN h2), wrapped as a handshake record on the wire.
     var ch_buf: [512]u8 = undefined;
@@ -387,7 +403,7 @@ fn establishedPair() !struct { session: Session, client_conn: client.ClientConne
     var cert_buf: [512]u8 = undefined;
     const cert_der = try std.fmt.hexToBytes(&cert_buf, fixture_cert_hex);
 
-    var session = Session.init(cert_der, .{ .ecdsa_p256 = server_key }, &.{.H2});
+    var session = Session.init(&.{cert_der}, .{ .ecdsa_p256 = server_key }, &.{.H2});
 
     var ch_buf: [512]u8 = undefined;
     const started = try client.start(.{ .client_random = @splat(0x11), .ephemeral_secret = @splat(0x42), .alpn = &.{.H2} }, &ch_buf);
@@ -487,7 +503,7 @@ test "zix tls: a fragmented record is held until the whole record arrives" {
     var cert_buf: [512]u8 = undefined;
     const cert_der = try std.fmt.hexToBytes(&cert_buf, fixture_cert_hex);
 
-    var session = Session.init(cert_der, .{ .ecdsa_p256 = server_key }, &.{.H2});
+    var session = Session.init(&.{cert_der}, .{ .ecdsa_p256 = server_key }, &.{.H2});
 
     var ch_buf: [512]u8 = undefined;
     const started = try client.start(.{ .client_random = @splat(0x11), .ephemeral_secret = @splat(0x42), .alpn = &.{.H2} }, &ch_buf);

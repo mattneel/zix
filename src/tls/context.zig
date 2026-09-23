@@ -96,6 +96,13 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     /// DER end-entity certificate, owned (freed by deinit).
     cert_der: []u8,
+    /// The chain as presented: the end-entity first, then any intermediates. Empty in a Context built by
+    /// hand (a test fixture), where the single `cert_der` above stands in for it.
+    certificate_chain: []const []const u8 = &.{},
+    /// Storage for the chain's DER bytes, owned (freed by deinit).
+    chain_pool: []u8 = &.{},
+    /// Storage for the chain's entries, owned (freed by deinit).
+    chain_entries: [][]const u8 = &.{},
     /// The signing identity matching the certificate's key type (ECDSA P-256, Ed25519, or RSA).
     signing_key: SigningKey,
     alpn: []const Alpn,
@@ -136,11 +143,19 @@ pub const Context = struct {
             else => error.ZixTlsCertFileUnreadable,
         };
         defer allocator.free(cert_pem);
-        var cert_der_buf: [4096]u8 = undefined;
-        const cert_der_view = try pem.pemToDer(&cert_der_buf, cert_pem);
+        // The document may hold the end-entity plus the intermediates that chain it back to its authority, and
+        // a document with one block is a chain of one. Every block is decoded in place: the first entry is the
+        // end-entity, which is the one the key belongs to and the one the identity checks read.
+        var chain_view: pem.Chain = .{};
+        const chain_pool = try allocator.alloc(u8, PEM_MAX_BYTES);
+        errdefer allocator.free(chain_pool);
+        try pem.chainToDer(chain_pool, &chain_view, cert_pem);
 
-        const cert_der = try allocator.dupe(u8, cert_der_view);
+        const cert_der = try allocator.dupe(u8, chain_view.slice()[0]);
         errdefer allocator.free(cert_der);
+
+        const chain_entries = try allocator.dupe([]const u8, chain_view.slice());
+        errdefer allocator.free(chain_entries);
 
         const key_pem = std.Io.Dir.cwd().readFileAlloc(io, config.key_path, allocator, .limited(PEM_MAX_BYTES)) catch |err| return switch (err) {
             error.FileNotFound => error.ZixTlsKeyFileNotFound,
@@ -173,6 +188,9 @@ pub const Context = struct {
         return .{
             .allocator = allocator,
             .cert_der = cert_der,
+            .certificate_chain = chain_entries,
+            .chain_pool = chain_pool,
+            .chain_entries = chain_entries,
             .signing_key = signing_key,
             .alpn = config.alpn,
             .curves = config.curves,
@@ -186,6 +204,8 @@ pub const Context = struct {
 
     pub fn deinit(self: *Context) void {
         self.allocator.free(self.cert_der);
+        self.allocator.free(self.chain_pool);
+        self.allocator.free(self.chain_entries);
     }
 
     /// Build the per-connection handshake options from the context plus the freshly generated
@@ -194,7 +214,7 @@ pub const Context = struct {
     /// consumed by an RSA signing key, the ECDSA / Ed25519 paths ignore it.
     pub fn handshakeOptions(self: *const Context, ephemeral_secret: [32]u8, server_random: [32]u8, pss_salt: [rsa.pss_salt_len]u8) HandshakeOptions {
         return .{
-            .certificate_der = self.cert_der,
+            .certificate_chain = if (self.certificate_chain.len > 0) self.certificate_chain else &.{self.cert_der},
             .signing_key = self.signing_key,
             .ephemeral_secret = ephemeral_secret,
             .server_random = server_random,

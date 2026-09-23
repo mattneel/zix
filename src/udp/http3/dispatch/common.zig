@@ -1039,15 +1039,15 @@ fn sendServerHelloFD(table: *ConnTable, data: []const u8, tx: *datagram.SendBatc
     const tls_ctx = config.tls orelse return;
     const opts = tls_ctx.handshakeOptions(ephemeral, server_random, @splat(0));
 
-    var flight_out: [1500]u8 = undefined;
-    const flight_packet = flight.buildHandshakeFlight(
+    var flight_out: [flight.max_flight_bytes]u8 = undefined;
+    const built_flight = flight.buildHandshakeFlight(
         &flight_out,
         conn.hs_keys.server,
         conn.hs_keys.server_traffic,
         hdr.scid,
         conn.our_scid.slice(),
         &conn.handshake_transcript,
-        opts.certificate_der,
+        opts.certificate_chain,
         opts.signing_key,
         conn.dcid.slice(),
         conn.our_scid.slice(),
@@ -1059,9 +1059,13 @@ fn sendServerHelloFD(table: *ConnTable, data: []const u8, tx: *datagram.SendBatc
         return;
     };
 
-    _ = tx.queue(peer, flight_packet);
+    var flight_bytes: usize = 0;
+    for (built_flight.packets[0..built_flight.len]) |sealed| {
+        _ = tx.queue(peer, sealed);
+        flight_bytes += sealed.len;
+    }
     tx.flush(fd) catch {};
-    logSystem(config, .INFO, "sent Handshake flight ({d} bytes): EE + Cert + CertVerify + Finished", .{flight_packet.len});
+    logSystem(config, .INFO, "sent Handshake flight ({d} bytes in {d} packets): EE + Cert + CertVerify + Finished", .{ flight_bytes, built_flight.len });
 
     // 1-RTT application keys, derived from the transcript through the server Finished (which the
     // flight just appended). The client addresses us by our_scid from here on.

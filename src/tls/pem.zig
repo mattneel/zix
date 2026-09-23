@@ -40,6 +40,82 @@ pub fn pemToDer(out: []u8, pem: []const u8) ![]const u8 {
     return out[0..der_len];
 }
 
+/// The most certificates one chain may hold: an end-entity plus the intermediates a public authority
+/// needs, bounded the same way the rest of this file is.
+pub const max_chain = 4;
+
+/// One decoded certificate chain: the end-entity first, then any intermediates, each DER. The entries
+/// point into the caller's buffer, so it must outlive the chain.
+pub const Chain = struct {
+    ders: [max_chain][]const u8 = @splat(&.{}),
+    len: usize = 0,
+
+    /// The entries, in the order the document listed them: the end-entity first.
+    pub fn slice(self: *const Chain) []const []const u8 {
+        return self.ders[0..self.len];
+    }
+};
+
+/// Decode every CERTIFICATE block of a PEM document into `out`, in document order.
+///
+/// Why: a server certificate that a public authority issued is presented with the intermediates that
+/// chain it back to that authority. Serving the end-entity alone leaves a client that does not already
+/// hold the intermediate unable to build a path, which it reports as a missing issuer. A document with a
+/// single block yields a chain of one, so a single-certificate file behaves as it always did.
+///
+/// Param:
+/// out - []u8 (holds every decoded DER, packed end to end)
+/// chain - *Chain (filled with the entries, pointing into `out`)
+/// pem - []const u8 (the PEM document)
+///
+/// Return:
+/// - error.ZixInvalidPem (no CERTIFICATE block, or a body that is not base64)
+/// - error.ZixBufferTooSmall (over max_chain entries, or the DER does not fit `out`)
+pub fn chainToDer(out: []u8, chain: *Chain, pem: []const u8) !void {
+    var used: usize = 0;
+    var b64: [MAX_PEM_BYTES]u8 = undefined;
+    var n: usize = 0;
+    var in_certificate = false;
+
+    var lines = std.mem.tokenizeScalar(u8, pem, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (line.len == 0) continue;
+
+        if (std.mem.startsWith(u8, line, "-----BEGIN ")) {
+            in_certificate = std.mem.indexOf(u8, line, "CERTIFICATE") != null;
+            n = 0;
+
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, line, "-----END ")) {
+            if (!in_certificate) continue;
+            if (chain.len == max_chain) return error.ZixBufferTooSmall;
+
+            const decoder = std.base64.standard.Decoder;
+            const der_len = decoder.calcSizeForSlice(b64[0..n]) catch return error.ZixInvalidPem;
+            if (used + der_len > out.len) return error.ZixBufferTooSmall;
+            decoder.decode(out[used..][0..der_len], b64[0..n]) catch return error.ZixInvalidPem;
+
+            chain.ders[chain.len] = out[used..][0..der_len];
+            chain.len += 1;
+            used += der_len;
+            in_certificate = false;
+
+            continue;
+        }
+
+        if (!in_certificate) continue;
+        if (n + line.len > b64.len) return error.ZixBufferTooSmall;
+
+        @memcpy(b64[n..][0..line.len], line);
+        n += line.len;
+    }
+
+    if (chain.len == 0) return error.ZixInvalidPem;
+}
+
 /// Extract the 32-byte private scalar from a SEC1 ECPrivateKey DER (RFC 5915):
 /// SEQUENCE { INTEGER version(1), OCTET STRING privateKey(32), ... }.
 pub fn ecdsaScalarFromSec1(der: []const u8) ![32]u8 {
@@ -129,6 +205,57 @@ const DerReader = struct {
 
 // --------------------------------------------------------------- //
 // --------------------------------------------------------------- //
+
+test "zix tls: pem, a chain decodes every CERTIFICATE block in document order" {
+    // The shape a public authority's fullchain file has: the end-entity first, then the intermediate that
+    // chains it back to the authority. Before this, every block's body was concatenated into one base64
+    // blob, so a chain decoded as garbage and only a single-certificate file survived.
+    const document =
+        \\-----BEGIN CERTIFICATE-----
+        \\MAMBAgM=
+        \\-----END CERTIFICATE-----
+        \\-----BEGIN CERTIFICATE-----
+        \\MAQKCwwN
+        \\-----END CERTIFICATE-----
+    ;
+    const end_entity = [_]u8{ 0x30, 0x03, 0x01, 0x02, 0x03 };
+    const intermediate = [_]u8{ 0x30, 0x04, 0x0a, 0x0b, 0x0c, 0x0d };
+
+    var out: [64]u8 = undefined;
+    var chain: Chain = .{};
+    try chainToDer(&out, &chain, document);
+
+    try std.testing.expectEqual(@as(usize, 2), chain.len);
+    try std.testing.expectEqualSlices(u8, &end_entity, chain.slice()[0]);
+    try std.testing.expectEqualSlices(u8, &intermediate, chain.slice()[1]);
+}
+
+test "zix tls: pem, one CERTIFICATE block is a chain of one" {
+    const document =
+        \\-----BEGIN CERTIFICATE-----
+        \\MAMBAgM=
+        \\-----END CERTIFICATE-----
+    ;
+
+    var out: [64]u8 = undefined;
+    var chain: Chain = .{};
+    try chainToDer(&out, &chain, document);
+
+    try std.testing.expectEqual(@as(usize, 1), chain.len);
+    try std.testing.expectEqual(@as(usize, 5), chain.slice()[0].len);
+}
+
+test "zix tls: pem, a document with no CERTIFICATE block is not a chain" {
+    const document =
+        \\-----BEGIN PRIVATE KEY-----
+        \\MAMBAgM=
+        \\-----END PRIVATE KEY-----
+    ;
+
+    var out: [64]u8 = undefined;
+    var chain: Chain = .{};
+    try std.testing.expectError(error.ZixInvalidPem, chainToDer(&out, &chain, document));
+}
 
 test "zix tls: pem, SEC1 ECDSA key -> 32-byte scalar (fixture)" {
     const key_pem =

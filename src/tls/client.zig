@@ -466,7 +466,7 @@ test "zix tls: client, 1.3 handshake against the zix server (in-memory round tri
     // the zix server responds (the byte-exact RFC 8448 oracle), signing with the fixture key.
     var srv_out: [4096]u8 = undefined;
     var server = try connection.serverHandshake(.{
-        .certificate_der = cert_der,
+        .certificate_chain = &.{cert_der},
         .signing_key = .{ .ecdsa_p256 = server_key },
         .ephemeral_secret = @splat(0x99),
         .server_random = @splat(0x55),
@@ -584,7 +584,7 @@ test "zix tls: client over a socketpair (real fds, full https/1.1 request)" {
             const ch = try readRecordFd(ctx.fd, &buf);
             var out: [4096]u8 = undefined;
             var res = try connection.serverHandshake(.{
-                .certificate_der = ctx.cert,
+                .certificate_chain = &.{ctx.cert},
                 .signing_key = .{ .ecdsa_p256 = ctx.key },
                 .ephemeral_secret = @splat(0x99),
                 .server_random = @splat(0x55),
