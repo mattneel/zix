@@ -68,7 +68,9 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 
 # Fly's name for the address a UDP listener must bind; the server takes a numeric address.
-session_ip=${ZIX_SESSION_IP:-0.0.0.0}
+# Default to Fly's own name for it: on this platform a UDP listener has to bind that address, and a wildcard
+# bind is not the same thing.
+session_ip=${ZIX_SESSION_IP:-fly-global-services}
 if [ "$session_ip" = "fly-global-services" ]; then
     session_ip=$(getent hosts fly-global-services | awk '{print $1; exit}')
     echo "[entrypoint] fly-global-services resolves to $session_ip"
