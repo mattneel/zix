@@ -21,6 +21,17 @@ The UDP listener binds a numeric address. Fly requires UDP listeners on `fly-glo
 `entrypoint.sh` resolves that name before starting the server. `ZIX_SESSION_IP`, `ZIX_CERT`, `ZIX_KEY` and
 `DATABASE_URL` are the environment overrides the example reads; without them it keeps its local defaults.
 
+## Staged deployment
+
+`DOMAIN` is optional. With it, the machine obtains and holds a certificate a browser trusts, and no browser
+flag is needed. Without it, the bundled development certificate is served instead and browsers need
+`--ignore-certificate-errors-spki-list` - the machine still runs, which is what lets the passthrough be
+verified before a domain exists. `https://<app>.fly.dev/` is enough to check the wiring, because the pin
+applies to a key rather than to a name.
+
+Auto-stop is off deliberately: Fly decides a machine is idle from proxy traffic, and these services have no
+proxy, so a machine serving a live WebTransport session looks idle. Stopping it drops every session.
+
 ## The sequence
 
 ```sh
@@ -28,11 +39,11 @@ The UDP listener binds a numeric address. Fly requires UDP listeners on `fly-glo
 #    address: a shared one routes through the proxy.
 fly apps create zix-webtransport-demo --org personal
 fly ips allocate-v4 --app zix-webtransport-demo
-fly volumes create certs --app zix-webtransport-demo --region mia --size 1 --yes
+fly volumes create certs --app zix-webtransport-demo --region iad --size 1 --yes
 
 # 2. A database. The durable slice is the demo, and it panics without one. Either create a Fly Postgres and
 #    attach it (this sets DATABASE_URL), or point DATABASE_URL at a Postgres you already run.
-fly postgres create --name zix-demo-db --region mia --vm-size shared-cpu-1x --initial-cluster-size 1
+fly postgres create --name zix-demo-db --region iad --vm-size shared-cpu-1x --initial-cluster-size 1
 fly postgres attach zix-demo-db --app zix-webtransport-demo
 
 # 3. The certificate inputs. Point the domain's A record at the address `fly ips list` reports, DNS-only if

@@ -20,6 +20,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/bin/zix-example-webtransport_tasks-x86_64-linux-debug /app/zix-demo
+# The development certificate, so the machine runs before a domain exists; the entrypoint moves ZIX_CERT and
+# ZIX_KEY to the ACME files once it has them.
+COPY --from=build /src/examples/certs /app/examples/certs
 COPY deploy/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 ENTRYPOINT ["/app/entrypoint.sh"]
