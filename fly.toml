@@ -44,7 +44,7 @@ primary_region = "iad"
     port = 443
 
 [[services]]
-  internal_port = 9444
+  internal_port = 443
   protocol = "udp"
 
   [[services.ports]]
