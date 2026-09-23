@@ -28,6 +28,7 @@ const std = @import("std");
 const zix = @import("zix");
 
 const postgrez = zix.Driver.postgrez;
+const row_mod = postgrez.row;
 
 // --------------------------------------------------------- //
 // Schema
@@ -157,6 +158,22 @@ pub const Event = struct {
     payload: []const u8,
 };
 
+/// Decode one row into `allocator` rather than into the connection's own allocator.
+///
+/// `queryRow` allocates the strings it returns from the connection's allocator. Behind a pool that is the
+/// pool's allocator and therefore the caller's, so with that path alone the memory an operation returns
+/// lives until the pool is torn down — and `reset`, which the store tells its callers to use between
+/// operations, frees nothing. Routing every decoded row through the store's arena is what makes the
+/// store's contract true: a result belongs to the store, and `reset` releases it.
+fn queryRow(allocator: std.mem.Allocator, executor: anytype, comptime T: type, sql: []const u8, args: anytype) !?T {
+    var result = try executor.rows(sql, args);
+    defer result.deinit();
+
+    const first = (try result.next()) orelse return null;
+
+    return try row_mod.parseRow(T, allocator, result.columns, first.cells, .{});
+}
+
 /// Whether a revisioned patch may move the view forward. Delivery is at least once, so a view sees a
 /// revision twice whenever a dispatcher crashed between publishing and marking; applying the same
 /// revision twice must not move the state or double-count.
@@ -263,7 +280,7 @@ pub const Store = struct {
         var tx = try conn.begin();
         defer tx.rollback();
 
-        const outcome = try Store.createIn(&tx, request);
+        const outcome = try Store.createIn(self.arena.allocator(), &tx, request);
         switch (outcome) {
             .rejected => return outcome,
             .accepted => try tx.commit(),
@@ -274,18 +291,19 @@ pub const Store = struct {
 
     /// The transaction body of `create`, callable with a caller-owned transaction so the failure case can
     /// be tested where it matters: after both inserts, before the commit. Nothing here writes outside `tx`,
-    /// which is why it takes no `Store`: a caller that rolls back has to be able to run exactly this body.
-    pub fn createIn(tx: *postgrez.Transaction, request: CreateRequest) !Outcome {
+    /// which is why it takes no `Store`: a caller that rolls back has to be able to run exactly this body,
+    /// and only lends the arena its decoded rows come from.
+    pub fn createIn(allocator: std.mem.Allocator, tx: *postgrez.Transaction, request: CreateRequest) !Outcome {
         if (request.title.len == 0 or request.title.len > max_title) return .{ .rejected = "title must be 1..120 bytes" };
         if (request.idempotency_key.len == 0 or request.idempotency_key.len > max_key) return .{ .rejected = "idempotency key must be 1..64 bytes" };
         if (request.principal.len == 0 or request.tenant.len == 0) return .{ .rejected = "principal and tenant are required" };
 
-        const member = try tx.queryRow(AuthRow, "SELECT 1::int8 AS ok FROM principals WHERE id = $1 AND tenant_id = $2", .{ request.principal, request.tenant });
+        const member = try queryRow(allocator, tx, AuthRow, "SELECT 1::int8 AS ok FROM principals WHERE id = $1 AND tenant_id = $2", .{ request.principal, request.tenant });
         if (member == null) return .{ .rejected = "principal is not a member of this tenant" };
 
         // The unique key is what makes a retry idempotent: the second submission conflicts, reads the task
         // it already created, and inserts no second job and no second event.
-        const inserted = try tx.queryRow(IdRow,
+        const inserted = try queryRow(allocator, tx, IdRow,
             \\INSERT INTO tasks (tenant_id, idempotency_key, title)
             \\VALUES ($1, $2, $3)
             \\ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
@@ -293,7 +311,7 @@ pub const Store = struct {
         , .{ request.tenant, request.idempotency_key, request.title });
 
         if (inserted == null) {
-            const existing = (try tx.queryRow(
+            const existing = (try queryRow(allocator, tx, 
                 ExistingRow,
                 "SELECT id::int8 AS id, updated_rev::int8 AS rev FROM tasks WHERE tenant_id = $1 AND idempotency_key = $2",
                 .{ request.tenant, request.idempotency_key },
@@ -303,7 +321,7 @@ pub const Store = struct {
         }
 
         const task_id = inserted.?.id;
-        const rev = try nextRevision(tx, request.tenant);
+        const rev = try nextRevision(allocator, tx, request.tenant);
 
         _ = try tx.exec("UPDATE tasks SET created_rev = $2, updated_rev = $2 WHERE id = $1", .{ task_id, rev });
         _ = try tx.exec("INSERT INTO jobs (task_id) VALUES ($1)", .{task_id});
@@ -321,7 +339,7 @@ pub const Store = struct {
         const conn = try self.pool.acquire();
         defer self.pool.release(conn);
 
-        const rev = (try conn.queryRow(RevRow, "SELECT COALESCE((SELECT rev FROM tenant_revision WHERE tenant_id = $1), 0)::int8 AS rev", .{tenant})).?.rev;
+        const rev = (try queryRow(self.arena.allocator(), conn, RevRow, "SELECT COALESCE((SELECT rev FROM tenant_revision WHERE tenant_id = $1), 0)::int8 AS rev", .{tenant})).?.rev;
 
         var tasks: std.ArrayList(Task) = .empty;
         var result = try conn.rows(
@@ -358,7 +376,7 @@ pub const Store = struct {
         var tx = try conn.begin();
         defer tx.rollback();
 
-        const leased = try tx.queryRow(LeaseRow,
+        const leased = try queryRow(self.arena.allocator(), &tx, LeaseRow,
             \\WITH candidate AS (
             \\  SELECT j.id FROM jobs j
             \\  WHERE (j.state = 'queued' AND j.available_at <= now())
@@ -381,7 +399,7 @@ pub const Store = struct {
         if (leased == null) return null;
 
         const found = leased.?;
-        const rev = try nextRevision(&tx, found.tenant_id);
+        const rev = try nextRevision(self.arena.allocator(), &tx, found.tenant_id);
         _ = try tx.exec("UPDATE tasks SET state = 'running', attempts = $2, updated_rev = $3 WHERE id = $1", .{ found.task_id, found.attempts, rev });
 
         var payload_buf: [512]u8 = undefined;
@@ -415,7 +433,7 @@ pub const Store = struct {
         var tx = try conn.begin();
         defer tx.rollback();
 
-        const owned = try tx.queryRow(IdRow,
+        const owned = try queryRow(self.arena.allocator(), &tx, IdRow,
             \\UPDATE jobs SET state = 'done', lease_until = NULL
             \\WHERE id = $1 AND attempts = $2 AND state = 'running'
             \\RETURNING id::int8 AS id
@@ -423,7 +441,7 @@ pub const Store = struct {
 
         if (owned == null) return .not_owner;
 
-        const rev = try nextRevision(&tx, held.tenant_id);
+        const rev = try nextRevision(self.arena.allocator(), &tx, held.tenant_id);
 
         _ = try tx.exec("UPDATE tasks SET state = 'completed', result = $2, updated_rev = $3 WHERE id = $1", .{ held.task_id, result, rev });
 
@@ -475,8 +493,8 @@ pub const Store = struct {
 
 /// Allocate this tenant's next revision inside `tx`, so the revision and the state change it labels commit
 /// together or not at all.
-fn nextRevision(tx: *postgrez.Transaction, tenant: []const u8) !i64 {
-    return (try tx.queryRow(RevRow,
+fn nextRevision(allocator: std.mem.Allocator, tx: *postgrez.Transaction, tenant: []const u8) !i64 {
+    return (try queryRow(allocator, tx, RevRow,
         \\INSERT INTO tenant_revision (tenant_id, rev) VALUES ($1, 1)
         \\ON CONFLICT (tenant_id) DO UPDATE SET rev = tenant_revision.rev + 1
         \\RETURNING rev::int8 AS rev
@@ -793,7 +811,7 @@ test "zix durable tasks: an event payload escapes what the caller typed" {
     const payload = try renderTaskEvent(&buf, 7, "task_created", 3, "quote \" and \\ and \n", "queued", 0, null);
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"task_created\",\"rev\":7,\"task\":{\"id\":3,\"title\":\"quote \\\" and \\\\ and \\\\n\",\"state\":\"queued\",\"attempts\":0,\"result\":null}}",
+        "{\"kind\":\"task_created\",\"rev\":7,\"task\":{\"id\":3,\"title\":\"quote \\\" and \\\\ and \\n\",\"state\":\"queued\",\"attempts\":0,\"result\":null}}",
         payload,
     );
 }
