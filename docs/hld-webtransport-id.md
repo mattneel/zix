@@ -481,3 +481,21 @@ Dengan cara mana pun, sertifikatnya tetap harus dipercaya alih-alih diterima lew
 mengabaikan `Alt-Svc` yang origin-nya berstatus error sertifikat, dan click-through adalah error, bukan
 kepercayaan. WebTransport pada deployment biasa tidak pernah butuh langkah ini karena servernya menyajikan
 sertifikat yang sudah dipercaya browser; demo self-signed lokal adalah kasus yang butuh.
+
+## Membuka demo di Chrome, dan kenapa butuh dua switch
+
+Chrome memverifikasi sertifikat koneksi QUIC secara terpisah dari sertifikat koneksi HTTPS. Pada setiap
+konfigurasi yang diuji di sini, sertifikat leaf yang sama diterima untuk HTTPS dan ditolak untuk QUIC
+dengan `46: certificate unknown`, termasuk saat CA-nya dipercaya di system store maupun di store browser
+itu sendiri. Yang diterima jalur QUIC adalah sertifikat yang disebut oleh SPKI-nya:
+
+```
+chrome --origin-to-force-quic-on=127.0.0.1:9444 \
+       --ignore-certificate-errors-spki-list=HjE8OI+7PQoOBJJ2vbhlKM5g0rdmDnZpDHaKqfXQcsM= \
+       --user-data-dir=%TEMP%\zix-chrome \
+       https://127.0.0.1:9444/
+```
+
+Buka `https://127.0.0.1:9444/` (alamat literal, cocok dengan switch-nya) lalu tekan *open session*. Inilah
+yang dilakukan browser milik development loop itu sendiri, dan itulah sebabnya `scripts/dev_loop_bench.py`
+memberi kedua switch. Deployment dengan sertifikat yang dipercaya publik tidak butuh keduanya.

@@ -477,3 +477,21 @@ Either way, the certificate still has to be trusted rather than click-through ac
 an `Alt-Svc` whose origin has a certificate error, and a click-through is an error, not trust. WebTransport
 in an ordinary deployment never needs this step because the server presents a certificate the browser
 already trusts; a local self-signed demo is the case that does.
+
+## Opening the demo in Chrome, and why it needs two switches
+
+Chrome verifies the certificate of a QUIC connection separately from the certificate of an HTTPS
+connection. In every configuration tested here the same leaf certificate was accepted for HTTPS and
+rejected for QUIC with `46: certificate unknown`, including with the CA trusted in the system store and in
+the browser's own store. What the QUIC path did accept was the certificate named by its SPKI:
+
+```
+chrome --origin-to-force-quic-on=127.0.0.1:9444 \
+       --ignore-certificate-errors-spki-list=HjE8OI+7PQoOBJJ2vbhlKM5g0rdmDnZpDHaKqfXQcsM= \
+       --user-data-dir=%TEMP%\zix-chrome \
+       https://127.0.0.1:9444/
+```
+
+Open `https://127.0.0.1:9444/` (the literal address, matching the switch) and press *open session*. This is
+what the development loop's own browser does, and it is why `scripts/dev_loop_bench.py` passes both
+switches. A deployment with a publicly trusted certificate needs neither.
