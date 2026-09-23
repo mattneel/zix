@@ -1,0 +1,22 @@
+.{
+    .name = .room_host,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
+    // Changing this has security and trust implications.
+    .fingerprint = 0xac23f9996a431f40,
+    .dependencies = .{
+        // The transport: HTTP/3 and WebTransport, from the repository this example lives in.
+        .zix = .{ .path = "../.." },
+        // The simulation kernel, and the room this host drives — from the checkout beside it. gkz pins its own
+        // `fpz`, so nothing else is declared here.
+        .gkz = .{ .path = "../../../gkz" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "host.zig",
+        "server.zig",
+        "native_session.zig",
+        "page.html",
+    },
+}
