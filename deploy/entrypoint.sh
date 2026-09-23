@@ -107,6 +107,14 @@ if [ -z "${DATABASE_URL:-}" ]; then
     pgbin=$(ls -d /usr/lib/postgresql/*/bin | head -1)
     pgdata=/data/pg
 
+    if [ -f "$pgdata/postmaster.pid" ]; then
+        # The platform stops and starts machines routinely, and an abrupt stop leaves this behind, after which
+        # pg_ctl refuses to start. A booted machine has nothing running, so clearing it is safe - and without
+        # it every deploy would refuse to bring the database up.
+        echo "[entrypoint] clearing a stale postmaster.pid"
+        rm -f "$pgdata/postmaster.pid"
+    fi
+
     if [ ! -d "$pgdata" ]; then
         echo "[entrypoint] initialising a local database in $pgdata"
         install -d -o postgres -g postgres "$pgdata"
