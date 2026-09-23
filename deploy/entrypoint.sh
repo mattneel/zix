@@ -15,10 +15,22 @@ STATE=/data/letsencrypt
 # QUIC handshake ends here, so the private key has to be here. Without one, the bundled development
 # certificate is served instead and browsers need the SPKI pin - the machine still runs, which is what makes
 # a staged deployment possible.
+acme_ok=yes
 if [ -n "$DOMAIN" ]; then
+    # A certificate that cannot be obtained must not take the machine with it: a deployment that serves the
+    # self-signed certificate and says so is diagnosable, and one that crash-loops cannot even be shelled
+    # into to find out why.
+    echo "[entrypoint] acme client: $(command -v lego || echo missing) $(lego --version 2>/dev/null | head -1)"
     if [ ! -d "$STATE/certificates/$DOMAIN" ]; then
         echo "[entrypoint] requesting a certificate for $DOMAIN through a DNS-01 challenge"
-        lego --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN" --path "$STATE" --accept-tos run
+        if ! lego --email "$ACME_EMAIL" --dns spaceship --domains "$DOMAIN" --path "$STATE" --accept-tos run; then
+            echo "[entrypoint] WARNING: the certificate request failed; serving the development certificate"
+            acme_ok=no
+        fi
+    fi
+
+    if [ "$acme_ok" = no ]; then
+        DOMAIN=""
     fi
 
     # A renewal loop: certificates last 90 days and nothing else here would notice. A renewed certificate
