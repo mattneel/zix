@@ -21,6 +21,16 @@ The UDP listener binds a numeric address. Fly requires UDP listeners on `fly-glo
 `entrypoint.sh` resolves that name before starting the server. `ZIX_SESSION_IP`, `ZIX_CERT`, `ZIX_KEY` and
 `DATABASE_URL` are the environment overrides the example reads; without them it keeps its local defaults.
 
+### The port UDP forwards to
+
+Fly rewrites the port for a TCP service and does **not** rewrite it for UDP - it rewrites only the IP. A UDP
+service of external 443 into internal 9444 therefore delivers datagrams to the machine on **443**, where
+nothing is listening, while the QUIC server waits on 9444 for traffic that can never arrive. The symptoms
+are a client stuck on `QUIC_NETWORK_IDLE_TIMEOUT` with `num_undecryptable_packets: 0`, and a packet capture
+on the internal port that records nothing at all while datagrams are demonstrably being sent. The UDP
+service forwards 443 to 443 and the session port is 443; the TCP service keeps 443 to 9444, which Fly does
+honour.
+
 ## Staged deployment
 
 `DOMAIN` is optional. With it, the machine obtains and holds a certificate a browser trusts, and no browser
