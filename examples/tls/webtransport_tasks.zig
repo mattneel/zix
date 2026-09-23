@@ -613,19 +613,30 @@ fn writeLine(stream: *const zix.Webtransport.Stream, line: []const u8) void {
 
 // --------------------------------------------------------- //
 
+/// Take an environment override when it is set and non-empty.
+///
+/// An empty value is not a value: a shell that exports DATABASE_URL= while testing would otherwise blank
+/// the built-in default and the store would fail on a URL nobody meant to set.
+fn envOverride(env: anytype, name: []const u8) ?[]const u8 {
+    const value = env.get(name) orelse return null;
+    if (value.len == 0) return null;
+
+    return value;
+}
+
 pub fn main(process: std.process.Init) !void {
     current_io = process.io;
 
     // Environment overrides, read before anything uses these. `fly-global-services` is Fly.io's name for
     // the address a UDP listener must bind; ZIX_PAGE_IP stays separate because the TCP page listener binds
     // wherever the platform routes its TCP, which is not that address.
-    if (process.environ_map.get("ZIX_SESSION_IP")) |value| IP = value;
-    if (process.environ_map.get("ZIX_PAGE_IP")) |value| PAGE_IP = value;
-    if (process.environ_map.get("ZIX_SESSION_PORT")) |value| PORT = std.fmt.parseInt(u16, value, 10) catch PORT;
-    if (process.environ_map.get("ZIX_PAGE_PORT")) |value| PAGE_PORT = std.fmt.parseInt(u16, value, 10) catch PAGE_PORT;
-    if (process.environ_map.get("ZIX_CERT")) |value| CERT = value;
-    if (process.environ_map.get("ZIX_KEY")) |value| KEY = value;
-    if (process.environ_map.get("DATABASE_URL")) |value| DSN = value;
+    if (envOverride(process.environ_map, "ZIX_SESSION_IP")) |value| IP = value;
+    if (envOverride(process.environ_map, "ZIX_PAGE_IP")) |value| PAGE_IP = value;
+    if (envOverride(process.environ_map, "ZIX_SESSION_PORT")) |value| PORT = std.fmt.parseInt(u16, value, 10) catch PORT;
+    if (envOverride(process.environ_map, "ZIX_PAGE_PORT")) |value| PAGE_PORT = std.fmt.parseInt(u16, value, 10) catch PAGE_PORT;
+    if (envOverride(process.environ_map, "ZIX_CERT")) |value| CERT = value;
+    if (envOverride(process.environ_map, "ZIX_KEY")) |value| KEY = value;
+    if (envOverride(process.environ_map, "DATABASE_URL")) |value| DSN = value;
 
     preparePage();
     served_version = std.hash.Fnv1a_64.hash(served_page[0..served_page_len]);

@@ -204,12 +204,16 @@ pub const Store = struct {
         self.allocator = allocator;
         self.io = io;
         self.arena = std.heap.ArenaAllocator.init(allocator);
+        // Every field the parsed DSN carries, including its TLS mode. Dropping `tls` here is silent and the
+        // DSN's `sslmode=require` then does nothing: the connection goes out in cleartext, which a hosted
+        // database refuses - so a URL that asks for TLS has to be the URL that gets it.
         self.pool = try postgrez.Pool.init(allocator, io, .{
             .ip = parsed.ip,
             .port = parsed.port,
             .user = parsed.user,
             .password = parsed.password,
             .database = parsed.database,
+            .tls = parsed.tls,
             .pool_size = pool_size,
         });
 
