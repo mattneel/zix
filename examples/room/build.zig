@@ -73,7 +73,11 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(server);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    // Zig 0.16 hands the arguments after `--` to the build script as `b.args`;
+    // later versions forward them through the run step itself.
+    if (@hasField(std.Build, "args")) {
+        if (b.args) |args| run.addArgs(args);
+    } else run.addPassthruArgs();
     b.step("run", "Run the room host").dependOn(&run.step);
 
     // The native acceptance harness: drive a session, export its run log, and hand the file to gkz's `replay`.
@@ -88,6 +92,10 @@ pub fn build(b: *std.Build) void {
     });
     session.root_module.addObject(room_obj);
     const run_session = b.addRunArtifact(session);
-    if (b.args) |args| run_session.addArgs(args);
+    // Zig 0.16 hands the arguments after `--` to the build script as `b.args`;
+    // later versions forward them through the run step itself.
+    if (@hasField(std.Build, "args")) {
+        if (b.args) |args| run_session.addArgs(args);
+    } else run_session.addPassthruArgs();
     b.step("session", "Drive a native session and export its run log").dependOn(&run_session.step);
 }

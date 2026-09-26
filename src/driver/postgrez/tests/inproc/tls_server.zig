@@ -26,6 +26,12 @@ const record = postgrez_tls.record;
 const wire = postgrez_tls.wire;
 
 const X25519 = std.crypto.dh.X25519;
+
+/// The public key of an X25519 secret. `X25519.recoverPublicKey` can fail in Zig 0.16 and
+/// cannot in later versions, so this is an error union in both.
+fn x25519PublicKey(secret_key: [X25519.secret_length]u8) ![X25519.public_length]u8 {
+    return X25519.recoverPublicKey(secret_key);
+}
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Secret = key_schedule.Secret;
@@ -175,7 +181,7 @@ pub fn handshake(
     // the server ephemeral share, fresh per connection
     var server_secret: [32]u8 = undefined;
     io.randomSecure(&server_secret) catch io.random(&server_secret);
-    const server_public = try X25519.recoverPublicKey(server_secret);
+    const server_public = try x25519PublicKey(server_secret);
 
     var server_random: [32]u8 = undefined;
     io.randomSecure(&server_random) catch io.random(&server_random);
@@ -551,7 +557,7 @@ test "postgrez inproc: tls parses a client hello built by the driver" {
 
     const parsed = try parseClientHello(started.client_hello);
 
-    const expected_public = try X25519.recoverPublicKey(@splat(0x33));
+    const expected_public = try x25519PublicKey(@splat(0x33));
     try testing.expectEqualSlices(u8, &expected_public, &parsed.client_public);
 }
 

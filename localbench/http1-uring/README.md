@@ -110,6 +110,7 @@ that would resolve against whatever directory the process started in.
 | `ZIX_TLS_KEY` | yes | its private key |
 | `DATABASE_URL` | no | absent leaves `/async-db` and `/crud` answering 503 and opens no connection |
 | `DATABASE_MAX_CONN` | no | total connections across workers, otherwise derived from the CPU count |
+| `ZIX_IO` | no | `threadz` runs the server on Zig++'s `std.Io.Threadz`, each io_uring loop a task pinned to one Threadz worker, on that worker's ring. A Zig without Threadz ignores it |
 
 `scripts/localbench-run.sh` sets all of these. Starting the binary by hand
 means setting them by hand.

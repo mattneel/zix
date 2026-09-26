@@ -21,9 +21,23 @@ const Routes = zix.Grpc.Router(&[_]zix.Grpc.Route{
     .{ .path = streamsum.PATH, .handler = streamsum.RESPONSE, .is_server_streaming = true },
 });
 
+/// Zig++'s std.Io.Threadz, `void` on a Zig without it.
+const Threadz = blk: {
+    if (!@hasDecl(std.Io, "Threadz")) break :blk void;
+    break :blk std.Io.Threadz;
+};
+
 pub fn main(process: std.process.Init) !void {
+    // ZIX_IO=threadz runs the server on std.Io.Threadz: each io_uring loop is a task pinned to
+    // one worker, on that worker's ring, instead of a thread with a ring of its own.
+    var threadz: Threadz = undefined;
+    const on_threadz = Threadz != void and std.mem.eql(u8, process.environ_map.get("ZIX_IO") orelse "", "threadz");
+    if (on_threadz) try threadz.init(std.heap.smp_allocator, .{ .log2_ring_entries = 12 });
+    defer if (on_threadz) threadz.deinit();
+    const io = if (on_threadz) threadz.io() else process.io;
+
     var server = zix.Grpc.Server.init(Routes, .{
-        .io = process.io,
+        .io = io,
         .ip = "::",
         .port = 8080,
         .workers = 0,

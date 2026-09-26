@@ -19,6 +19,7 @@ const common = @import("common.zig");
 const wt_pool = @import("../webtransport/pool.zig");
 const reuseport = @import("../../../multiplexers/reuseport.zig");
 const listen_report = @import("../../../multiplexers/listen_report.zig");
+const ring_host = @import("../../../multiplexers/ring_host.zig");
 const epoll = @import("epoll.zig");
 
 /// io_uring submission-queue depth for an HTTP/3 .URING worker. The ring carries only recvmsg SQEs
@@ -49,12 +50,16 @@ const uring_buf_group: u16 = 1;
 
 /// user_data tag on the multishot recvmsg SQE (completions are identified by IORING_CQE_F_BUFFER, so the
 /// tag is only for symmetry with the one-shot slot tags).
+///
+/// Note:
+/// - Every tag here carries ring_host.owner_bit, which the multishot tag has anyway: on a
+///   std.Io.Threadz worker's ring that bit is what hands the completion back to this loop.
 const uring_mshot_tag: u64 = std.math.maxInt(u64);
 
 /// user_data tag on the periodic maintenance timeout SQE. Distinct from the recv-slot indices
 /// (0..uring_recv_slots), the two send tags, and the multishot tag, so the completion loop can tell a
 /// fired maintenance timer from an I/O completion and never mistakes it for a recv slot index.
-const uring_timeout_tag: u64 = (1 << 32) + 2;
+const uring_timeout_tag: u64 = ring_host.owner_bit | ((1 << 32) + 2);
 
 /// Bytes the kernel prefixes to each selected buffer: the io_uring_recvmsg_out header.
 const recvmsg_out_hdr: usize = @sizeOf(linux.io_uring_recvmsg_out);
@@ -80,7 +85,7 @@ const UringTx = struct {
     /// (0..uring_recv_slots) and below the multishot tag (maxInt(u64)), so a completion's user_data
     /// alone says which of the two buffers (if any) it belongs to, with no risk of colliding with a
     /// recv completion's tag.
-    const tags = [2]u64{ 1 << 32, (1 << 32) + 1 };
+    const tags = [2]u64{ ring_host.owner_bit | (1 << 32), ring_host.owner_bit | ((1 << 32) + 1) };
 
     fn init(allocator: std.mem.Allocator, count: usize, buf_bytes: usize) !UringTx {
         var first = try datagram.SendBatch.init(allocator, count, buf_bytes);
@@ -188,7 +193,7 @@ fn armUringRecv(ring: *IoUring, msg: *linux.msghdr, slot: usize, fd: std.posix.s
 
     const sqe = uringGetSqe(ring) orelse return false;
     sqe.prep_recvmsg(fd, msg, 0);
-    sqe.user_data = @intCast(slot);
+    sqe.user_data = ring_host.owner_bit | slot;
 
     return true;
 }
@@ -251,12 +256,14 @@ fn parseMultishotBuf(buf: []const u8, name_reserve: usize, controllen: usize, ma
 fn workerLoopUring(comptime handler: core.HandlerFn, config: Http3ServerConfig, worker_id: usize, steering: ?reuseport.Steering, report: *listen_report.Report) void {
     common.pinToCpu(worker_id);
 
-    var ring = initUringRing() catch |err| {
+    // Its own ring, or on std.Io.Threadz the ring of the worker this task is pinned to.
+    var own_ring: IoUring = undefined;
+    const host = ring_host.LoopRing.init(config.io, &own_ring, initUringRing) catch |err| {
         common.logSystem(config, .WARN, "io_uring unavailable ({s}): worker {d} folds to epoll", .{ @errorName(err), worker_id });
 
         return epoll.workerLoopEpoll(handler, config, worker_id, steering, report);
     };
-    defer ring.deinit();
+    defer host.deinit();
 
     // Skew report at worker exit: requests this worker served (common.tl_requests_served).
     // Placed after the ring probe so the epoll fold reports through its own line only.
@@ -304,21 +311,22 @@ fn workerLoopUring(comptime handler: core.HandlerFn, config: Http3ServerConfig, 
 
     tx.setGso(config.gso_enabled and datagram.probeGso(fd));
 
-    runRecvLoop(handler, &ring, fd, table, &pool, if (wt_pool_handle) |*opened| opened else null, &tx, config, worker_id);
+    runRecvLoop(handler, host, fd, table, &pool, if (wt_pool_handle) |*opened| opened else null, &tx, config, worker_id);
 }
 
 /// Drive receives on the ring: set up the multishot provided buffer ring and run the multishot loop, or
 /// fall back to the one-shot recvmsg slot pool when the buffer ring cannot be registered (older kernel).
-fn runRecvLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.socket_t, table: *common.ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, tx: *UringTx, config: Http3ServerConfig, worker_id: usize) void {
+fn runRecvLoop(comptime handler: core.HandlerFn, host: ring_host.LoopRing, fd: std.posix.socket_t, table: *common.ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, tx: *UringTx, config: Http3ServerConfig, worker_id: usize) void {
+    const ring = host.ring;
     const buf_size = std.mem.alignForward(usize, recvmsg_out_hdr + mshot_name_reserve + config.max_recv_buf, 16);
 
     const br = IoUring.setup_buf_ring(ring.fd, uring_ring_bufs, uring_buf_group, .{ .inc = false }) catch
-        return runOneShotLoop(handler, ring, fd, table, pool, wt_pool_ptr, tx, config, worker_id);
+        return runOneShotLoop(handler, host, fd, table, pool, wt_pool_ptr, tx, config, worker_id);
     defer IoUring.free_buf_ring(ring.fd, br, uring_ring_bufs, uring_buf_group);
     IoUring.buf_ring_init(br);
 
     const backing = config.allocator.alloc(u8, uring_ring_bufs * buf_size) catch
-        return runOneShotLoop(handler, ring, fd, table, pool, wt_pool_ptr, tx, config, worker_id);
+        return runOneShotLoop(handler, host, fd, table, pool, wt_pool_ptr, tx, config, worker_id);
     defer config.allocator.free(backing);
 
     const mask = IoUring.buf_ring_mask(uring_ring_bufs);
@@ -360,15 +368,15 @@ fn runRecvLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.s
         }
 
         if (comptime common.diag_enabled) stats.wait_enter_us = recovery.nowUs();
-        const wait_result = ring.submit_and_wait(1);
+        // Submits, then waits in the kernel on an own ring, or parks until the worker hands the
+        // loop a completion on a std.Io.Threadz worker's ring.
+        const wait_result = host.wait(&cqes);
         if (comptime common.diag_enabled) {
             stats.block_us += recovery.nowUs() -| stats.wait_enter_us;
             stats.wait_enter_us = 0;
         }
-        _ = wait_result catch continue;
+        const reaped = wait_result catch continue;
         stats.wakes += 1;
-
-        const reaped = ring.copy_cqes(&cqes, 0) catch continue;
         var rearm = false;
         for (cqes[0..reaped]) |cqe| {
             if (cqe.user_data == uring_timeout_tag) {
@@ -425,7 +433,8 @@ fn runRecvLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.s
 /// The one-shot recvmsg fallback (still io_uring): a pool of recvmsg submissions stays in flight, one
 /// buffer + sockaddr + msghdr per slot, and each completion hands back the bytes and peer address by slot
 /// index, re-armed per datagram. Used when the provided buffer ring cannot be registered.
-fn runOneShotLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posix.socket_t, table: *common.ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, tx: *UringTx, config: Http3ServerConfig, worker_id: usize) void {
+fn runOneShotLoop(comptime handler: core.HandlerFn, host: ring_host.LoopRing, fd: std.posix.socket_t, table: *common.ConnTable, pool: *reassembly.Pool, wt_pool_ptr: ?*wt_pool.Pool, tx: *UringTx, config: Http3ServerConfig, worker_id: usize) void {
+    const ring = host.ring;
     const bufs = config.allocator.alloc(u8, uring_recv_slots * config.max_recv_buf) catch return;
     defer config.allocator.free(bufs);
     const names = config.allocator.alloc(std.posix.sockaddr.in6, uring_recv_slots) catch return;
@@ -485,15 +494,15 @@ fn runOneShotLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posi
         }
 
         if (comptime common.diag_enabled) stats.wait_enter_us = recovery.nowUs();
-        const wait_result = ring.submit_and_wait(1);
+        // Submits, then waits in the kernel on an own ring, or parks until the worker hands the
+        // loop a completion on a std.Io.Threadz worker's ring.
+        const wait_result = host.wait(&cqes);
         if (comptime common.diag_enabled) {
             stats.block_us += recovery.nowUs() -| stats.wait_enter_us;
             stats.wait_enter_us = 0;
         }
-        _ = wait_result catch continue;
+        const reaped = wait_result catch continue;
         stats.wakes += 1;
-
-        const reaped = ring.copy_cqes(&cqes, 0) catch continue;
         for (cqes[0..reaped]) |cqe| {
             if (cqe.user_data == uring_timeout_tag) {
                 timeout_armed = false; // the maintenance timer fired (or was cancelled): re-arm next loop
@@ -501,7 +510,7 @@ fn runOneShotLoop(comptime handler: core.HandlerFn, ring: *IoUring, fd: std.posi
             }
             if (tx.reap(cqe.user_data)) continue; // a send SQE landed, bookkeeping only
 
-            const slot: usize = @intCast(cqe.user_data);
+            const slot: usize = @intCast(cqe.user_data & ~ring_host.owner_bit);
 
             // res > 0 is the datagram length, res <= 0 is an empty datagram or a recvmsg error. Re-arm the
             // slot either way so the receive stays in flight.
@@ -543,12 +552,14 @@ pub fn runUring(comptime handler: core.HandlerFn, config: Http3ServerConfig) !vo
         return;
     }
 
-    const want = common.effectiveWorkers(config);
+    // On std.Io.Threadz each loop is pinned to a worker of its own, so there are no more loops
+    // than workers.
+    const want = ring_host.Workers.count(config.io, common.effectiveWorkers(config));
 
     common.installDiagnosticDump();
 
-    const threads = try config.allocator.alloc(std.Thread, want);
-    defer config.allocator.free(threads);
+    var workers = try ring_host.Workers.init(config.io, want);
+    defer workers.deinit();
 
     // CBPF steering: one shared bind-order gate, alive until join().
     var bind_gate = reuseport.BindOrderGate{};
@@ -558,30 +569,34 @@ pub fn runUring(comptime handler: core.HandlerFn, config: Http3ServerConfig) !vo
     // reaches this frame instead of ending that thread and nothing else.
     var report = listen_report.Report.init(want);
 
-    var spawned: usize = 0;
+    // A loop with the handler bound, since a worker function takes runtime arguments only.
+    const Loop = struct {
+        fn run(cfg: Http3ServerConfig, worker_id: usize, steer: ?reuseport.Steering, group: *listen_report.Report) void {
+            workerLoopUring(handler, cfg, worker_id, steer, group);
+        }
+    };
     for (0..want) |i| {
-        threads[i] = std.Thread.spawn(.{ .stack_size = config.worker_stack_size_bytes }, workerLoopUring, .{ handler, config, i, steering, &report }) catch |err| {
+        workers.spawn(config.worker_stack_size_bytes, Loop.run, .{ config, i, steering, &report }) catch |err| {
             common.logSystem(config, .ERROR, "could not spawn worker {d} of {d} ({s})", .{ i, want, @errorName(err) });
             report.abandon(config.io, want - i, err);
 
             break;
         };
-        spawned += 1;
     }
 
     if (report.awaitGroup(config.io)) |err| {
         common.logSystem(config, .ERROR, "not listening on {s}:{d}: {d} of {d} workers could not bind ({s})", .{ config.ip, config.port, report.failures(), want, @errorName(err) });
 
-        for (threads[0..spawned]) |thread| thread.join();
+        workers.join();
 
         return error.ZixHttp3ListenFailed;
     }
 
     // Announced here rather than above the spawn, because until the group reports there is nothing
     // to announce: the old line claimed a socket that may never have been bound.
-    common.logSystem(config, .INFO, "listening on {s}:{d} ({d} workers, SO_REUSEPORT + io_uring)", .{ config.ip, config.port, want });
+    common.logSystem(config, .INFO, "listening on {s}:{d} ({d} workers, SO_REUSEPORT + io_uring{s})", .{ config.ip, config.port, want, if (workers.threadz != null) " on std.Io.Threadz" else "" });
 
-    for (threads[0..spawned]) |thread| thread.join();
+    workers.join();
 }
 
 // --------------------------------------------------------------- //
@@ -679,7 +694,7 @@ test "zix http3: io_uring recvmsg delivers a datagram and its peer address by sl
     var cqes: [4]linux.io_uring_cqe = undefined;
     const n = ring.copy_cqes(&cqes, 0) catch return;
     try std.testing.expect(n >= 1);
-    try std.testing.expectEqual(@as(u64, 7), cqes[0].user_data);
+    try std.testing.expectEqual(ring_host.owner_bit | 7, cqes[0].user_data);
     try std.testing.expect(cqes[0].res >= 4);
     try std.testing.expectEqualStrings("ping", buf[0..4]);
 }

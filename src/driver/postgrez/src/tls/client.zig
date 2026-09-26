@@ -24,6 +24,12 @@ const key_schedule = @import("key_schedule.zig");
 const record = @import("record.zig");
 
 const X25519 = std.crypto.dh.X25519;
+
+/// The public key of an X25519 secret. `X25519.recoverPublicKey` can fail in Zig 0.16 and
+/// cannot in later versions, so this is an error union in both.
+fn x25519PublicKey(secret_key: [X25519.secret_length]u8) ![X25519.public_length]u8 {
+    return X25519.recoverPublicKey(secret_key);
+}
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const Secret = key_schedule.Secret;
 
@@ -111,7 +117,7 @@ pub const ClientConnection = struct {
 /// Phase 1: build the ClientHello and start the transcript. The caller
 /// wraps `client_hello` in a plaintext handshake record and sends it.
 pub fn start(opts: HandshakeOptions, out: []u8) !StartResult {
-    const client_public = try X25519.recoverPublicKey(opts.ephemeral_secret);
+    const client_public = try x25519PublicKey(opts.ephemeral_secret);
     const client_hello = buildClientHello(out, opts.client_random, client_public);
 
     var state = State{ .ephemeral_secret = opts.ephemeral_secret, .transcript = key_schedule.Transcript.init() };
@@ -450,13 +456,13 @@ test "postgrez tls: tls client hello offers 1.3, x25519, aes-128-gcm" {
     // supported_versions carries 0x0304
     try testing.expect(std.mem.indexOf(u8, hello, &.{ 0x03, 0x04 }) != null);
     // key_share carries the x25519 public of the fixed ephemeral
-    const client_public = try X25519.recoverPublicKey(@splat(0x42));
+    const client_public = try x25519PublicKey(@splat(0x42));
     try testing.expect(std.mem.indexOf(u8, hello, &client_public) != null);
 }
 
 test "postgrez tls: tls client finish reports NeedMoreRecords on a bare ServerHello" {
     // A minimal ServerHello record with a key_share, no encrypted flight yet.
-    const server_public = try X25519.recoverPublicKey(@splat(0x99));
+    const server_public = try x25519PublicKey(@splat(0x99));
 
     var sh_buf: [256]u8 = undefined;
     var writer = wire.Writer{ .buf = &sh_buf };

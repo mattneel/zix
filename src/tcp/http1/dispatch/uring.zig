@@ -8,6 +8,7 @@ const cache = @import("../../../utils/response_cache.zig");
 const ws = @import("../websocket.zig");
 const uring = @import("../../../multiplexers/ring.zig");
 const ring_wait = @import("../../../multiplexers/ring_wait.zig");
+const ring_host = @import("../../../multiplexers/ring_host.zig");
 const slab = @import("../../../multiplexers/slab.zig");
 const tls_mux = @import("../tls_mux.zig");
 const tls_conn = @import("../../../multiplexers/tls_conn.zig");
@@ -291,7 +292,10 @@ const TlsConnTable = tls_conn.ConnTable(UringTlsConn, MAX_FD, freeUringTlsConn);
 /// interceptor baked in at compile time, mirroring epollWorkerFn.
 fn UringWorker(comptime handler_fn: HandlerFn) type {
     return struct {
-        ring: IoUring,
+        /// The loop's ring: its own, or its std.Io.Threadz worker's (see ring_host).
+        ring: *IoUring,
+        /// Where `ring` came from, which decides how `run` waits on it.
+        host: ring_host.LoopRing = undefined,
         /// fd-indexed inline connection table (mapZeroedSlots, demand-paged).
         /// An empty slot reads as buf.len == 0, mirroring the EPOLL ConnTable.
         slots: []UringConn,
@@ -410,7 +414,7 @@ fn UringWorker(comptime handler_fn: HandlerFn) type {
             if (self.ws_bufs) |*bg| bg.deinit(allocator);
             if (self.tls_conns) |*tls_table| tls_table.deinit();
             if (self.tls_out_buf.len > 0) allocator.free(self.tls_out_buf);
-            self.ring.deinit();
+            self.host.deinit();
         }
 
         /// Get an SQE, submitting the staged batch first when the SQ is full.
@@ -1462,7 +1466,8 @@ fn UringWorker(comptime handler_fn: HandlerFn) type {
             // wait. Without IORING_FEAT_EXT_ARG the ceiling drops to one completion,
             // which anything already queued satisfies, so a worker can never park on
             // completions its remaining connections will not produce.
-            const coalesce_max: u32 = if (ring_wait.boundedWaitSupported(&self.ring)) URING_WAIT_COALESCE_MAX else 1;
+            // A lent ring has no bounded wait: the loop parks until the worker hands it a completion.
+            const coalesce_max: u32 = if (!self.host.isLent() and ring_wait.boundedWaitSupported(self.ring)) URING_WAIT_COALESCE_MAX else 1;
 
             var wait_nr: u32 = 1;
             var cqes: [URING_CQE_BATCH]linux.io_uring_cqe = undefined;
@@ -1472,24 +1477,31 @@ fn UringWorker(comptime handler_fn: HandlerFn) type {
                 // window so a short batch is handed over rather than held. A pass that
                 // only wants one completion needs no window, and skipping it there is
                 // what lets an idle worker sleep instead of waking on a timer.
-                if (wait_nr > 1) {
-                    ring_wait.submitAndWaitTimeout(&self.ring, wait_nr, URING_WAIT_COALESCE_NS) catch |err| switch (err) {
-                        error.SignalInterrupt => continue,
-                        else => return,
-                    };
+                var count: u32 = 0;
+                if (self.host.isLent()) {
+                    // Submits, then parks until the worker hands the loop a completion.
+                    count = self.host.wait(&cqes) catch return;
+                    self.drainParked();
                 } else {
-                    _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
-                        error.SignalInterrupt => continue,
-                        else => return,
-                    };
+                    if (wait_nr > 1) {
+                        ring_wait.submitAndWaitTimeout(self.ring, wait_nr, URING_WAIT_COALESCE_NS) catch |err| switch (err) {
+                            error.SignalInterrupt => continue,
+                            else => return,
+                        };
+                    } else {
+                        _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                            error.SignalInterrupt => continue,
+                            else => return,
+                        };
+                    }
+
+                    // The submit above pushed the staged SQEs to the kernel, so the
+                    // SQ has room again: retry the pending accept re-arm and the
+                    // parked process-queue entries before reaping new completions.
+                    self.drainParked();
+
+                    count = self.ring.copy_cqes(&cqes, 0) catch return;
                 }
-
-                // The submit above pushed the staged SQEs to the kernel, so the
-                // SQ has room again: retry the pending accept re-arm and the
-                // parked process-queue entries before reaping new completions.
-                self.drainParked();
-
-                const count = self.ring.copy_cqes(&cqes, 0) catch return;
                 wait_nr = @min(@max(@as(u32, @intCast(count / 2)), 1), coalesce_max);
                 for (cqes[0..count], 0..) |cqe, cqe_idx| {
                     const decoded = uring.unpackUserData(cqe.user_data);
@@ -1691,7 +1703,10 @@ fn uringWorkerFn(comptime handler_fn: HandlerFn) fn (UringWorkerCtx) void {
                 .tls_listener_fd = tls_listener_fd,
                 .tls_ctx = if (tls_active) config.tls else null,
             };
-            worker.ring = initUringRing() catch return;
+            // Its own ring, or on std.Io.Threadz the ring of the worker this task is pinned to.
+            var own_ring: IoUring = undefined;
+            worker.host = ring_host.LoopRing.init(io, &own_ring, initUringRing) catch return;
+            worker.ring = worker.host.ring;
             if (tls_active) {
                 worker.tls_conns = TlsConnTable.init() catch return;
                 worker.tls_out_buf = std.heap.smp_allocator.alloc(u8, tls_mux.RESPONSE_BUF_SIZE) catch return;
@@ -1699,7 +1714,7 @@ fn uringWorkerFn(comptime handler_fn: HandlerFn) fn (UringWorkerCtx) void {
             // Provided-buffer ring for WebSocket recvs (Phase 4b). Optional: a
             // kernel without buffer-ring support leaves it null, and WebSocket
             // uses the plain recv path.
-            worker.ws_bufs = IoUring.BufferGroup.init(&worker.ring, std.heap.smp_allocator, WS_RING_BGID, WS_RING_BUF_SIZE, WS_RING_BUF_COUNT) catch null;
+            worker.ws_bufs = IoUring.BufferGroup.init(worker.ring, std.heap.smp_allocator, WS_RING_BGID, WS_RING_BUF_SIZE, WS_RING_BUF_COUNT) catch null;
             defer worker.deinit();
 
             // Per-worker response cache (ADR-036), owned for this worker's
@@ -1756,10 +1771,12 @@ pub fn runUring(config: Config, comptime handler_fn: HandlerFn) !void {
     probe.deinit();
 
     const cpu = getAvailableCpuCount();
-    const worker_count = if (config.workers == 0) cpu else config.workers;
+    // On std.Io.Threadz each loop is pinned to a worker of its own, so there are no more loops
+    // than workers.
+    const worker_count = ring_host.Workers.count(config.io, if (config.workers == 0) cpu else config.workers);
 
-    const threads = try std.heap.smp_allocator.alloc(std.Thread, worker_count);
-    defer std.heap.smp_allocator.free(threads);
+    var workers = try ring_host.Workers.init(config.io, worker_count);
+    defer workers.deinit();
 
     // std.compress.flate.Compress is about 230 KB and is built on the handler's stack
     // frame, so a compressing handler (sendNegotiateCachedFD) needs more than the default
@@ -1776,16 +1793,16 @@ pub fn runUring(config: Config, comptime handler_fn: HandlerFn) !void {
     var report = listen_report.Report.init(worker_count);
 
     const worker = uringWorkerFn(handler_fn);
-    for (threads, 0..) |*thread, worker_id| {
-        thread.* = std.Thread.spawn(
-            .{ .stack_size = worker_stack },
+    for (0..worker_count) |worker_id| {
+        workers.spawn(
+            worker_stack,
             worker,
             .{UringWorkerCtx{ .config = config, .worker_id = worker_id, .steering = steering, .report = &report }},
         ) catch |err| {
             logSystem(config, .ERROR, "could not spawn worker {d} of {d} ({s})", .{ worker_id, worker_count, @errorName(err) });
             report.abandon(config.io, worker_count - worker_id, err);
 
-            for (threads[0..worker_id]) |spawned| spawned.join();
+            workers.join();
 
             return error.ZixHttp1ListenFailed;
         };
@@ -1794,18 +1811,18 @@ pub fn runUring(config: Config, comptime handler_fn: HandlerFn) !void {
     if (report.awaitGroup(config.io)) |err| {
         logSystem(config, .ERROR, "not listening on {s}:{d}: {d} of {d} workers could not bind ({s})", .{ config.ip, config.port, report.failures(), worker_count, @errorName(err) });
 
-        for (threads) |thread| thread.join();
+        workers.join();
 
         return error.ZixHttp1ListenFailed;
     }
 
     // Announced here rather than above the spawn, because until the group reports there is nothing
     // to announce: the old line claimed a listener that may never have come up.
-    logSystem(config, .INFO, "listening on {s}:{d} (io_uring, {d} workers, shared-nothing)", .{ config.ip, config.port, worker_count });
+    logSystem(config, .INFO, "listening on {s}:{d} (io_uring, {d} workers{s}, shared-nothing)", .{ config.ip, config.port, worker_count, if (workers.threadz != null) " on std.Io.Threadz" else "" });
     if (config.tls != null and config.tls_port != 0)
         logSystem(config, .INFO, "dual listener: https/1.1 TLS on {s}:{d} (same workers, on-ring)", .{ config.ip, config.tls_port });
 
-    for (threads) |thread| thread.join();
+    workers.join();
 }
 
 // Echo the received body size counted off the socket: the large-body drain
@@ -2451,7 +2468,7 @@ test "zix http1: URING finishClose rings the close and recycles the slot" {
     // fds[1] is handed to finishClose, which closes it via the ring (not here).
 
     const Worker = UringWorker(testOkHandler);
-    const ring = initUringRing() catch {
+    var ring = initUringRing() catch {
         std.log.info("io_uring is unavailable on this kernel, test skipped", .{});
         return;
     };
@@ -2459,7 +2476,7 @@ test "zix http1: URING finishClose rings the close and recycles the slot" {
     const slots = try gpa.alloc(UringConn, @as(usize, @intCast(fds[1])) + 1);
     var free_slots: [4]u32 = undefined;
     var worker = Worker{
-        .ring = ring,
+        .ring = &ring,
         .slots = slots,
         .free_slots = &free_slots,
         .listener_fd = -1,
@@ -2666,11 +2683,12 @@ test "zix http1: URING pending accept re-arm is retried by drainParked" {
     }
 
     const Worker = UringWorker(testOkHandler);
+    var ring = initUringRing() catch {
+        std.log.info("io_uring is unavailable on this kernel, test skipped", .{});
+        return;
+    };
     var worker = Worker{
-        .ring = initUringRing() catch {
-            std.log.info("io_uring is unavailable on this kernel, test skipped", .{});
-            return;
-        },
+        .ring = &ring,
         .slots = &[_]UringConn{},
         .listener_fd = fds[0],
         .gen_counter = 0,
@@ -2710,14 +2728,14 @@ test "zix http1: URING drainParked re-arms a parked recv on the ring" {
 
     const Worker = UringWorker(testOkHandler);
     var entries: [4]ParkEntry = undefined;
-    const ring = initUringRing() catch {
+    var ring = initUringRing() catch {
         std.log.info("io_uring is unavailable on this kernel, test skipped", .{});
         return;
     };
 
     const slots = try gpa.alloc(UringConn, @as(usize, @intCast(fds[1])) + 1);
     var worker = Worker{
-        .ring = ring,
+        .ring = &ring,
         .slots = slots,
         .listener_fd = -1,
         .gen_counter = 0,
@@ -2768,14 +2786,14 @@ test "zix http1: URING drainParked re-arms a parked WS recv through the buffer r
 
     const Worker = UringWorker(testOkHandler);
     var entries: [4]ParkEntry = undefined;
-    const ring = initUringRing() catch {
+    var ring = initUringRing() catch {
         std.log.info("io_uring is unavailable on this kernel, test skipped", .{});
         return;
     };
 
     const slots = try gpa.alloc(UringConn, @as(usize, @intCast(fds[1])) + 1);
     var worker = Worker{
-        .ring = ring,
+        .ring = &ring,
         .slots = slots,
         .listener_fd = -1,
         .gen_counter = 0,
@@ -2794,7 +2812,7 @@ test "zix http1: URING drainParked re-arms a parked WS recv through the buffer r
 
     // Shared provided-buffer ring, skip where the kernel lacks buffer rings
     // (the engine then uses the plain recv path, covered by the test above).
-    worker.ws_bufs = IoUring.BufferGroup.init(&worker.ring, gpa, WS_RING_BGID, WS_RING_BUF_SIZE, 4) catch {
+    worker.ws_bufs = IoUring.BufferGroup.init(worker.ring, gpa, WS_RING_BGID, WS_RING_BUF_SIZE, 4) catch {
         std.log.info("io_uring buffer groups are unavailable on this kernel, test skipped", .{});
         return;
     };

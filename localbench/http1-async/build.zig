@@ -21,6 +21,10 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the server");
     const run_cmd = b.addRunArtifact(exe);
-    if (b.args) |args| run_cmd.addArgs(args);
+    // Zig 0.16 hands the arguments after `--` to the build script as `b.args`;
+    // later versions forward them through the run step itself.
+    if (@hasField(std.Build, "args")) {
+        if (b.args) |args| run_cmd.addArgs(args);
+    } else run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 }

@@ -21,6 +21,12 @@ const extensions = @import("extensions.zig");
 const cert_verify = @import("cert_verify.zig");
 
 const X25519 = std.crypto.dh.X25519;
+
+/// The public key of an X25519 secret. `X25519.recoverPublicKey` can fail in Zig 0.16 and
+/// cannot in later versions, so this is an error union in both.
+fn x25519PublicKey(secret_key: [X25519.secret_length]u8) ![X25519.public_length]u8 {
+    return X25519.recoverPublicKey(secret_key);
+}
 const Secret = key_schedule.Secret;
 const Alpn = extensions.Alpn;
 
@@ -129,7 +135,7 @@ pub const ClientConnection = struct {
 /// Phase 1: build the ClientHello (offering x25519 + the mandatory extensions) and start the
 /// transcript. The caller sends `client_hello`, then feeds the server flight to `finish`.
 pub fn start(opts: HandshakeOptions, out: []u8) !StartResult {
-    const client_public = try X25519.recoverPublicKey(opts.ephemeral_secret);
+    const client_public = try x25519PublicKey(opts.ephemeral_secret);
     const client_hello = buildClientHello(out, opts.client_random, client_public, opts.alpn);
 
     var state = State{ .ephemeral_secret = opts.ephemeral_secret, .transcript = key_schedule.Transcript.init() };

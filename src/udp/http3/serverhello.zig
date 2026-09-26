@@ -24,6 +24,12 @@ const ks = @import("../../tls/key_schedule.zig");
 
 const X25519 = std.crypto.dh.X25519;
 
+/// The public key of an X25519 secret. `X25519.recoverPublicKey` can fail in Zig 0.16 and
+/// cannot in later versions, so this is an error union in both.
+fn x25519PublicKey(secret_key: [X25519.secret_length]u8) ![X25519.public_length]u8 {
+    return X25519.recoverPublicKey(secret_key);
+}
+
 /// A built server Initial packet plus the handshake state it established.
 pub const ServerInitial = struct {
     /// The sealed Initial packet, a slice into the caller-provided output buffer.
@@ -68,7 +74,7 @@ pub fn buildServerHelloInitial(
     var client_pub: [32]u8 = undefined;
     @memcpy(&client_pub, client_share);
 
-    const server_public = X25519.recoverPublicKey(ephemeral_secret) catch return null;
+    const server_public = x25519PublicKey(ephemeral_secret) catch return null;
     const shared = X25519.scalarmult(ephemeral_secret, client_pub) catch return null;
 
     const params = switch (handshake.negotiate(hello, &server_public, &.{.X25519})) {

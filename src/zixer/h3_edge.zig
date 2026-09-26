@@ -1176,6 +1176,12 @@ const wire = zix.Http3.response;
 const ks = zix.Http3.tls_key_schedule;
 const X25519 = std.crypto.dh.X25519;
 
+/// The public key of an X25519 secret. `X25519.recoverPublicKey` can fail in Zig 0.16 and
+/// cannot in later versions, so this is an error union in both.
+fn x25519PublicKey(secret_key: [X25519.secret_length]u8) ![X25519.public_length]u8 {
+    return X25519.recoverPublicKey(secret_key);
+}
+
 const FIXTURE_CERT = "examples/certs/ecdsa_p256_cert.pem";
 const FIXTURE_KEY = "examples/certs/ecdsa_p256_key.pem";
 
@@ -1467,7 +1473,7 @@ const H3Client = struct {
     }
 
     fn handshake(client: *H3Client, dcid: []const u8, scid_bytes: []const u8, client_random: [32]u8, ephemeral: [32]u8) !void {
-        const public_key = try X25519.recoverPublicKey(ephemeral);
+        const public_key = try x25519PublicKey(ephemeral);
 
         const secrets = crypto.initialSecrets(dcid);
         const initial_client = crypto.AesKeys.fromSecret(secrets.client);

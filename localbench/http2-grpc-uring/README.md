@@ -73,6 +73,15 @@ one reader covers both: a `SumRequest` simply leaves count at its default.
 ./scripts/localbench-run.sh http2-grpc-uring
 ```
 
+With a Zig++ toolchain, `ZIX_IO=threadz` runs the server on `std.Io.Threadz`: each
+io_uring loop is a task pinned to one Threadz worker, on that worker's ring, rather
+than a thread with a ring of its own. A Zig without Threadz ignores the variable.
+
+```bash
+ZIG_BIN=<zig++> ./scripts/localbench-build.sh http2-grpc-uring
+ZIX_IO=threadz ./scripts/localbench-run.sh http2-grpc-uring
+```
+
 Validation drives the service with `grpcurl` against the arena's own
 `requests/benchmark.proto`, so it needs `grpcurl` on PATH. The server carries
 no reflection service, which is why the schema comes from that file.

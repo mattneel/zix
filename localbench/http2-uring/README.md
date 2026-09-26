@@ -78,3 +78,12 @@ which the router reaches before writing its 404.
 ./scripts/localbench-validate.sh http2-uring
 ./scripts/localbench-run.sh http2-uring
 ```
+
+With a Zig++ toolchain, `ZIX_IO=threadz` runs the server on `std.Io.Threadz`: each
+io_uring loop is a task pinned to one Threadz worker, on that worker's ring, rather
+than a thread with a ring of its own. A Zig without Threadz ignores the variable.
+
+```bash
+ZIG_BIN=<zig++> ./scripts/localbench-build.sh http2-uring
+ZIX_IO=threadz ./scripts/localbench-run.sh http2-uring
+```

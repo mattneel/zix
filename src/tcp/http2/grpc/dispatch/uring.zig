@@ -18,6 +18,7 @@ const setNoDelay = common.setNoDelay;
 const MAX_FD = common.MAX_FD;
 const rcache = @import("../../../../utils/response_cache.zig");
 const uring = @import("../../../../multiplexers/ring.zig");
+const ring_host = @import("../../../../multiplexers/ring_host.zig");
 const slab = @import("../../../../multiplexers/slab.zig");
 const tls_mux = @import("../tls_mux.zig");
 const tls_conn = @import("../../../../multiplexers/tls_conn.zig");
@@ -105,7 +106,10 @@ const UringMuxCtx = struct {
 fn uringMuxWorkerFn(comptime RouterType: type) fn (UringMuxCtx) void {
     return struct {
         const Worker = struct {
-            ring: IoUring,
+            /// The loop's ring: its own, or its std.Io.Threadz worker's (see ring_host).
+            ring: *IoUring,
+            /// Where `ring` came from, which decides how `run` waits on it.
+            host: ring_host.LoopRing = undefined,
             slots: []?*UringGrpcConn,
             listener_fd: std.posix.fd_t,
             gen_counter: u24,
@@ -141,7 +145,7 @@ fn uringMuxWorkerFn(comptime RouterType: type) fn (UringMuxCtx) void {
 
                 slab.unmapSlots(self.slots);
                 if (self.tls_conns) |*tls_table| tls_table.deinit();
-                self.ring.deinit();
+                self.host.deinit();
             }
 
             fn getSqe(self: *Self) ?*linux.io_uring_sqe {
@@ -528,10 +532,16 @@ fn uringMuxWorkerFn(comptime RouterType: type) fn (UringMuxCtx) void {
 
                 var cqes: [URING_CQE_BATCH]linux.io_uring_cqe = undefined;
                 while (true) {
-                    _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
-                        error.SignalInterrupt => continue,
-                        else => return,
-                    };
+                    var count: u32 = 0;
+                    if (self.host.isLent()) {
+                        // Submits, then parks until the worker hands the loop a completion.
+                        count = self.host.wait(&cqes) catch return;
+                    } else {
+                        _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+                            error.SignalInterrupt => continue,
+                            else => return,
+                        };
+                    }
 
                     // The submit above freed SQ space: retry an accept re-arm
                     // lost to a full SQ, so the worker never stops accepting.
@@ -544,7 +554,7 @@ fn uringMuxWorkerFn(comptime RouterType: type) fn (UringMuxCtx) void {
                         self.armTlsAccept();
                     }
 
-                    const count = self.ring.copy_cqes(&cqes, 0) catch return;
+                    if (!self.host.isLent()) count = self.ring.copy_cqes(&cqes, 0) catch return;
                     for (cqes[0..count]) |cqe| {
                         const decoded = uring.unpackUserData(cqe.user_data);
                         switch (decoded.op) {
@@ -640,7 +650,10 @@ fn uringMuxWorkerFn(comptime RouterType: type) fn (UringMuxCtx) void {
                 .tls_listener_fd = tls_listener_fd,
                 .tls_ctx = if (tls_active) ctx.tls_ctx else null,
             };
-            worker.ring = initUringRing() catch return;
+            // Its own ring, or on std.Io.Threadz the ring of the worker this task is pinned to.
+            var own_ring: IoUring = undefined;
+            worker.host = ring_host.LoopRing.init(ctx.io, &own_ring, initUringRing) catch return;
+            worker.ring = worker.host.ring;
             if (tls_active) worker.tls_conns = TlsConnTable.init() catch return;
             defer worker.deinit();
 
@@ -692,11 +705,13 @@ pub fn runUring(comptime RouterType: type, cfg: GrpcServerConfig) !void {
     const io = cfg.io;
     // cgroup-aware so a limited cpuset defaults to one worker per available CPU, not one per machine core.
     const cpu = common.getAvailableCpuCount();
-    const worker_count = if (cfg.workers == 0) cpu else cfg.workers;
+    // On std.Io.Threadz each loop is pinned to a worker of its own, so there are no more loops
+    // than workers.
+    const worker_count = ring_host.Workers.count(io, if (cfg.workers == 0) cpu else cfg.workers);
     const opts = common.serveOptsWithCache(cfg);
 
-    const workers = try std.heap.smp_allocator.alloc(std.Thread, worker_count);
-    defer std.heap.smp_allocator.free(workers);
+    var workers = try ring_host.Workers.init(io, worker_count);
+    defer workers.deinit();
 
     // CBPF steering: one shared bind-order gate, alive until join().
     var bind_gate = reuseport.BindOrderGate{};
@@ -707,9 +722,9 @@ pub fn runUring(comptime RouterType: type, cfg: GrpcServerConfig) !void {
     var report = listen_report.Report.init(worker_count);
 
     const worker_fn = uringMuxWorkerFn(RouterType);
-    for (workers, 0..) |*thread, idx|
-        thread.* = std.Thread.spawn(
-            .{ .stack_size = cfg.worker_stack_size_bytes },
+    for (0..worker_count) |idx|
+        workers.spawn(
+            cfg.worker_stack_size_bytes,
             worker_fn,
             .{UringMuxCtx{
                 .io = io,
@@ -728,7 +743,7 @@ pub fn runUring(comptime RouterType: type, cfg: GrpcServerConfig) !void {
             logSystem(cfg, .ERROR, "could not spawn worker {d} of {d} ({s})", .{ idx, worker_count, @errorName(err) });
             report.abandon(io, worker_count - idx, err);
 
-            for (workers[0..idx]) |spawned| spawned.join();
+            workers.join();
 
             return error.ZixGrpcListenFailed;
         };
@@ -736,16 +751,16 @@ pub fn runUring(comptime RouterType: type, cfg: GrpcServerConfig) !void {
     if (report.awaitGroup(io)) |err| {
         logSystem(cfg, .ERROR, "not listening on {s}:{d}: {d} of {d} workers could not bind ({s})", .{ cfg.ip, cfg.port, report.failures(), worker_count, @errorName(err) });
 
-        for (workers) |thread| thread.join();
+        workers.join();
 
         return error.ZixGrpcListenFailed;
     }
 
     // Announced here rather than above the spawn, because until the group reports there is
     // nothing to announce: the old line claimed a listener that may never have come up.
-    logSystem(cfg, .INFO, "listening on {s}:{d} (io_uring-mux/{d})", .{ cfg.ip, cfg.port, worker_count });
+    logSystem(cfg, .INFO, "listening on {s}:{d} (io_uring-mux/{d}{s})", .{ cfg.ip, cfg.port, worker_count, if (workers.threadz != null) " on std.Io.Threadz" else "" });
     if (cfg.tls != null and cfg.tls_port != 0)
         logSystem(cfg, .INFO, "dual listener: grpc TLS on {s}:{d} (same workers, on-ring)", .{ cfg.ip, cfg.tls_port });
 
-    for (workers) |thread| thread.join();
+    workers.join();
 }

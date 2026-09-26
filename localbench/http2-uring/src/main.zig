@@ -21,11 +21,25 @@ const Routes = zix.Http2.Router(&[_]zix.Http2.Route{
     .{ .path = json.PATH, .handler = json.RESPONSE, .kind = .PREFIX },
 });
 
+/// Zig++'s std.Io.Threadz, `void` on a Zig without it.
+const Threadz = blk: {
+    if (!@hasDecl(std.Io, "Threadz")) break :blk void;
+    break :blk std.Io.Threadz;
+};
+
 pub fn main(process: std.process.Init) !void {
+    // ZIX_IO=threadz runs the server on std.Io.Threadz: each io_uring loop is a task pinned to
+    // one worker, on that worker's ring, instead of a thread with a ring of its own.
+    var threadz: Threadz = undefined;
+    const on_threadz = Threadz != void and std.mem.eql(u8, process.environ_map.get("ZIX_IO") orelse "", "threadz");
+    if (on_threadz) try threadz.init(std.heap.smp_allocator, .{ .log2_ring_entries = 12 });
+    defer if (on_threadz) threadz.deinit();
+    const io = if (on_threadz) threadz.io() else process.io;
+
     var tls_alloc = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
     defer tls_alloc.deinit();
 
-    var tls = zix.Tls.Context.init(tls_alloc.allocator(), process.io, .{
+    var tls = zix.Tls.Context.init(tls_alloc.allocator(), io, .{
         .cert_path = paths.TLS_CERT,
         .key_path = paths.TLS_KEY,
         .alpn = &.{.H2},
@@ -35,7 +49,7 @@ pub fn main(process: std.process.Init) !void {
     };
 
     var server = zix.Http2.Server.init(Routes.dispatch, .{
-        .io = process.io,
+        .io = io,
         .ip = "::",
         .port = 8082,
         .workers = 0,
