@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const ring_host = @import("ring_host.zig");
 
 /// Completion routing tag, carried in the top byte of user_data so the loop
 /// knows which handler a CQE belongs to without a per-fd lookup first. timeout
@@ -32,6 +33,9 @@ pub const Decoded = struct { op: OpKind, gen: u24, fd: linux.fd_t };
 ///   32 bits. The generation guards against fd reuse: a connection can close
 ///   and its fd be re-accepted while stale CQEs for the old connection are
 ///   still in the completion queue, and those must not touch the new one.
+/// - The top bit of the op byte is always set (ring_host.owner_bit). A loop on
+///   a std.Io.Threadz worker's ring shares it with the worker, which hands the
+///   loop exactly the completions that carry this bit.
 ///
 /// Param:
 /// op - OpKind (which completion handler the CQE routes to)
@@ -43,7 +47,7 @@ pub const Decoded = struct { op: OpKind, gen: u24, fd: linux.fd_t };
 pub fn packUserData(op: OpKind, gen: u24, fd: linux.fd_t) u64 {
     const fd_bits: u32 = @bitCast(fd);
 
-    return (@as(u64, @intFromEnum(op)) << 56) | (@as(u64, gen) << 32) | fd_bits;
+    return ring_host.owner_bit | (@as(u64, @intFromEnum(op)) << 56) | (@as(u64, gen) << 32) | fd_bits;
 }
 
 /// Decode a SQE's user_data back into its op, generation, and fd.
@@ -55,7 +59,7 @@ pub fn packUserData(op: OpKind, gen: u24, fd: linux.fd_t) u64 {
 /// - Decoded
 pub fn unpackUserData(user_data: u64) Decoded {
     return .{
-        .op = @enumFromInt(@as(u8, @intCast(user_data >> 56))),
+        .op = @enumFromInt(@as(u8, @intCast((user_data & ~ring_host.owner_bit) >> 56))),
         .gen = @intCast((user_data >> 32) & 0xff_ff_ff),
         .fd = @bitCast(@as(u32, @intCast(user_data & 0xff_ff_ff_ff))),
     };

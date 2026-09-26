@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const ring_host = @import("ring_host.zig");
 
 /// An error value carried across threads as a plain integer, because an atomic cannot hold an
 /// error union. Zero is the "nothing failed yet" slot, which is never a real error code.
@@ -200,12 +201,16 @@ pub const Slot = struct {
 };
 
 /// Park the calling thread while the word still reads expected. Linux keeps the raw futex fast
-/// path, other targets park through the io backend, the same split the driver pools use.
+/// path, other targets park through the io backend, the same split the driver pools use. On
+/// std.Io.Threadz the workers are tasks, and a raw wait would block the worker thread under the
+/// waiting task, so there it parks through io too.
 fn futexWait(io: std.Io, word: *std.atomic.Value(u32), expected: u32) void {
     if (comptime builtin.target.os.tag == .linux) {
-        _ = std.os.linux.futex_4arg(&word.raw, .{ .cmd = .WAIT, .private = true }, expected, null);
+        if (ring_host.threadzOf(io) == null) {
+            _ = std.os.linux.futex_4arg(&word.raw, .{ .cmd = .WAIT, .private = true }, expected, null);
 
-        return;
+            return;
+        }
     }
 
     io.futexWaitUncancelable(u32, &word.raw, expected);
@@ -214,9 +219,11 @@ fn futexWait(io: std.Io, word: *std.atomic.Value(u32), expected: u32) void {
 /// Wake every thread parked on the word. Same branch split as futexWait.
 fn futexWake(io: std.Io, word: *std.atomic.Value(u32)) void {
     if (comptime builtin.target.os.tag == .linux) {
-        _ = std.os.linux.futex_3arg(&word.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        if (ring_host.threadzOf(io) == null) {
+            _ = std.os.linux.futex_3arg(&word.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
 
-        return;
+            return;
+        }
     }
 
     io.futexWake(u32, &word.raw, std.math.maxInt(u32));
