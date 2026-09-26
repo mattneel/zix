@@ -56,7 +56,11 @@ pub fn build(b: *std.Build) void {
     const acceptance = b.addTest(.{ .root_module = acceptance_module });
     const run_acceptance = b.addRunArtifact(acceptance);
     // `zig build test-durable -- --test-filter "an expired lease"` runs one scenario.
-    if (b.args) |args| run_acceptance.addArgs(args);
+    // Zig 0.16 hands the arguments after `--` to the build script as `b.args`;
+    // later versions forward them through the run step itself.
+    if (@hasField(std.Build, "args")) {
+        if (b.args) |args| run_acceptance.addArgs(args);
+    } else run_acceptance.addPassthruArgs();
     const durable_step = b.step("test-durable", "Run the acceptance scenarios against a real PostgreSQL");
     durable_step.dependOn(&run_acceptance.step);
 
