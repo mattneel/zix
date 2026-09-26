@@ -28,6 +28,12 @@ const CLIENT_CERT_RECORD_BUF: usize = 4096;
 const SERVER_FLIGHT_BUF: usize = 4096;
 
 const X25519 = std.crypto.dh.X25519;
+
+/// The public key of an X25519 secret. `X25519.recoverPublicKey` can fail in Zig 0.16 and
+/// cannot in later versions, so this is an error union in both.
+fn x25519PublicKey(secret_key: [X25519.secret_length]u8) ![X25519.public_length]u8 {
+    return X25519.recoverPublicKey(secret_key);
+}
 const P256 = std.crypto.ecc.P256;
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const NamedGroup = handshake.NamedGroup;
@@ -536,7 +542,7 @@ fn computeKeyExchange(group: NamedGroup, ephemeral_secret: [32]u8, client_public
 
             var client_pub: [32]u8 = undefined;
             @memcpy(&client_pub, client_public);
-            const server_public = try X25519.recoverPublicKey(ephemeral_secret);
+            const server_public = try x25519PublicKey(ephemeral_secret);
             const shared = try X25519.scalarmult(ephemeral_secret, client_pub);
 
             var kex = KeyExchange{ .server_public = undefined, .server_public_len = 32, .shared = shared };
@@ -1143,7 +1149,7 @@ test "zix tls: connection, HelloRetryRequest round trip (RFC 8446 4.1.4)" {
         .server_random = @splat(0x55),
     };
 
-    const client_x25519 = try X25519.recoverPublicKey(@splat(0x42));
+    const client_x25519 = try x25519PublicKey(@splat(0x42));
     var dummy_secp: [65]u8 = @splat(0xAB); // 65-byte point, content unused (HRR precedes ECDHE)
     dummy_secp[0] = 0x04;
 
